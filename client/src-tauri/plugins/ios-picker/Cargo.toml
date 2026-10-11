@@ -1,0 +1,16 @@
+[package]
+name = "tauri-plugin-ios-picker"
+version = "0.1.0"
+description = "Files-app document picker for the PS5Upload iOS build: files and folders, opened in place."
+edition = "2021"
+rust-version = "1.77"
+publish = false
+# Required by tauri-plugin's build script (it links the Swift package).
+links = "tauri-plugin-ios-picker"
+
+[dependencies]
+tauri = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

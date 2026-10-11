@@ -11,7 +11,7 @@ import { QueuePanel, queueItemsForHost } from "../Upload/QueuePanel";
 import { volumeOfPkgPath } from "../../lib/pkgStorage";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
 import { gamePath, hasTitleId } from "../../lib/gamePage";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openDialog } from "../../lib/openDialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   PackageOpen,

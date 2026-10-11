@@ -6,6 +6,7 @@ import {
   useNavigationType,
 } from "react-router";
 
+import { isIOS } from "../lib/platform";
 import { useTr } from "../state/lang";
 
 function browserHistoryIndex(): number | null {
@@ -38,6 +39,10 @@ export default function NavigationControls() {
 
   const backLabel = tr("navigation_back", undefined, "Back");
   const forwardLabel = tr("navigation_forward", undefined, "Forward");
+
+  // iOS: no Back/Forward pill — it crowds the title bar on a phone and the
+  // bottom tab bar already reaches every screen.
+  if (isIOS()) return null;
 
   return (
     <nav

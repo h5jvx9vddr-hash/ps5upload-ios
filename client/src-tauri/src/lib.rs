@@ -147,6 +147,9 @@ pub fn run() {
     // stages the download first, see commands/dragout.rs).
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_drag::init());
+    // iOS: Files-app picker for files AND folders, opened in place (commands/ios_picker.rs).
+    #[cfg(target_os = "ios")]
+    let builder = builder.plugin(tauri_plugin_ios_picker::init());
     let app = builder
         .plugin(tauri_plugin_dialog::init())
         // Opener: the cross-platform way to open external URLs / reveal files.
@@ -554,6 +557,8 @@ pub fn run() {
             commands::local_storage_roots,
             commands::storage_access_granted,
             commands::request_storage_access,
+            // iOS Files-app picker (files + folders, in place).
+            commands::ios_pick_paths,
         ])
         .build(tauri::generate_context!())
         .expect("tauri runtime failed to build");

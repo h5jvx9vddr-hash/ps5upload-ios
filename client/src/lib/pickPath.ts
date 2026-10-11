@@ -4,15 +4,13 @@
 // real paths. Android's scoped storage doesn't — its directory picker is
 // a no-op and its file picker returns content:// URIs the engine can't
 // read — so on Android we route to the in-app real-path browser
-// (LocalPathPicker via the localPicker store) instead. iOS goes the same
-// way: its document picker hands back security-scoped copies, not paths
-// the engine can stream from, so the in-app browser lists the app's
-// Documents folder (shared with the Files app) instead. Callers don't
+// (LocalPathPicker via the localPicker store) instead. iOS uses the Files
+// app through lib/openDialog (files and folders, opened in place). Callers don't
 // branch; they just `await pickPath({ mode })`.
 
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openDialog } from "./openDialog";
 
-import { isAndroid, isIOS } from "./platform";
+import { isAndroid } from "./platform";
 import { engineIsOnThisDevice } from "../state/engine";
 import { pickLocalPath, pickLocalPaths } from "../state/localPicker";
 
@@ -29,10 +27,10 @@ export interface PickPathOptions {
 
 /** Pick a single real path, or null if cancelled. */
 export async function pickPath(opts: PickPathOptions): Promise<string | null> {
-  // A server, Android, iOS, the web build and a remote engine all browse in-app: the web build has
+  // A server, Android, the web build and a remote engine all browse in-app: the web build has
   // no system dialog, and the system dialog would browse the wrong machine (this one, not the
   // engine's) whenever the engine runs elsewhere.
-  if (opts.source || opts.mode === "any" || isAndroid() || isIOS() || !engineIsOnThisDevice()) {
+  if (opts.source || opts.mode === "any" || isAndroid() || !engineIsOnThisDevice()) {
     return pickLocalPath({
       mode: opts.mode,
       title: opts.title,
@@ -60,7 +58,7 @@ export async function pickPaths(
   opts: Omit<PickPathOptions, "mode"> & { mode?: "file" | "folder" } = {},
 ): Promise<string[]> {
   const mode = opts.mode ?? "file";
-  if (opts.source || isAndroid() || isIOS() || !engineIsOnThisDevice()) {
+  if (opts.source || isAndroid() || !engineIsOnThisDevice()) {
     return pickLocalPaths({ mode, title: opts.title, filters: opts.filters, source: opts.source });
   }
   const sel = await openDialog({

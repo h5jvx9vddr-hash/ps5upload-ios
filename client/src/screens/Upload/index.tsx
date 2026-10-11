@@ -17,7 +17,7 @@ import {
   ListPlus,
 } from "lucide-react";
 import clsx from "clsx";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { openDialog } from "../../lib/openDialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { isAndroid } from "../../lib/platform";
 import { pkgKindLabel } from "./pkgKind";

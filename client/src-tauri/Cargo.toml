@@ -133,6 +133,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 ps5upload-engine = { path = "../../engine/crates/ps5upload-engine" }
 
+# iOS-only: Files-app document picker (files + folders, opened in place).
+# plugin-dialog's iOS picker copies into the sandbox and can't pick folders.
+[target.'cfg(target_os = "ios")'.dependencies]
+tauri-plugin-ios-picker = { path = "plugins/ios-picker" }
+
 # Android-only: call the platform APIs needed for all-files storage access
 # (Environment.isExternalStorageManager + the settings intent) from Rust.
 # We capture the JavaVM ourselves in JNI_OnLoad and get the Application
