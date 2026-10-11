@@ -1,0 +1,62 @@
+# Unsigned iOS .ipa (sign it yourself). Manual trigger only.
+name: ios
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri -> target
+
+      - name: Tools
+        run: |
+          xcodebuild -version
+          command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+
+      - name: npm ci
+        working-directory: client
+        run: npm ci
+
+      - name: tauri ios init
+        working-directory: client
+        run: |
+          rm -rf src-tauri/gen/apple
+          npx tauri ios init --ci
+          bash ../scripts/release/ios-postinit-patch.sh
+
+      - name: tauri ios build (unsigned)
+        working-directory: client
+        run: npx tauri ios build --no-sign --target aarch64 --ci
+
+      - name: Collect IPA
+        run: |
+          IPA=$(find client/src-tauri/gen/apple/build -name '*.ipa' | head -1)
+          test -n "$IPA"
+          cp "$IPA" PS5Upload.ipa
+          unzip -l PS5Upload.ipa | head -20
+          ls -la PS5Upload.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PS5Upload.ipa
+          path: PS5Upload.ipa
