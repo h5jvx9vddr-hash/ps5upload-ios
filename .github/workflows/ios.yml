@@ -8,11 +8,94 @@ permissions:
   contents: read
 
 jobs:
+  build-payload:
+    name: build-payload
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Sync version from VERSION
+        run: node scripts/update-version.js
+
+      - name: Install payload toolchain
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          # See the note on the Tauri prerequisites step: apt has no default
+          # network timeout, so a stalled mirror hangs until the job dies.
+          apt_retry() {
+            for attempt in 1 2 3; do
+              if sudo DEBIAN_FRONTEND=noninteractive apt-get \
+                   -o Acquire::Retries=3 \
+                   -o Acquire::http::Timeout=20 \
+                   -o Acquire::https::Timeout=20 \
+                   "$@"; then
+                return 0
+              fi
+              echo "apt attempt $attempt failed; retrying in 15s" >&2
+              sleep 15
+            done
+            echo "apt failed after 3 attempts: apt-get $*" >&2
+            return 1
+          }
+          apt_retry update
+          # Add LLVM apt repo for llvm-22 (not in Ubuntu 24.04 default repos)
+          curl -fsSL --retry 3 --retry-delay 5 https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
+          apt_retry install -y clang-22 llvm-22-dev lld-22 unzip python3
+
+      - name: Install pinned PS5 Payload SDK
+        run: sudo env PS5_SDK_INSTALL_DIR=/opt/ps5-payload-sdk bash scripts/install-ps5-sdk.sh
+
+      - name: Build payload ELF
+        env:
+          PS5_PAYLOAD_SDK: /opt/ps5-payload-sdk
+          # SDK v0.42's prospero-llvm-config candidate search maxes at 21,
+          # so point it at the CI-installed LLVM 22 explicitly.
+          LLVM_CONFIG: /usr/bin/llvm-config-22
+        run: make payload
+
+      - name: Sanity-check ELF shape
+        run: |
+          file payload/ps5upload.elf payload/installer/ps5upload-installer.elf
+          test -s payload/ps5upload.elf
+          test -s payload/installer/ps5upload-installer.elf
+          gzip -t payload/ps5upload.elf.gz payload/installer/ps5upload-installer.elf.gz
+
+      - name: Gzip payloads for bundling
+        run: |
+          gzip -kf payload/ps5upload.elf payload/installer/ps5upload-installer.elf
+          ls -la \
+            payload/ps5upload.elf payload/ps5upload.elf.gz \
+            payload/installer/ps5upload-installer.elf payload/installer/ps5upload-installer.elf.gz
+
+      - name: Upload payload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ps5upload-payload
+          path: |
+            payload/ps5upload.elf
+            payload/ps5upload.elf.gz
+            payload/installer/ps5upload-installer.elf
+            payload/installer/ps5upload-installer.elf.gz
+          if-no-files-found: error
+
+
   ipa:
+    needs: build-payload
     runs-on: macos-26
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore payload ELF
+        uses: actions/download-artifact@v4
+        with:
+          name: ps5upload-payload
+          path: payload
 
       - uses: actions/setup-node@v4
         with:
