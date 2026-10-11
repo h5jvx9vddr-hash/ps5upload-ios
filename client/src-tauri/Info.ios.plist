@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  iOS-only Info.plist keys, merged by `tauri ios build` into the generated
+  gen/apple/<app>_iOS/Info.plist (gen/ is gitignored and regenerated).
+-->
+<plist version="1.0">
+<dict>
+	<!-- The PS5, NAS shares and the phone's own in-process engine all live on
+	     the local network; iOS 14+ asks once and blocks LAN sockets without it. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>PS5Upload connects to your PS5 and file shares on the local network to upload, install and manage games.</string>
+	<!-- mDNS service types browsed by commands/discover.rs. -->
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_sonic-loader._tcp</string>
+		<string>_ftp._tcp</string>
+		<string>_workstation._tcp</string>
+		<string>_http._tcp</string>
+		<string>_ssh._tcp</string>
+	</array>
+	<!-- The renderer talks to the in-process engine over plain HTTP on
+	     127.0.0.1:19113 (and to a remote engine / the console over the LAN). -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsArbitraryLoadsInWebContent</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!-- Documents/ is the in-app browser's root (local_fs.rs) and appears in
+	     the Files app as "On My iPhone › PS5Upload". -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+</dict>
+</plist>

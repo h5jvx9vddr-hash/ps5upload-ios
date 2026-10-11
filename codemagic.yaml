@@ -1,0 +1,57 @@
+# Codemagic build of an UNSIGNED iOS .ipa (sign it yourself, e.g. with a
+# signing service or AltStore/Sideloadly). No automatic trigger — start it in
+# the Codemagic UI or via the API (scripts/ios-build.sh).
+workflows:
+  ios-ipa:
+    name: iOS IPA (unsigned)
+    instance_type: mac_mini_m2
+    max_build_duration: 90
+    environment:
+      xcode: latest
+      node: 22
+    cache:
+      cache_paths:
+        - ~/.cargo/registry
+        - ~/.cargo/git
+        - client/src-tauri/target
+    scripts:
+      - name: Rust toolchain
+        script: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          source "$HOME/.cargo/env"
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-ios
+          echo "PATH=$HOME/.cargo/bin:$PATH" >> "$CM_ENV"
+          rustc -V
+      - name: XcodeGen
+        script: |
+          xcodebuild -version
+          command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+      - name: npm ci
+        script: |
+          node -v
+          cd client && npm ci
+      - name: tauri ios init
+        script: |
+          cd client
+          rm -rf src-tauri/gen/apple
+          npx tauri ios init --ci
+          bash ../scripts/release/ios-postinit-patch.sh
+      - name: tauri ios build (unsigned)
+        script: |
+          cd client
+          npx tauri ios build --no-sign --target aarch64 --ci 2>&1 | tee ../ios-build.log
+          test "${PIPESTATUS[0]}" -eq 0
+      - name: Collect IPA
+        script: |
+          IPA=$(find client/src-tauri/gen/apple/build -name '*.ipa' | head -1)
+          test -n "$IPA"
+          cp "$IPA" PS5Upload.ipa
+          unzip -l PS5Upload.ipa | head -20
+          ls -la PS5Upload.ipa
+    artifacts:
+      - PS5Upload.ipa
+      - ios-build.log

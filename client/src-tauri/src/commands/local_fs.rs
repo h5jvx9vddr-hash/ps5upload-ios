@@ -51,7 +51,8 @@ pub async fn local_list_dir(path: String) -> Result<Vec<LocalEntry>, String> {
 }
 
 /// Roots to seed the in-app browser. Android: primary shared storage plus
-/// any mounted removable volumes under `/storage`. Desktop: the home dir.
+/// any mounted removable volumes under `/storage`. iOS: the app's Documents
+/// folder. Desktop: the home dir.
 #[tauri::command]
 pub async fn local_storage_roots() -> Result<Vec<String>, String> {
     #[cfg(target_os = "android")]
@@ -102,7 +103,18 @@ pub async fn local_storage_roots() -> Result<Vec<String>, String> {
         }
         Ok(roots)
     }
-    #[cfg(not(target_os = "android"))]
+    // iOS: the sandbox's Documents folder. Info.ios.plist sets
+    // UIFileSharingEnabled + LSSupportsOpeningDocumentsInPlace, so it shows up
+    // in the Files app as "On My iPhone › PS5Upload" — the place to drop games
+    // and packages before uploading them.
+    #[cfg(target_os = "ios")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let docs = std::path::Path::new(&home).join("Documents");
+        let _ = std::fs::create_dir_all(&docs);
+        Ok(vec![docs.to_string_lossy().into_owned()])
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
