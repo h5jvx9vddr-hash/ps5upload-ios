@@ -2256,7 +2256,7 @@ library_mount_tooltip_smp: "이 이미지를 ShadowMount+에 넘깁니다. 마�
 
 
 helper_mismatch_title: "PS5 헬퍼는 v{payload}, 이 앱은 v{app}입니다",
-helper_mismatch_body: "최신 버전의 수정 사항과 기능은 콘솔의 헬퍼가 일치할 때까지 동작하지 않습니다. 연결 화면에서 다시 불러오세요.",
+helper_mismatch_body_v2: "PS5 자체에서 할 일은 없습니다. 헬퍼 다시 불러오기를 누르면 이 앱이 맞는 헬퍼를 본체로 보냅니다. 그때까지는 새 버전의 수정 사항과 기능이 동작하지 않습니다.",
 helper_mismatch_go: "헬퍼 다시 불러오기",
 
 "joberr.direct_staged_file_missing": "이 업로드는 이미 완료되어 게시할 항목이 남아 있지 않았습니다. 게다가 PS5의 파일이 없거나 크기가 올바르지 않습니다. 다시 업로드하면서 '이어하기'가 아닌 '덮어쓰기'를 선택하세요.",
@@ -2428,6 +2428,8 @@ helper_mismatch_go: "헬퍼 다시 불러오기",
 "fpkg.compressionFast": "빠름",
 "fpkg.compressionBalanced": "균형",
 "fpkg.compressionSmallest": "최소",
+"fpkg.compressionStored": "무압축",
+"fpkg.compressionStoredHint": "압축 없음: 패키지가 게임 크기 그대로입니다. 압축된 패키지가 설치는 되지만 시작되지 않을 때 시도해 보세요.",
 "fpkg.cancel": "취소",
 "fpkg.done": "패키지 기록됨",
 "fpkg.error": "변환 오류",

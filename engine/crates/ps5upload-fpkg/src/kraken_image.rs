@@ -291,7 +291,7 @@ pub fn compress(
         |(t, bytes)| {
             // Stored (`PS5UPLOAD_FPKG_KRAKEN_STORE=1`, see `store_only`): every half raw, the same
             // layout with nothing for the console's decoder to decompress.
-            let halves = if store_only() {
+            let halves = if store_only() || level == kraken::Level::Stored {
                 bytes
                     .chunks(kraken::HALF)
                     .map(|h| Half::Raw(h.to_vec()))

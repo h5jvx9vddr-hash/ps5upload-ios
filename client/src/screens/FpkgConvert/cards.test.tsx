@@ -32,7 +32,8 @@ describe("CompressionTiles", () => {
       <CompressionTiles value="balanced" onChange={() => {}} estimates={estimates} />,
     );
     expect(out).toContain('role="radiogroup"');
-    expect((out.match(/role="radio"/g) ?? []).length).toBe(3);
+    expect((out.match(/role="radio"/g) ?? []).length).toBe(4);
+    expect(out).toContain("Stored");
     expect(out).toMatch(/aria-checked="true"[^>]*>[\s\S]*?Balanced/);
     expect(out).toContain("Recommended");
   });

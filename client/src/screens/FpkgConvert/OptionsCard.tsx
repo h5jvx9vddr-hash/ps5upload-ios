@@ -21,7 +21,7 @@ export interface OptionsCardProps {
   canBrowse: boolean;
   compression: FpkgCompression;
   onCompression: (c: FpkgCompression) => void;
-  estimates: Record<FpkgCompression, FpkgEstimate> | "pending" | null | undefined;
+  estimates: Partial<Record<FpkgCompression, FpkgEstimate>> | "pending" | null | undefined;
   locked: boolean;
   /** The package's planned (uncompressed) size, once the game is checked. */
   plannedSize?: number;

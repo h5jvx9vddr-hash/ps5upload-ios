@@ -82,7 +82,8 @@ export interface FpkgBuildRequest {
   language?: string;
 }
 
-export type FpkgCompression = "fast" | "balanced" | "smallest";
+/** `stored` = no compression: the fallback for a console that refuses a compressed package. */
+export type FpkgCompression = "fast" | "balanced" | "smallest" | "stored";
 
 export const fpkg = {
   inspect: (source: string, outputDir?: string) =>

@@ -1,7 +1,7 @@
 import { formatDate } from "../../lib/formatDate";
 import { useState } from "react";
 import { useNavigate } from "react-router";
-import { Check, Copy, FolderOpen, Link2, PackageOpen, Trash2, Upload } from "lucide-react";
+import { Check, Copy, Download, FolderOpen, Link2, PackageOpen, Trash2, Upload } from "lucide-react";
 
 import type { CollectionLocation } from "../../api/collection";
 import { Badge } from "../../components";
@@ -19,6 +19,9 @@ import { useConnectionStore } from "../../state/connection";
 import { useCopyActivity } from "../../state/copyActivity";
 import { useTr } from "../../state/lang";
 import { sendKind } from "../../lib/collectionSend";
+import { hostOf } from "../../lib/addr";
+import { gamePath } from "../../lib/gamePage";
+import { installOffers } from "./collectionInstall";
 import { ActivityLine } from "./ActivityLine";
 
 // One copy of a game on the drives: what it is, where, and what can be done with it.
@@ -93,14 +96,22 @@ function kindTone(kind?: string) {
   return kind === "patch" ? "accent" : kind === "dlc" ? "ps5" : "neutral";
 }
 
+/** PARAM.SFO category from the collection's pkg kind: orders installs base → update → DLC. */
+function categoryOf(kind: string | undefined): string {
+  return kind === "patch" ? "gp" : kind === "dlc" ? "ac" : "gd";
+}
+
 export function CopyRow({
   loc,
   host,
+  game,
   onTrash,
   onSend,
 }: {
   loc: CollectionLocation;
   host: string;
+  /** The game this copy belongs to, for the install queue's label and link. */
+  game: { title: string; titleId: string };
   onTrash?: (paths: string[]) => void;
   /** Opens the game's send panel with this copy picked. */
   onSend: () => void;
@@ -210,6 +221,36 @@ export function CopyRow({
           text={loc.absolute_path || loc.path}
           label={tr("collection.copy_path", undefined, "Copy path")}
         />
+        {host && loc.type === "pkg" && p?.complete !== false && !p?.error && (
+          // A package is installed, not sent: queue it streamed from here (or from the
+          // server it sits on), the same path as the console row's offers.
+          <button
+            type="button"
+            onClick={() => {
+              installOffers(hostOf(host), [
+                {
+                  game: { title: game.title },
+                  offer: {
+                    path: loc.absolute_path,
+                    name: loc.path.split(/[\\/]/).pop() || loc.path,
+                    version: p?.version ?? "",
+                    content_id: p?.content_id ?? "",
+                    title: p?.title ?? game.title,
+                    size_bytes: loc.size_bytes,
+                    category: categoryOf(p?.kind),
+                  },
+                },
+              ]);
+              pushNotification("info", tr("collection.queued", { n: 1 }, "{n} packages queued for install"), {
+                link: gamePath(game.titleId),
+              });
+            }}
+            className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--color-accent)] px-3 py-1 text-xs font-medium text-[var(--color-text)] hover:bg-[var(--color-accent-soft)]"
+          >
+            <Download size={12} />
+            {tr("game_install", undefined, "Install")}
+          </button>
+        )}
         {host &&
           !onServer &&
           loc.type === "pkg" &&

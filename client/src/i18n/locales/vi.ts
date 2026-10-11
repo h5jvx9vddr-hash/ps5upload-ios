@@ -2239,7 +2239,7 @@ library_mount_tooltip_smp: "Giao ảnh đĩa này cho ShadowMount+, nó sẽ g�
 
 
 helper_mismatch_title: "Trình trợ giúp PS5 là v{payload} còn ứng dụng này là v{app}",
-helper_mismatch_body: "Các bản sửa lỗi và tính năng của phiên bản mới sẽ không hoạt động cho tới khi trình trợ giúp trên máy khớp. Hãy tải lại từ màn hình Kết nối.",
+helper_mismatch_body_v2: "Không cần làm gì trên chính PS5: nhấn Tải lại helper và ứng dụng này sẽ gửi helper phù hợp đến máy. Trước đó, các bản sửa lỗi và tính năng của phiên bản mới sẽ không hoạt động.",
 helper_mismatch_go: "Tải lại trợ giúp",
 
 "joberr.direct_staged_file_missing": "Lần tải lên này đã hoàn tất từ trước nên không còn gì để công bố — và tệp trên PS5 hiện đã mất hoặc sai kích thước. Hãy tải lên lại và chọn «Ghi đè» thay vì «Tiếp tục».",
@@ -2411,6 +2411,8 @@ helper_mismatch_go: "Tải lại trợ giúp",
 "fpkg.compressionFast": "Nhanh",
 "fpkg.compressionBalanced": "Cân bằng",
 "fpkg.compressionSmallest": "Nhỏ nhất",
+"fpkg.compressionStored": "Không nén",
+"fpkg.compressionStoredHint": "Không nén: gói có kích thước bằng trò chơi. Hãy thử nếu gói nén cài được nhưng không khởi động.",
 "fpkg.cancel": "Hủy",
 "fpkg.done": "Đã ghi gói",
 "fpkg.error": "Lỗi chuyển đổi",

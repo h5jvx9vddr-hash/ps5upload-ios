@@ -1147,9 +1147,9 @@ function HelperVersionBanner() {
             </p>
             <p className="text-xs text-[var(--color-muted)]">
               {tr(
-                "helper_mismatch_body",
+                "helper_mismatch_body_v2",
                 undefined,
-                "Fixes and features from the newer version won't work until the helper on the console matches. Reload it from the Connection screen.",
+                "Nothing to do on the PS5 itself: press Reload helper and this app sends the matching helper to the console. Fixes and features from the newer version won't work until then.",
               )}
             </p>
           </div>

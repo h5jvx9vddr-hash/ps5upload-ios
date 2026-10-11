@@ -159,7 +159,10 @@ export function humanizePs5Error(
   // multi-volume set (a missing .partN, or the user picked a middle volume),
   // so lead with that actionable guidance rather than the opaque library text.
   if (/\b(open rar|read rar header|extract rar entry|skip rar entry)\b/i.test(raw)) {
-    return te("err_rar_open_failed");
+    // Keep the library's own words after the advice: a report that only says
+    // "damaged or unsupported" cannot be diagnosed (a 7.0.10 report).
+    const detail = raw.replace(/\s+/g, " ").trim().slice(0, 200);
+    return `${te("err_rar_open_failed")} (${detail})`;
   }
 
   // ─── Multi-file manifest rejected at BEGIN_TX ──────────────────────

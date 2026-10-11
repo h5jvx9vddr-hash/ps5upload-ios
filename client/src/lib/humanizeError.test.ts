@@ -88,6 +88,8 @@ describe("humanizePs5Error", () => {
       const msg = humanizePs5Error(raw);
       expect(msg).toMatch(/damaged|doesn't support|re-download/i);
       expect(msg).not.toMatch(/select the FIRST part/i);
+      // The library's reason stays visible, so a report can be diagnosed.
+      expect(msg).toContain(raw);
     });
     it("names the specific volume that is missing", () => {
       const msg = humanizePs5Error("rar_missing_volume: game.part2.rar");

@@ -2187,7 +2187,7 @@ library_mount_tooltip_smp: "把此映像檔交給 ShadowMount+，由它掛載並
 
 
 helper_mismatch_title: "PS5 小幫手為 v{payload}，而此應用程式為 v{app}",
-helper_mismatch_body: "新版本的修正與功能要等主機上的小幫手版本一致後才生效。請在「連線」畫面重新載入。",
+helper_mismatch_body_v2: "PS5 本身無需操作：按「重新載入助手」，此應用程式會把相符的助手傳送到主機。在此之前，新版本的修正和功能無法使用。",
 helper_mismatch_go: "重新載入小幫手",
 
 "joberr.direct_staged_file_missing": "這次上傳其實已經完成，沒有剩餘內容可以發布——而且 PS5 上的檔案現在遺失或大小不正確。請重新上傳，並選擇「覆寫」而不是「續傳」。",
@@ -2359,6 +2359,8 @@ helper_mismatch_go: "重新載入小幫手",
 "fpkg.compressionFast": "快速",
 "fpkg.compressionBalanced": "平衡",
 "fpkg.compressionSmallest": "最小",
+"fpkg.compressionStored": "不壓縮",
+"fpkg.compressionStoredHint": "不壓縮：套件與遊戲同樣大小。如果壓縮套件能安裝但無法啟動，請試試這個。",
 "fpkg.cancel": "取消",
 "fpkg.done": "套件已寫入",
 "fpkg.error": "轉換錯誤",

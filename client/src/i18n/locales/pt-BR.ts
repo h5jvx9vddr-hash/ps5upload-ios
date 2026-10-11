@@ -2254,7 +2254,7 @@ library_mount_tooltip_smp: "Entregar esta imagem ao ShadowMount+, que a monta e 
 
 
 helper_mismatch_title: "O auxiliar do PS5 é v{payload}, mas este app é v{app}",
-helper_mismatch_body: "Correções e recursos da versão mais nova não funcionarão até o auxiliar no console corresponder. Recarregue-o na tela Conexão.",
+helper_mismatch_body_v2: "Não há nada a fazer no próprio PS5: toque em Recarregar helper e este app envia ao console o helper correspondente. Até lá, as correções e os recursos da versão nova não vão funcionar.",
 helper_mismatch_go: "Recarregar auxiliar",
 
 "joberr.direct_staged_file_missing": "Este envio já havia terminado, então não restava nada para publicar — e agora o arquivo no PS5 está ausente ou com o tamanho errado. Envie-o novamente e escolha «Substituir» em vez de «Retomar».",
@@ -2426,6 +2426,8 @@ helper_mismatch_go: "Recarregar auxiliar",
 "fpkg.compressionFast": "Rápida",
 "fpkg.compressionBalanced": "Equilibrada",
 "fpkg.compressionSmallest": "Menor",
+"fpkg.compressionStored": "Sem compressão",
+"fpkg.compressionStoredHint": "Sem compressão: o pacote tem o tamanho do jogo. Tente isto se um pacote comprimido instala mas não abre.",
 "fpkg.cancel": "Cancelar",
 "fpkg.done": "Pacote gravado",
 "fpkg.error": "Erro de conversão",

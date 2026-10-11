@@ -2241,7 +2241,7 @@ library_mount_tooltip_smp: "Dieses Abbild an ShadowMount+ übergeben, das es ein
 
 
 helper_mismatch_title: "Der PS5-Helfer ist v{payload}, diese App ist v{app}",
-helper_mismatch_body: "Korrekturen und Funktionen der neueren Version wirken erst, wenn der Helfer auf der Konsole dazu passt. Lade ihn im Verbindungs-Bildschirm neu.",
+helper_mismatch_body_v2: "Auf der PS5 selbst ist nichts zu tun: Drücke „Helper neu laden“, und diese App sendet den passenden Helper an die Konsole. Bis dahin funktionieren die Fixes und Funktionen der neueren Version nicht.",
 helper_mismatch_go: "Helfer neu laden",
 
 "joberr.direct_staged_file_missing": "Dieser Upload war bereits abgeschlossen, es gab also nichts mehr zu veröffentlichen – und die Datei auf der PS5 fehlt jetzt oder hat die falsche Größe. Lade sie erneut hoch und wähle „Überschreiben“ statt „Fortsetzen“.",
@@ -2413,6 +2413,8 @@ helper_mismatch_go: "Helfer neu laden",
 "fpkg.compressionFast": "Schnell",
 "fpkg.compressionBalanced": "Ausgewogen",
 "fpkg.compressionSmallest": "Am kleinsten",
+"fpkg.compressionStored": "Unkomprimiert",
+"fpkg.compressionStoredHint": "Keine Kompression: Das Paket ist so groß wie das Spiel. Probiere das, wenn ein komprimiertes Paket installiert wird, aber nicht startet.",
 "fpkg.cancel": "Abbrechen",
 "fpkg.done": "Paket geschrieben",
 "fpkg.error": "Umwandlungsfehler",

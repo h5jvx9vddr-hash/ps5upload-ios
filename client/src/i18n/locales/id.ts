@@ -2246,7 +2246,7 @@ library_mount_tooltip_smp: "Serahkan image ini ke ShadowMount+, yang memasang da
 
 
 helper_mismatch_title: "Helper PS5 v{payload}, tapi aplikasi ini v{app}",
-helper_mismatch_body: "Perbaikan dan fitur versi yang lebih baru tidak akan jalan sampai helper di konsol cocok. Muat ulang dari layar Koneksi.",
+helper_mismatch_body_v2: "Tidak ada yang perlu dilakukan di PS5 itu sendiri: tekan Muat ulang helper dan aplikasi ini mengirim helper yang sesuai ke konsol. Sebelum itu, perbaikan dan fitur versi baru tidak akan berfungsi.",
 helper_mismatch_go: "Muat ulang helper",
 
 "joberr.direct_staged_file_missing": "Unggahan ini sebenarnya sudah selesai, jadi tidak ada lagi yang perlu diterbitkan — dan berkas di PS5 kini hilang atau ukurannya salah. Unggah ulang dan pilih «Timpa», bukan «Lanjutkan».",
@@ -2418,6 +2418,8 @@ helper_mismatch_go: "Muat ulang helper",
 "fpkg.compressionFast": "Cepat",
 "fpkg.compressionBalanced": "Seimbang",
 "fpkg.compressionSmallest": "Terkecil",
+"fpkg.compressionStored": "Tanpa kompresi",
+"fpkg.compressionStoredHint": "Tanpa kompresi: paket sebesar gamenya. Coba ini jika paket terkompresi terpasang tetapi tidak mau mulai.",
 "fpkg.cancel": "Batal",
 "fpkg.done": "Paket ditulis",
 "fpkg.error": "Kesalahan konversi",

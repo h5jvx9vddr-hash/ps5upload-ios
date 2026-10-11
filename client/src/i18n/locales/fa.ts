@@ -865,6 +865,8 @@ queue_will_mount: "اتصال پس از بارگذاری",
 "fpkg.compressionFast": "سریع",
 "fpkg.compressionBalanced": "متعادل",
 "fpkg.compressionSmallest": "کوچک‌ترین",
+"fpkg.compressionStored": "بدون فشرده‌سازی",
+"fpkg.compressionStoredHint": "بدون فشرده‌سازی: بسته هم‌اندازهٔ بازی است. اگر بستهٔ فشرده نصب می‌شود اما اجرا نمی‌شود، این را امتحان کنید.",
 "fpkg.cancel": "لغو",
 "fpkg.done": "بسته نوشته شد",
 "fpkg.error": "خطای تبدیل",
@@ -2766,7 +2768,7 @@ library_mount_tooltip_smp: "این تصویر را به ShadowMount+ بسپار 
 
 
 helper_mismatch_title: "راهنمای PS5 نسخه‌ی v{payload} است اما این برنامه v{app}",
-helper_mismatch_body: "اصلاحات و ویژگی‌های نسخه‌ی جدیدتر تا زمانی که راهنمای روی کنسول مطابقت نکند کار نمی‌کنند. از صفحه‌ی Connection دوباره بارگذاری کنید.",
+helper_mismatch_body_v2: "روی خود PS5 کاری لازم نیست: «بارگذاری مجدد کمک‌یار» را بزنید تا این برنامه کمک‌یار هم‌خوان را به کنسول بفرستد. تا آن زمان، رفع اشکال‌ها و امکانات نسخهٔ جدید کار نمی‌کنند.",
 helper_mismatch_go: "بارگذاری دوباره‌ی راهنما",
 
 "joberr.direct_staged_file_missing": "این بارگذاری از قبل تمام شده بود، پس چیزی برای انتشار نمانده بود — و فایل روی PS5 اکنون گم‌شده یا اندازه‌ی اشتباه دارد. دوباره بارگذاری کنید و به‌جای Resume، Override را انتخاب کنید.",

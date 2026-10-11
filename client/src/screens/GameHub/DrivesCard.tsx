@@ -73,6 +73,7 @@ export function DrivesCard({
                 key={`${l.root}|${l.path}`}
                 loc={l}
                 host={connectedHost}
+                game={{ title: view?.title ?? "", titleId: view?.title_id ?? "" }}
                 onTrash={canTrash ? trash : undefined}
                 onSend={onSend}
               />

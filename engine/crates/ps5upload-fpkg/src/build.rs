@@ -57,7 +57,7 @@ pub struct BuildRequest {
     /// layout.
     pub kraken: bool,
     /// How hard the Kraken encoder works: `PS5UPLOAD_FPKG_LEVEL` (`fast`, `balanced`,
-    /// `smallest`) overrides the default, Balanced.
+    /// `smallest`, or `stored` for no compression) overrides the default, Balanced.
     pub level: crate::kraken::Level,
     /// Narrows the package's PlayGo languages to this one (`fr-FR`, …; see
     /// [`cnt_write::playgo_scenario_json`]). Absent, it declares all of them with `en-US` first.

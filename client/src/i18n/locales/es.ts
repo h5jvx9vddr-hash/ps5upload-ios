@@ -2183,7 +2183,7 @@ library_mount_tooltip_smp: "Entregar esta imagen a ShadowMount+, que la monta y 
 
 
 helper_mismatch_title: "El asistente de la PS5 es v{payload} pero esta app es v{app}",
-helper_mismatch_body: "Las correcciones y funciones de la versión más nueva no funcionarán hasta que el asistente de la consola coincida. Recárgalo desde la pantalla Conexión.",
+helper_mismatch_body_v2: "No hay nada que hacer en la propia PS5: pulsa Recargar ayudante y esta app envía a la consola el ayudante que corresponde. Hasta entonces, los arreglos y funciones de la versión nueva no funcionarán.",
 helper_mismatch_go: "Recargar asistente",
 
 "joberr.direct_staged_file_missing": "Esta subida ya había terminado, así que no quedaba nada por publicar, y ahora el archivo en la PS5 falta o tiene un tamaño incorrecto. Vuelve a subirlo y elige «Sobrescribir» en lugar de «Reanudar».",
@@ -2355,6 +2355,8 @@ helper_mismatch_go: "Recargar asistente",
 "fpkg.compressionFast": "Rápida",
 "fpkg.compressionBalanced": "Equilibrada",
 "fpkg.compressionSmallest": "Mínima",
+"fpkg.compressionStored": "Sin comprimir",
+"fpkg.compressionStoredHint": "Sin compresión: el paquete ocupa lo que el juego. Pruébalo si un paquete comprimido se instala pero no arranca.",
 "fpkg.cancel": "Cancelar",
 "fpkg.done": "Paquete escrito",
 "fpkg.error": "Error de conversión",

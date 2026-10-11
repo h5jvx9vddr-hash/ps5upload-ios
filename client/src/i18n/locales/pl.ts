@@ -2493,7 +2493,7 @@ library_mount_tooltip_smp: "Przekaż ten obraz do ShadowMount+, który zamontuje
 
 
 helper_mismatch_title: "Pomocnik PS5 ma v{payload}, a ta aplikacja v{app}",
-helper_mismatch_body: "Poprawki i funkcje nowszej wersji nie zadziałają, dopóki pomocnik na konsoli się nie zgadza. Załaduj go ponownie z ekranu Połączenie.",
+helper_mismatch_body_v2: "Na samej PS5 nie trzeba nic robić: naciśnij „Załaduj pomocnika ponownie”, a ta aplikacja wyśle na konsolę pasującego pomocnika. Do tego czasu poprawki i funkcje nowszej wersji nie będą działać.",
 helper_mismatch_go: "Załaduj pomocnika",
 
 "joberr.direct_staged_file_missing": "To przesyłanie już się zakończyło, więc nie było nic do opublikowania — a pliku na PS5 teraz brakuje lub ma zły rozmiar. Wyślij go ponownie i wybierz „Nadpisz” zamiast „Wznów”.",
@@ -2665,6 +2665,8 @@ helper_mismatch_go: "Załaduj pomocnika",
 "fpkg.compressionFast": "Szybka",
 "fpkg.compressionBalanced": "Zrównoważona",
 "fpkg.compressionSmallest": "Najmniejsza",
+"fpkg.compressionStored": "Bez kompresji",
+"fpkg.compressionStoredHint": "Bez kompresji: pakiet ma rozmiar gry. Wypróbuj, jeśli skompresowany pakiet instaluje się, ale nie uruchamia.",
 "fpkg.cancel": "Anuluj",
 "fpkg.done": "Pakiet zapisany",
 "fpkg.error": "Błąd konwersji",

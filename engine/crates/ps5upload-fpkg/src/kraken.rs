@@ -286,6 +286,9 @@ pub enum Level {
     Balanced,
     /// An optimal parse with deeper match searches, priced three times.
     Smallest,
+    /// No compression: every block stored raw in the same block layout. The fallback when a
+    /// console refuses to play a compressed package (compression is verified on FW 5.10 only).
+    Stored,
 }
 
 impl std::str::FromStr for Level {
@@ -297,6 +300,7 @@ impl std::str::FromStr for Level {
             "fast" => Ok(Level::Fast),
             "balanced" => Ok(Level::Balanced),
             "smallest" => Ok(Level::Smallest),
+            "stored" | "store" | "none" => Ok(Level::Stored),
             other => Err(format!("unknown compression level {other:?}")),
         }
     }
@@ -309,6 +313,7 @@ impl Level {
             Level::Fast => 16,
             Level::Balanced => 32,
             Level::Smallest => 128,
+            Level::Stored => 0,
         }
     }
 
@@ -318,6 +323,7 @@ impl Level {
             Level::Fast => 0,
             Level::Balanced => 2,
             Level::Smallest => 3,
+            Level::Stored => 0,
         }
     }
 }

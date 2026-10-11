@@ -2233,7 +2233,7 @@ library_mount_tooltip_smp: "سلِّم هذه الصورة إلى ShadowMount+ �
 
 
 helper_mismatch_title: "مساعد PS5 بإصدار v{payload} بينما هذا التطبيق v{app}",
-helper_mismatch_body: "لن تعمل إصلاحات وميزات الإصدار الأحدث حتى يتطابق المساعد على الجهاز. أعد تحميله من شاشة الاتصال.",
+helper_mismatch_body_v2: "لا شيء لفعله على PS5 نفسه: اضغط «إعادة تحميل المساعد» وسيرسل هذا التطبيق المساعد المطابق إلى الجهاز. حتى ذلك الحين لن تعمل إصلاحات الإصدار الأحدث وميزاته.",
 helper_mismatch_go: "إعادة تحميل المساعد",
 
 "joberr.direct_staged_file_missing": "كان هذا الرفع قد اكتمل بالفعل، لذا لم يتبقَّ ما يُنشر — كما أن الملف على PS5 مفقود الآن أو حجمه غير صحيح. أعد رفعه واختر «استبدال» بدلاً من «متابعة».",
@@ -2405,6 +2405,8 @@ helper_mismatch_go: "إعادة تحميل المساعد",
 "fpkg.compressionFast": "سريع",
 "fpkg.compressionBalanced": "متوازن",
 "fpkg.compressionSmallest": "الأصغر",
+"fpkg.compressionStored": "بدون ضغط",
+"fpkg.compressionStoredHint": "بدون ضغط: الحزمة بحجم اللعبة. جرّب هذا إذا كانت الحزمة المضغوطة تُثبَّت لكنها لا تعمل.",
 "fpkg.cancel": "إلغاء",
 "fpkg.done": "كُتبت الحزمة",
 "fpkg.error": "خطأ في التحويل",

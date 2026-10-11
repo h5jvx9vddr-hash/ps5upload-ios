@@ -2244,7 +2244,7 @@ library_mount_tooltip_smp: "Bu imajı ShadowMount+'a devret; onu bağlayıp kayd
 
 
 helper_mismatch_title: "PS5 yardımcısı v{payload}, bu uygulama ise v{app}",
-helper_mismatch_body: "Yeni sürümdeki düzeltmeler ve özellikler, konsoldaki yardımcı eşleşene kadar çalışmaz. Bağlantı ekranından yeniden yükle.",
+helper_mismatch_body_v2: "PS5'in kendisinde yapılacak bir şey yok: Yardımcıyı yeniden yükle'ye basın, bu uygulama eşleşen yardımcıyı konsola gönderir. O zamana kadar yeni sürümün düzeltmeleri ve özellikleri çalışmaz.",
 helper_mismatch_go: "Yardımcıyı yükle",
 
 "joberr.direct_staged_file_missing": "Bu yükleme zaten tamamlanmıştı, dolayısıyla yayımlanacak bir şey kalmamıştı — üstelik PS5'teki dosya şu anda yok ya da boyutu yanlış. Dosyayı yeniden yükleyin ve «Sürdür» yerine «Üzerine yaz» seçeneğini kullanın.",
@@ -2416,6 +2416,8 @@ helper_mismatch_go: "Yardımcıyı yükle",
 "fpkg.compressionFast": "Hızlı",
 "fpkg.compressionBalanced": "Dengeli",
 "fpkg.compressionSmallest": "En küçük",
+"fpkg.compressionStored": "Sıkıştırmasız",
+"fpkg.compressionStoredHint": "Sıkıştırma yok: paket oyunun boyutundadır. Sıkıştırılmış bir paket yüklenip başlamıyorsa bunu deneyin.",
 "fpkg.cancel": "İptal",
 "fpkg.done": "Paket yazıldı",
 "fpkg.error": "Dönüştürme hatası",

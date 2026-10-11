@@ -2258,7 +2258,7 @@ library_mount_tooltip_smp: "このイメージを ShadowMount+ に渡します�
 
 
 helper_mismatch_title: "PS5 ヘルパーは v{payload}、このアプリは v{app} です",
-helper_mismatch_body: "新しいバージョンの修正や機能は、本体のヘルパーが一致するまで動作しません。接続画面から再読み込みしてください。",
+helper_mismatch_body_v2: "PS5 側で行うことはありません。「ヘルパーを再読み込み」を押すと、このアプリが本体に合ったヘルパーを送ります。それまでは新しいバージョンの修正や機能は動作しません。",
 helper_mismatch_go: "ヘルパーを再読み込み",
 
 "joberr.direct_staged_file_missing": "このアップロードはすでに完了していたため、公開するものが残っていません。さらに PS5 上のファイルが見つからないか、サイズが正しくありません。もう一度アップロードし、「再開」ではなく「上書き」を選んでください。",
@@ -2430,6 +2430,8 @@ helper_mismatch_go: "ヘルパーを再読み込み",
 "fpkg.compressionFast": "高速",
 "fpkg.compressionBalanced": "バランス",
 "fpkg.compressionSmallest": "最小",
+"fpkg.compressionStored": "無圧縮",
+"fpkg.compressionStoredHint": "圧縮なし: パッケージはゲームと同じサイズです。圧縮したパッケージがインストールできても起動しない場合に試してください。",
 "fpkg.cancel": "キャンセル",
 "fpkg.done": "パッケージを書き込みました",
 "fpkg.error": "変換エラー",

@@ -2712,7 +2712,7 @@ library_mount_tooltip_smp: "Add át ezt a képet a ShadowMount+-nak, amely csato
 
 
 helper_mismatch_title: "A PS5 segédprogram v{payload}, de ez az alkalmazás v{app}",
-helper_mismatch_body: "Az újabb verzió javításai és funkciói nem fognak működni, amíg a konzolon lévő segédprogram nem egyezik. Töltsd be újra a Kapcsolat képernyőről.",
+helper_mismatch_body_v2: "A PS5-ön magán nincs teendő: nyomd meg a „Segéd újratöltése” gombot, és ez az app elküldi a konzolra a hozzá illő segédet. Addig az újabb verzió javításai és funkciói nem működnek.",
 helper_mismatch_go: "Segédprogram újratöltése",
 
 "joberr.direct_staged_file_missing": "Ez a feltöltés már befejeződött, így nem maradt semmi közzétehető — és a fájl a PS5-ön most hiányzik vagy rossz méretű. Töltsd fel újra, és válaszd a Felülírást a Folytatás helyett.",
@@ -2899,6 +2899,8 @@ task_recheck: "Újraellenőrzés",
 "fpkg.compressionFast": "Gyors",
 "fpkg.compressionBalanced": "Kiegyensúlyozott",
 "fpkg.compressionSmallest": "Legkisebb",
+"fpkg.compressionStored": "Tömörítetlen",
+"fpkg.compressionStoredHint": "Nincs tömörítés: a csomag akkora, mint a játék. Próbáld ki, ha egy tömörített csomag települ, de nem indul.",
 "fpkg.lowSpace": "Kevés a szabad hely: az átalakításhoz akár {need} is kellhet a kimeneti meghajtón, ahol {free} szabad.",
 "activity_ago_hours": "{hours} órája",
 "activity_ago_min": "{min} perce",

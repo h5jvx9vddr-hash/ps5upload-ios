@@ -933,6 +933,8 @@ queue_will_mount: "mount after upload",
 "fpkg.compressionFast": "Fast",
 "fpkg.compressionBalanced": "Balanced",
 "fpkg.compressionSmallest": "Smallest",
+"fpkg.compressionStored": "Stored",
+"fpkg.compressionStoredHint": "No compression: the package is the game's size. Try this if a compressed package installs but will not start.",
 "fpkg.cancel": "Cancel",
 "fpkg.done": "Package written",
 "fpkg.error": "Conversion error",
@@ -3006,7 +3008,7 @@ library_mount_tooltip_smp: "Hand this image to ShadowMount+, which mounts and re
 
 
 helper_mismatch_title: "The PS5 helper is v{payload} but this app is v{app}",
-helper_mismatch_body: "Fixes and features from the newer version won't work until the helper on the console matches. Reload it from the Connection screen.",
+helper_mismatch_body_v2: "Nothing to do on the PS5 itself: press Reload helper and this app sends the matching helper to the console. Fixes and features from the newer version won't work until then.",
 helper_mismatch_go: "Reload helper",
 
 "joberr.direct_staged_file_missing": "This upload had already finished, so there was nothing left to publish — and the file on the PS5 is now missing or the wrong size. Upload it again and choose Override rather than Resume.",
