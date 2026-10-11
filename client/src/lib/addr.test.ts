@@ -7,6 +7,7 @@ import {
   PS5_AVA1_PORT,
   consoleAddr,
   transferAddr,
+  typedHost,
   withPort,
 } from "./addr";
 
@@ -105,5 +106,16 @@ describe("IPv6 addressing", () => {
   });
   it("leaves IPv4 unbracketed and portless", () => {
     expect(mgmtAddr("192.168.1.50")).toBe("192.168.1.50");
+  });
+});
+
+describe("typedHost", () => {
+  it("turns the decimal-pad comma into a dot", () => {
+    expect(typedHost("192,168,1,50")).toBe("192.168.1.50");
+    expect(typedHost("192.168,1")).toBe("192.168.1");
+  });
+  it("leaves addresses without commas alone", () => {
+    expect(typedHost("ps5.local")).toBe("ps5.local");
+    expect(typedHost("")).toBe("");
   });
 });

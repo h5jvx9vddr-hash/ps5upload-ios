@@ -40,6 +40,7 @@ import { isTauriEnv, safeUnlisten } from "../../lib/tauriEnv";
 import { log } from "../../state/logs";
 import { physicalPointInRect } from "./dropZone";
 import { formatDate } from "../../lib/formatDate";
+import { typedHost } from "../../lib/addr";
 
 /**
  * Playlist editor + runner panel for the SendPayload screen.
@@ -970,7 +971,7 @@ function PlaylistCard({
                     inputMode="decimal"
                     onChange={(e) =>
                       updateStep(playlist.id, i, {
-                        ip: e.target.value.trim(),
+                        ip: typedHost(e.target.value.trim()),
                       })
                     }
                     disabled={anyRunning}

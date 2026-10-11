@@ -24,6 +24,7 @@ import { Modal } from "../components/Modal";
 import { parsePS5Firmware } from "../lib/ps5Firmware";
 import { menuKeyTarget } from "../lib/menuKeys";
 import { formatDate } from "../lib/formatDate";
+import { typedHost } from "../lib/addr";
 
 /**
  * Sidebar dropdown for switching between known PS5s.
@@ -322,7 +323,7 @@ function RosterManageModal({ onClose }: { onClose: () => void }) {
                       />
                       <input
                         value={editHost}
-                        onChange={(e) => setEditHost(e.target.value)}
+                        onChange={(e) => setEditHost(typedHost(e.target.value))}
                         placeholder="192.168.1.50"
                         inputMode="decimal"
                         className="flex-1 rounded-full border border-[var(--glass-edge)] bg-[var(--color-surface-raised)] px-2 py-1"
@@ -470,7 +471,7 @@ function RosterManageModal({ onClose }: { onClose: () => void }) {
               />
               <input
                 value={newHost}
-                onChange={(e) => setNewHost(e.target.value)}
+                onChange={(e) => setNewHost(typedHost(e.target.value))}
                 placeholder="192.168.1.50"
                 inputMode="decimal"
                 className="flex-1 rounded-full border border-[var(--glass-edge)] bg-[var(--color-surface-raised)] px-2 py-1 text-xs"

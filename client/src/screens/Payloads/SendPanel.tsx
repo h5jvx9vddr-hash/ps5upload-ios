@@ -26,6 +26,7 @@ import { PlaylistsPanel } from "./PlaylistsPanel";
 import { dropIsOwnedElsewhere } from "./dropZone";
 import { probeVerdict } from "./probeVerdict";
 import { formatDate } from "../../lib/formatDate";
+import { typedHost } from "../../lib/addr";
 
 /**
  * Send tab of the Payloads screen — send any custom ELF (or BIN/JS/
@@ -400,7 +401,7 @@ export default function SendPanel() {
               label={tr("sendpayload_ps5_ip_address", undefined, "PS5 IP address")}
               value={host}
               onChange={(e) => {
-                setHostDraft(e.target.value);
+                setHostDraft(typedHost(e.target.value));
                 clearSendBannerOnEdit();
               }}
               placeholder="192.168.1.50"

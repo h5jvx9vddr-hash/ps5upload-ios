@@ -32,7 +32,7 @@ import { compareVersions } from "../../lib/semver";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { AlertTriangle, CheckCircle2, CircleDashed, XCircle, Send, ArrowRight, Radar, Sparkles, Cable, ExternalLink } from "lucide-react";
 import { openExternalUrl } from "../../lib/openExternalUrl";
-import { hostOf as bareHostOf } from "../../lib/addr";
+import { hostOf as bareHostOf, typedHost } from "../../lib/addr";
 import { PageHeader, Button, Spinner, ErrorCard } from "../../components";
 import { selectConsoleByAddress } from "../../state/roster";
 import { useTr } from "../../state/lang";
@@ -605,7 +605,7 @@ export default function ConnectionScreen() {
               value={hostDraft}
               // Draft only — see `hostDraft`. Writing the store here made
               // every keystroke remount the screen.
-              onChange={(e) => setHostDraft(e.target.value)}
+              onChange={(e) => setHostDraft(typedHost(e.target.value))}
               // Leaving the field commits, so an address typed and then
               // navigated away from is not silently discarded.
               onBlur={() => commitHost(hostDraft, false)}

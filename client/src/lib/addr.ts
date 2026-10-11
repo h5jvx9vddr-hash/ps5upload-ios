@@ -83,3 +83,12 @@ export const mgmtAddr = consoleAddr;
 
 /** Alias of `consoleAddr` (see `mgmtAddr`). */
 export const transferAddr = consoleAddr;
+
+/** What the user typed into a PS5 IP field, with every `,` turned into
+ *  a `.`. iOS (and some Android keyboards) show the decimal pad of
+ *  `inputMode="decimal"` with the region's decimal separator, so in
+ *  German, French, … the only separator key types a comma. An address
+ *  never contains a comma, so the swap is safe for every input. */
+export function typedHost(value: string): string {
+  return value.replace(/,/g, ".");
+}

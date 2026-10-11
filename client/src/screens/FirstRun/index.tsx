@@ -21,7 +21,7 @@ import {
   processList,
   type PayloadReleaseInfo,
 } from "../../api/ps5";
-import { mgmtAddr } from "../../lib/addr";
+import { mgmtAddr, typedHost } from "../../lib/addr";
 import { runningChainPayloads, type ChainPayload } from "../../lib/runningChain";
 import { useConnectionStore, PS5_LOADER_PORT } from "../../state/connection";
 import { helperSendFor, useHelperSendStore } from "../../state/helperSend";
@@ -420,7 +420,7 @@ export default function FirstRunScreen() {
               value={hostDraft}
               onBlur={() => commitAndCheck(false)}
               onChange={(e) => {
-                setHostDraft(e.target.value);
+                setHostDraft(typedHost(e.target.value));
                 setStep1("idle");
                 setStep1Msg(
                   tr(

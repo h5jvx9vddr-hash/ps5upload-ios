@@ -6,7 +6,7 @@ import { useRosterStore, profileAccentForHost } from "../state/roster";
 import { useHostRuntime } from "../state/connection";
 import { useUploadQueueStore } from "../state/uploadQueue";
 import { pkgLibraryStore } from "../state/pkgLibrary";
-import { hostOf } from "../lib/addr";
+import { hostOf, typedHost } from "../lib/addr";
 import { useEdgeFade } from "../lib/edgeFade";
 import { useTr } from "../state/lang";
 
@@ -180,7 +180,7 @@ export default function ConsoleTabs() {
           <input
             autoFocus
             value={ip}
-            onChange={(e) => setIp(e.target.value)}
+            onChange={(e) => setIp(typedHost(e.target.value))}
             onKeyDown={(e) => {
               if (e.key === "Enter") submitAdd();
               if (e.key === "Escape") setAdding(false);
