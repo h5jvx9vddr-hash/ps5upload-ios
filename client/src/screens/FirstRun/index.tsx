@@ -23,7 +23,7 @@ import {
 } from "../../api/ps5";
 import { mgmtAddr, typedHost } from "../../lib/addr";
 import { runningChainPayloads, type ChainPayload } from "../../lib/runningChain";
-import { useConnectionStore, PS5_LOADER_PORT } from "../../state/connection";
+import { useConnectionStore } from "../../state/connection";
 import { helperSendFor, useHelperSendStore } from "../../state/helperSend";
 import { sendHelperAndWait } from "../../state/helperSendRuntime";
 import { PageHeader, Button, Spinner } from "../../components";
@@ -31,6 +31,7 @@ import { useTr } from "../../state/lang";
 import { pushNotification } from "../../state/notifications";
 import { selectConsoleByAddress, withConsolePrefix } from "../../state/roster";
 import { formatBytes } from "../../lib/format";
+import { loaderPort } from "../../state/consolePorts";
 
 /**
  * First-run setup wizard.
@@ -131,18 +132,18 @@ export default function FirstRunScreen() {
     setStep1Msg(
       tr(
         "first_run_step1_checking",
-        { host, port: PS5_LOADER_PORT },
-        `Checking ${host}:${PS5_LOADER_PORT}…`,
+        { host, port: loaderPort() },
+        `Checking ${host}:${loaderPort()}…`,
       ),
     );
-    const ok = await portCheck(host, PS5_LOADER_PORT);
+    const ok = await portCheck(host, loaderPort());
     if (!ok) {
       setStep1("fail");
       setStep1Msg(
         tr(
           "first_run_step1_unreachable",
-          { host, port: PS5_LOADER_PORT },
-          `Port ${PS5_LOADER_PORT} not open on ${host}. Is your PS5 jailbroken and on the same LAN?`,
+          { host, port: loaderPort() },
+          `Port ${loaderPort()} not open on ${host}. Is your PS5 jailbroken and on the same LAN?`,
         ),
       );
       return;
@@ -307,7 +308,7 @@ export default function FirstRunScreen() {
           state: "busy",
           note: tr(
             "first_run_note_sending",
-            { host, port: PS5_LOADER_PORT },
+            { host, port: loaderPort() },
             "sending to {host}:{port}…",
           ),
         });

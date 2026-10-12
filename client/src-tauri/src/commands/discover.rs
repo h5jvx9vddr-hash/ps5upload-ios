@@ -73,11 +73,17 @@ const BROWSED_SERVICES: &[&str] = &[
 /// PS5 payload loader (universal across jailbreak chains — kstuff,
 /// etaHEN, etc. all bind it). Our strongest "this is actually a
 /// PS5 right now" signal.
-const PS5_LOADER_PORT: u16 = 9021;
+/// The user's setting (`ps5upload_core::ports`), 9021 by default.
+fn ps5_loader_port() -> u16 {
+    ps5upload_core::ports::loader_port()
+}
 
 /// ps5upload payload's one port (AVA1: management and data). Open ≈ our payload is already
 /// running — UI can show that and skip the "send payload" step.
-const PS5_AVA1_PORT: u16 = 9120;
+/// The user's setting (`ps5upload_core::ports`), 9120 by default.
+fn ps5_ava1_port() -> u16 {
+    ps5upload_core::ports::helper_port()
+}
 
 /// Max wallclock for a single discovery run, in seconds. The default
 /// (3s) covers a typical home LAN; the 10s ceiling handles enterprise
@@ -410,7 +416,7 @@ async fn probe_and_score_accum(
         let probe_ip = best_ip.to_string();
         let task = tokio::spawn(async move {
             let (loader_open, payload_open) = tokio::join!(
-                tcp_probe(&probe_ip, PS5_LOADER_PORT),
+                tcp_probe(&probe_ip, ps5_loader_port()),
                 payload_port_open(&probe_ip),
             );
             (loader_open, payload_open)
@@ -465,10 +471,10 @@ async fn tcp_probe(ip: &str, port: u16) -> bool {
 
 /// True when our payload's AVA1 port (:9120) accepts a connection.
 async fn payload_port_open(ip: &str) -> bool {
-    tcp_probe(ip, PS5_AVA1_PORT).await
+    tcp_probe(ip, ps5_ava1_port()).await
 }
 
-/// Concurrent /24 sweep against PS5_AVA1_PORT (9120) on the local
+/// Concurrent /24 sweep against ps5_ava1_port() (9120) on the local
 /// subnet. Used as the last-ditch fallback when mDNS finds nothing.
 ///
 /// 9120 is our payload's own port — we picked the number, no
@@ -664,7 +670,7 @@ mod tests {
         };
         assert!(tcp_probe("127.0.0.1", open_port).await);
         assert!(!tcp_probe("127.0.0.1", closed).await);
-        assert_eq!(PS5_AVA1_PORT, 9120, "the one port our payload listens on");
+        assert_eq!(ps5_ava1_port(), 9120, "the one port our payload listens on");
     }
 
     #[test]

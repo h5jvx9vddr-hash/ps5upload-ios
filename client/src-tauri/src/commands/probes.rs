@@ -12,7 +12,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-const PS5_LOADER_PORT: u16 = 9021;
+/// The ELF loader port in effect (the user's setting, 9021 by default).
+fn loader_port() -> u16 {
+    ps5upload_core::ports::loader_port()
+}
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Name resolution gets its own, longer budget — separate from the connect
 /// budget above.
@@ -28,6 +31,13 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 const PAYLOAD_SEND_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const EMBEDDED_PAYLOAD_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Set the console's loader and helper ports for this process (shell and, on
+/// mobile, the in-process engine): `ps5upload_core::ports`. 0 restores a default.
+#[tauri::command]
+pub fn set_console_ports(loader: Option<u16>, helper: Option<u16>) {
+    ps5upload_core::ports::set_ports(loader, helper);
+}
 
 /// Generic TCP reachability probe. Mirrors the Electron `port_check` shape:
 /// returns `{ open, error? }`. Used by the UI to know whether an IP is
@@ -184,7 +194,7 @@ pub async fn payload_check(ip: String) -> serde_json::Value {
 /// magic check → connect → stream → half-close) is reachable from
 /// `#[tokio::test]` without standing up a Tauri runtime.
 ///
-/// When `target_port == PS5_LOADER_PORT` (9021 — the canonical ELF
+/// When `target_port == loader_port()` (9021 — the canonical ELF
 /// loader convention) we peek the first 4 bytes and reject non-ELF
 /// before opening the TCP socket. Without this, picking the wrong
 /// file silently streamed garbage to the loader, which then either
@@ -216,7 +226,7 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
     // ports and can load ALONGSIDE ps5upload, so they must NOT knock it
     // offline. Determined here while the file is already open.
     let mut sending_ps5upload = false;
-    if target_port == PS5_LOADER_PORT {
+    if target_port == loader_port() {
         if size < 4 {
             return Err(format!("not an ELF file: {path} (only {size} bytes)"));
         }
@@ -262,7 +272,7 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
     // connection. (On a single-payload loader the loader itself may still
     // clobber ps5upload; that's outside our control, and the post-install
     // payload restore — which IS a ps5upload send — cleans up the ports.)
-    if target_port == PS5_LOADER_PORT && sending_ps5upload {
+    if target_port == loader_port() && sending_ps5upload {
         let host = ip.to_string();
         // Off the async runtime — the management call is blocking I/O.
         let _ = tokio::task::spawn_blocking(move || {
@@ -277,7 +287,7 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
     }
 
     // A ps5upload helper is sent from memory so its AVA1 trust slot can be stamped.
-    let helper_bytes = if target_port == PS5_LOADER_PORT && sending_ps5upload {
+    let helper_bytes = if target_port == loader_port() && sending_ps5upload {
         let mut v = Vec::with_capacity(size as usize);
         file.read_to_end(&mut v)
             .await
@@ -350,13 +360,13 @@ async fn do_payload_send(ip: &str, path: &str, target_port: u16) -> Result<u64, 
 /// the file, half-close the write side (the loader uses EOF as the
 /// "go execute" signal).
 ///
-/// `port` is optional — defaults to `PS5_LOADER_PORT` (9021). Pass an
+/// `port` is optional — defaults to `loader_port()` (the user's setting, 9021 by default). Pass an
 /// override for scene payloads that bind a different loader port (some
 /// custom builds do). The Connection screen's fast-path send always
 /// uses the default; the Send-payload screen exposes a port field.
 #[tauri::command]
 pub async fn payload_send(ip: String, path: String, port: Option<u16>) -> serde_json::Value {
-    let target_port = port.unwrap_or(PS5_LOADER_PORT);
+    let target_port = port.unwrap_or_else(loader_port);
     match do_payload_send(&ip, &path, target_port).await {
         Ok(n) => serde_json::json!({
             "ok": true,
@@ -368,7 +378,7 @@ pub async fn payload_send(ip: String, path: String, port: Option<u16>) -> serde_
         // console's Payload Manager instead. A wedged elfldr leaves :9021 dead
         // while Payload Manager stays up, and the helper could not be put back
         // until the user reloaded elfldr by hand (#344).
-        Err(e) if target_port == PS5_LOADER_PORT && e.starts_with("connect ") => {
+        Err(e) if target_port == loader_port() && e.starts_with("connect ") => {
             match payload_send_via_payload_manager(&ip, &path).await {
                 Ok(n) => serde_json::json!({
                     "ok": true,
@@ -849,7 +859,7 @@ mod payload_send_tests {
 
         // Port 0 would also fail to connect, but the magic check fires
         // first because we open and peek before connecting.
-        let err = do_payload_send("127.0.0.1", p.to_str().unwrap(), PS5_LOADER_PORT)
+        let err = do_payload_send("127.0.0.1", p.to_str().unwrap(), loader_port())
             .await
             .unwrap_err();
         assert!(
@@ -863,7 +873,7 @@ mod payload_send_tests {
         let tmp = tempdir();
         let p = write_fixture(&tmp, "tiny.elf", b"AB");
 
-        let err = do_payload_send("127.0.0.1", p.to_str().unwrap(), PS5_LOADER_PORT)
+        let err = do_payload_send("127.0.0.1", p.to_str().unwrap(), loader_port())
             .await
             .unwrap_err();
         assert!(
@@ -880,7 +890,7 @@ mod payload_send_tests {
         // on a non-default port and asserting success + bytes match.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        assert_ne!(port, PS5_LOADER_PORT, "ephemeral port must not be 9021");
+        assert_ne!(port, loader_port(), "ephemeral port must not be 9021");
 
         let received = tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
@@ -944,7 +954,7 @@ mod payload_send_tests {
         f.set_len(PAYLOAD_SEND_MAX_BYTES + 1).unwrap();
         drop(f);
 
-        let err = do_payload_send("127.0.0.1", p.to_str().unwrap(), PS5_LOADER_PORT)
+        let err = do_payload_send("127.0.0.1", p.to_str().unwrap(), loader_port())
             .await
             .unwrap_err();
         assert!(err.contains("too large"), "expected size cap, got: {err}");

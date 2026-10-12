@@ -16,7 +16,6 @@ import {
   useConnectionFrozen,
   useConnectionStore,
   EMPTY_HOST_RUNTIME,
-  PS5_LOADER_PORT,
 } from "../state/connection";
 import { usePayloadPlaylistsStore } from "../state/payloadPlaylists";
 import { log } from "../state/logs";
@@ -85,7 +84,6 @@ import { useWindowStatePersistence } from "../lib/windowState";
 import {
   mgmtAddr,
   hostOf,
-  PS5_AVA1_PORT,
 } from "../lib/addr";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { useUploadQueueStore } from "../state/uploadQueue";
@@ -107,6 +105,7 @@ import { GlobalPackageViewer } from "../components/GlobalPackageViewer";
 import { dropTarget, usePackageViewer } from "../state/packageViewer";
 import { installConvertRunner } from "../lib/convertQueueRunner";
 import { recordAppEvent } from "../lib/appJournal";
+import { loaderPort, helperPort, syncConsolePorts } from "../state/consolePorts";
 
 // The Convert queue builds through the Convert pipeline wherever the user is in the app.
 installConvertRunner();
@@ -187,7 +186,7 @@ async function runAutoLoaderOnce(
     return;
   }
   log.info("connection", `auto-loader: running "${playlistName}" on ${host}`);
-  await usePayloadPlaylistsStore.getState().run(playlistId, host, PS5_LOADER_PORT);
+  await usePayloadPlaylistsStore.getState().run(playlistId, host, loaderPort());
   await new Promise((r) => setTimeout(r, AUTO_LOADER_SETTLE_MS));
   const after = await consoleBootAndProcesses(host);
   if (after.boot !== null && after.names !== null) {
@@ -763,7 +762,7 @@ function useAutoRedeployDownHelpers() {
         // connects only, never an RPC.
         const portsOpen = (
           await Promise.all(
-            [PS5_AVA1_PORT].map((port) =>
+            [helperPort()].map((port) =>
               portCheck(hostOf(host) || host, port).catch(() => false),
             ),
           )
@@ -789,7 +788,7 @@ function useAutoRedeployDownHelpers() {
         // of its chain; a helper pushed into that window lands before the
         // kernel patches it relies on and crashed an FW 11.40 console three
         // times out of three. Wait until :9021 has been open a while.
-        const loaderOpen = await portCheck(hostOf(host) || host, PS5_LOADER_PORT).catch(
+        const loaderOpen = await portCheck(hostOf(host) || host, loaderPort()).catch(
           () => false,
         );
         if (cancelled) return;
@@ -1352,6 +1351,10 @@ function AndroidLocalNetworkBanner() {
 }
 
 export default function AppShell() {
+  // The user's loader/helper ports reach the shell and engine before anything dials the console.
+  useEffect(() => {
+    void syncConsolePorts();
+  }, []);
   useStatusPolling();
   useAutoSaveBackup();
   useAutoRedeployDownHelpers();

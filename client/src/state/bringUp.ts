@@ -1,7 +1,6 @@
 import { create } from "zustand";
 
 import { hostOf } from "../lib/addr";
-import { PS5_LOADER_PORT } from "./connection";
 import { sendHelperAndWait } from "./helperSendRuntime";
 import type { Translator } from "./lang";
 import { log } from "./logs";
@@ -9,6 +8,7 @@ import {
   runStatusForHost,
   usePayloadPlaylistsStore,
 } from "./payloadPlaylists";
+import { loaderPort } from "./consolePorts";
 
 /**
  * Quick bring-up — one-tap cold-boot of a PS5 to a usable state.
@@ -76,7 +76,7 @@ export const useBringUpStore = create<BringUpState>((set, get) => ({
         put({ kind: "running", host: bare, phase, detail: playlist.name });
         // run() resolves when the whole playlist (incl. sleeps) finishes; it
         // records failure in per-host run status rather than throwing.
-        await pl.run(playlist.id, h, PS5_LOADER_PORT);
+        await pl.run(playlist.id, h, loaderPort());
         const rs = runStatusForHost(usePayloadPlaylistsStore.getState(), h);
         if (rs.kind === "failed") {
           const step = "stepIndex" in rs ? rs.stepIndex + 1 : 0;
@@ -107,7 +107,7 @@ export const useBringUpStore = create<BringUpState>((set, get) => ({
           "connection",
           `bring-up: running auto-loader "${post.name}" on ${h}`,
         );
-        void plg.run(post.id, h, PS5_LOADER_PORT);
+        void plg.run(post.id, h, loaderPort());
       }
 
       put({ kind: "done", host: bare });

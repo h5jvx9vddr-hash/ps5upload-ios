@@ -28,6 +28,7 @@ pub mod patch_verify;
 pub mod payload_lifecycle;
 pub mod payload_manager;
 pub mod pkg_install;
+pub mod ports;
 pub mod process_mgr;
 pub mod profile;
 pub mod rar_stream;

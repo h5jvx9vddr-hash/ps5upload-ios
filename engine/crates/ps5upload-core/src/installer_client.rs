@@ -12,7 +12,6 @@ use serde_json::Value;
 use crate::payload_lifecycle::{
     join_host_port, port_is_open, send_elf_to_loader, LoaderImage, DPI_REASON_LOADER_SEND_FAILED,
     DPI_REASON_LOADER_UNREACHABLE, DPI_REASON_NO_BRINGUP, DPI_REASON_NO_IMAGE, INSTALLER_PORT,
-    PS5_LOADER_PORT,
 };
 
 /// The name the installer is stored under when Payload Manager launches it.
@@ -296,12 +295,13 @@ fn ensure_with(
     // is gone or refuses the send. On setups with Payload Manager and the
     // WebKit Autoloader, :9021 is often dead while Payload Manager is up, and
     // every install used to stop here (#344, #345).
-    let loader = join_host_port(ip, PS5_LOADER_PORT);
+    let loader_port = crate::ports::loader_port();
+    let loader = join_host_port(ip, loader_port);
     let loader_open = port_is_open(&loader, PROBE_TIMEOUT);
     let loader_result = if loader_open {
-        send_elf_to_loader(ip, PS5_LOADER_PORT, bytes, LoaderImage::Companion)
+        send_elf_to_loader(ip, loader_port, bytes, LoaderImage::Companion)
     } else {
-        Err("nothing answered on the ELF loader port :9021".to_string())
+        Err(format!("nothing answered on the ELF loader port :{loader_port}"))
     };
     let mut via_payload_manager = false;
     if let Err(loader_err) = loader_result {

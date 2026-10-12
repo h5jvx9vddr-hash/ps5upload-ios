@@ -30,7 +30,7 @@ use crate::net::resolve_connect_targets;
 
 /// The PS5 ELF loader's well-known port. Bytes written here are executed
 /// as a fresh process once the sender half-closes the socket.
-pub const PS5_LOADER_PORT: u16 = 9021;
+pub const PS5_LOADER_PORT: u16 = crate::ports::DEFAULT_LOADER_PORT;
 
 /// Why a `dpi-ensure` failed, in a form a UI can branch on. Prose is a bad
 /// contract: 5.17.6 collapsed three unrelated causes into one message that
@@ -185,7 +185,7 @@ pub enum LoaderImage {
 /// exits. A non-loader port is a scene loader on its own port, which never
 /// contends with our helper.
 fn should_evict_running_payload(port: u16, image: LoaderImage) -> bool {
-    port == PS5_LOADER_PORT && image == LoaderImage::Ps5Upload
+    port == crate::ports::loader_port() && image == LoaderImage::Ps5Upload
 }
 
 /// Eviction is gated on `image` — see `LoaderImage` for why that is a

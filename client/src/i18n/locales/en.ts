@@ -322,6 +322,10 @@ volumes_empty_message: "The payload didn't return any writable drives. Make sure
 // Connection screen — body copy
 connection_check: "Check",
 connection_check_tooltip: "Probe {host}:{port} to confirm it's reachable",
+connection_loader_port: "Loader port",
+connection_loader_port_hint: "ELF loader, default {port}",
+connection_helper_port: "Helper port",
+connection_helper_port_hint: "PS5Upload helper, default {port}",
 connection_step1_hint: "Find this in the PS5's network settings, or on your router's device list. A wired Ethernet connection is strongly recommended over Wi-Fi.",
 connection_step2_busy_hint: "The PS5 typically boots the helper within 3-5 seconds. We keep polling for up to 20 seconds before giving up — if it times out, send it again.",
 connection_step3_ready: "PS5 is ready",

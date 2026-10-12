@@ -1,5 +1,4 @@
 import { bundledPayloadPath, payloadCheck, sendPayload } from "../api/ps5";
-import { PS5_LOADER_PORT } from "../lib/addr";
 import { isNotPairedError, reportIfNotPaired } from "../lib/consoleSession";
 import { STUCK_LOADER_MESSAGE, waitForLoader } from "../lib/elfldrGuard";
 import { useConnectionStore } from "./connection";
@@ -14,6 +13,7 @@ import { invoke } from "../lib/invokeLogged";
 import { sendHelperOnce, sendInFlight, sentAgoMs } from "../lib/helperSendGate";
 import { isTauriEnv } from "../lib/tauriEnv";
 import { trStatic } from "../lib/trStatic";
+import { loaderPort } from "./consolePorts";
 
 /** The web UI has no helper file to send and no socket to the console: the engine sends its
  *  own bundled helper, stamped with its key, so it is paired by the send (#415). */
@@ -109,7 +109,7 @@ export function sendHelperTo(
       sending: (elf) =>
         tr(
           "connection_sending_elf",
-          { elf, host: target, port: PS5_LOADER_PORT },
+          { elf, host: target, port: loaderPort() },
           "Sending {elf} to {host}:{port}…",
         ),
       waiting: tr(

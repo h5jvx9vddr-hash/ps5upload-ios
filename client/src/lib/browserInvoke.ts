@@ -1526,6 +1526,12 @@ export async function browserInvoke<T>(
         qs("/api/ps5/port-check", { ip: args["ip"], port: args["port"] }),
       );
 
+    case "set_console_ports":
+      return postJson<T>("/api/console-ports", {
+        loader: args["loader"],
+        helper: args["helper"],
+      });
+
     // ── Native-only / unsupported ────────────────────────────────────────────
 
     default:

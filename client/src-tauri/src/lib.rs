@@ -534,6 +534,7 @@ pub fn run() {
             // Used by the Connection + Send payload tabs for
             // reachability checks and payload delivery.
             commands::port_check,
+            commands::set_console_ports,
             commands::payload_send,
             commands::payload_check,
             commands::payload_probe,

@@ -703,7 +703,7 @@ async fn payload_restore_handler(Json(req): Json<PayloadRestoreRequest>) -> Resp
         )?;
         pl::send_elf_to_loader(
             &ps5_ip,
-            pl::PS5_LOADER_PORT,
+            ps5upload_core::ports::loader_port(),
             &bytes,
             pl::LoaderImage::Ps5Upload,
         )

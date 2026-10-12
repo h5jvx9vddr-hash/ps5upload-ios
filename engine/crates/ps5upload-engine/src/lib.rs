@@ -3226,13 +3226,33 @@ struct HostQuery {
     host: String,
 }
 
-/// GET /api/ps5/elfldr/health?host= — whether the loader on :9021 answers (`healthy`), took
+#[derive(Debug, serde::Deserialize)]
+struct ConsolePortsReq {
+    loader: Option<u16>,
+    helper: Option<u16>,
+}
+
+/// GET/POST /api/console-ports — the loader and helper ports this engine dials
+/// (`ps5upload_core::ports`). POST `{loader?, helper?}`; 0 restores a default.
+async fn console_ports_get() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "loader": ps5upload_core::ports::loader_port(),
+        "helper": ps5upload_core::ports::helper_port(),
+    }))
+}
+
+async fn console_ports_set(Json(req): Json<ConsolePortsReq>) -> impl IntoResponse {
+    ps5upload_core::ports::set_ports(req.loader, req.helper);
+    console_ports_get().await
+}
+
+/// GET /api/ps5/elfldr/health?host= — whether the loader (:9021 by default) answers (`healthy`), took
 /// the connection and never answered (`stuck`), or isn't there (`absent`).
 async fn ps5_elfldr_health(Query(q): Query<HostQuery>) -> impl IntoResponse {
     let health = tokio::task::spawn_blocking(move || {
         elfldr_guard::probe(
             q.host.trim(),
-            9021,
+            ps5upload_core::ports::loader_port(),
             std::time::Duration::from_secs(3),
             std::time::Duration::from_secs(5),
         )
@@ -9950,6 +9970,10 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/ps5/fs/read-preview", post(ps5_fs_read_preview))
         .route("/api/ps5/process/list", get(ps5_process_list))
         .route("/api/ps5/elfldr/health", get(ps5_elfldr_health))
+        .route(
+            "/api/console-ports",
+            get(console_ports_get).post(console_ports_set),
+        )
         .route("/api/ps5/pldmgr", get(pldmgr_api::overview))
         .route("/api/ps5/pldmgr/launch", post(pldmgr_api::launch))
         .route("/api/ps5/pldmgr/delete", post(pldmgr_api::delete))

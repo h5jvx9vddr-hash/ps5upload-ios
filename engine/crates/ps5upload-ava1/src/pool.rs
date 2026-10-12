@@ -16,10 +16,11 @@ use ava1::peers::PeerStore;
 use ava1::session::{connect_expecting, Session, Timing};
 use ava1::Ava1Error;
 
-/// `host:9120` — the AVA1 default port. The lab can override an address on
-/// its own Pool; a process environment variable cannot redirect engine jobs.
+/// `host:9120` — the AVA1 default port, or the user's helper port setting
+/// (`ps5upload_core::ports`). The lab can override an address on its own Pool;
+/// a process environment variable cannot redirect engine jobs.
 pub fn ava1_addr(console: &str) -> String {
-    format!("{}:{}", host_of(console), ava1::gen::DEFAULT_PORT)
+    format!("{}:{}", host_of(console), ps5upload_core::ports::helper_port())
 }
 
 /// The console string without its port (the pool's key).

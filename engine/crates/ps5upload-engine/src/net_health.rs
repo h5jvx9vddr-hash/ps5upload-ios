@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use ps5upload_core::health::{CheckCategory, CheckStatus, HealthCheck};
-use ps5upload_core::payload_lifecycle::{probe_port, INSTALLER_PORT, PS5_LOADER_PORT};
+use ps5upload_core::payload_lifecycle::{probe_port, INSTALLER_PORT};
 
 const PORT_TIMEOUT: Duration = Duration::from_millis(1500);
 const REACH_TIMEOUT_MS: u32 = 3000;
@@ -38,7 +38,10 @@ pub(crate) fn loader_port_check(open: Result<(), String>) -> HealthCheck {
             "loader_port",
             "PS5 payload loader (port 9021)",
             CheckStatus::Warn,
-            format!("Nothing answered on port {PS5_LOADER_PORT} ({e})."),
+            format!(
+                "Nothing answered on port {} ({e}).",
+                ps5upload_core::ports::loader_port()
+            ),
         )
         .with_remedy(
             "The helper that is already running keeps working, but it cannot be sent again or \
@@ -286,7 +289,7 @@ pub(crate) fn network_checks(addr: &str, helper_up: bool) -> Vec<HealthCheck> {
 
     out.push(loader_port_check(probe_port(
         &host,
-        PS5_LOADER_PORT,
+        ps5upload_core::ports::loader_port(),
         PORT_TIMEOUT,
     )));
 

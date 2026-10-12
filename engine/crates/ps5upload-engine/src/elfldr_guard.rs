@@ -17,8 +17,8 @@ use serde::Serialize;
 
 use crate::bundled_payload::{image_bytes, Image};
 
-/// The loader port and the process name elfldr gives itself.
-const LOADER_PORT: u16 = 9021;
+/// The process name elfldr gives itself. The loader port is the user's setting
+/// (`ps5upload_core::ports`, 9021 by default).
 const ELFLDR_NAME: &str = "elfldr.elf";
 
 /// A request elfldr answers without running anything: it asks for a file that isn't there,
@@ -233,7 +233,7 @@ pub fn ensure(host: &str) -> Result<Outcome, String> {
         .or_else(|| remembered_pid(load_remembered(host), console_booted_at(&mgmt)));
     let health = probe(
         host,
-        LOADER_PORT,
+        ps5upload_core::ports::loader_port(),
         Duration::from_secs(3),
         Duration::from_secs(5),
     );
@@ -272,7 +272,7 @@ pub fn ensure(host: &str) -> Result<Outcome, String> {
                 let now = elfldr_pids(&mgmt).unwrap_or_default();
                 let answering = probe(
                     host,
-                    LOADER_PORT,
+                    ps5upload_core::ports::loader_port(),
                     Duration::from_secs(2),
                     Duration::from_secs(3),
                 );
@@ -289,11 +289,19 @@ pub fn ensure(host: &str) -> Result<Outcome, String> {
                 }
             }
             ps5upload_core::payload_manager::forget(host, "ps5upload-elfldr.elf");
-            Err("launched the patched elfldr through Payload Manager, but it was not answering on :9021 within 20 s".into())
+            Err(format!(
+                "launched the patched elfldr through Payload Manager, but it was not answering on :{} within 20 s",
+                ps5upload_core::ports::loader_port()
+            ))
         }
         Decision::Upgrade => {
             let bytes = image_bytes(Image::Elfldr)?;
-            pl::send_elf_to_loader(host, LOADER_PORT, &bytes, LoaderImage::Companion)?;
+            pl::send_elf_to_loader(
+                host,
+                ps5upload_core::ports::loader_port(),
+                &bytes,
+                LoaderImage::Companion,
+            )?;
             // The new elfldr kills the old one by name and takes the port; wait until it answers.
             let deadline = Instant::now() + Duration::from_secs(20);
             while Instant::now() < deadline {
@@ -301,7 +309,7 @@ pub fn ensure(host: &str) -> Result<Outcome, String> {
                 let now = elfldr_pids(&mgmt).unwrap_or_default();
                 let answering = probe(
                     host,
-                    LOADER_PORT,
+                    ps5upload_core::ports::loader_port(),
                     Duration::from_secs(2),
                     Duration::from_secs(3),
                 );
@@ -315,7 +323,10 @@ pub fn ensure(host: &str) -> Result<Outcome, String> {
                     });
                 }
             }
-            Err("the patched elfldr was sent but was not answering on :9021 within 20 s".into())
+            Err(format!(
+                "the patched elfldr was sent but was not answering on :{} within 20 s",
+                ps5upload_core::ports::loader_port()
+            ))
         }
     }
 }

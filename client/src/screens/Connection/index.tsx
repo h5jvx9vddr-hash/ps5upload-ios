@@ -5,7 +5,6 @@ import { getAppVersion } from "../../lib/appVersion";
 import { isTauriEnv } from "../../lib/tauriEnv";
 import {
   useConnectionStore,
-  PS5_LOADER_PORT,
   type ConnStep,
 } from "../../state/connection";
 import {
@@ -39,6 +38,8 @@ import { useTr } from "../../state/lang";
 import PowerControl from "./PowerControl";
 import { BringUpPanel } from "./BringUpPanel";
 import { formatBytes } from "../../lib/format";
+import { loaderPort } from "../../state/consolePorts";
+import { ConsolePortsFields } from "../../components/ConsolePortsFields";
 
 type StepState = "idle" | "busy" | "ok" | "fail";
 
@@ -345,8 +346,8 @@ export default function ConnectionScreen() {
       if ((transientStep1 ?? storedStep1) !== "ok") {
         settleStep1("ok", tr(
           "connection_port_open",
-          { port: PS5_LOADER_PORT, host },
-          `Port ${PS5_LOADER_PORT} is open on ${host}`,
+          { port: loaderPort(), host },
+          `Port ${loaderPort()} is open on ${host}`,
         ));
       }
       clearHelperSend(host);
@@ -458,7 +459,7 @@ export default function ConnectionScreen() {
       "busy",
       tr(
         "connection_checking",
-        { target, port: PS5_LOADER_PORT },
+        { target, port: loaderPort() },
         "Checking {target}:{port}…",
       ),
     );
@@ -466,12 +467,12 @@ export default function ConnectionScreen() {
     settleStep2("idle", tr("connection_payload_not_loaded", undefined, "Helper not loaded yet"), target);
     setTransientStep2(null);
     setTransientStep2Msg(null);
-    const probe = await portProbe(target, PS5_LOADER_PORT);
+    const probe = await portProbe(target, loaderPort());
     if (probe.open) {
       settleStep1("ok", tr(
           "connection_port_open",
-          { port: PS5_LOADER_PORT, host: target },
-          `Port ${PS5_LOADER_PORT} is open on ${target}`,
+          { port: loaderPort(), host: target },
+          `Port ${loaderPort()} is open on ${target}`,
         ), target);
     } else {
       // A closed loader port is not a problem when our helper is already
@@ -494,7 +495,7 @@ export default function ConnectionScreen() {
       // and the user has no way to tell the two apart (#272).
       const base = tr(
         "connection_port_closed",
-        { port: PS5_LOADER_PORT, host: target },
+        { port: loaderPort(), host: target },
         "Port {port} is not open on {host}",
       );
       const detail = probe.error ? `${base} — ${probe.error}` : base;
@@ -629,13 +630,14 @@ export default function ConnectionScreen() {
               loading={step1 === "busy"}
               title={tr(
                 "connection_check_tooltip",
-                { host: host || "the PS5", port: PS5_LOADER_PORT },
-                `Probe ${host || "the PS5"}:${PS5_LOADER_PORT} to confirm it's reachable`,
+                { host: host || "the PS5", port: loaderPort() },
+                `Probe ${host || "the PS5"}:${loaderPort()} to confirm it's reachable`,
               )}
             >
               {tr("connection_check", undefined, "Check")}
             </Button>
           </div>
+          <ConsolePortsFields disabled={step2 === "busy"} />
           <DiscoverPanel
             disabled={step2 === "busy"}
             currentHost={host}

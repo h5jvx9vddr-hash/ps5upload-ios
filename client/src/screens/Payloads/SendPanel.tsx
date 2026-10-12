@@ -15,7 +15,7 @@ import {
 
 import { Button, Spinner, Input } from "../../components";
 
-import { useConnectionStore, PS5_LOADER_PORT } from "../../state/connection";
+import { useConnectionStore } from "../../state/connection";
 import { sendPayload } from "../../api/ps5";
 import { useTr } from "../../state/lang";
 import { pushNotification } from "../../state/notifications";
@@ -27,6 +27,7 @@ import { dropIsOwnedElsewhere } from "./dropZone";
 import { probeVerdict } from "./probeVerdict";
 import { formatDate } from "../../lib/formatDate";
 import { typedHost } from "../../lib/addr";
+import { loaderPort } from "../../state/consolePorts";
 
 /**
  * Send tab of the Payloads screen — send any custom ELF (or BIN/JS/
@@ -88,7 +89,7 @@ function loaderPortForExt(path: string): number | null {
   if (p.endsWith(".js")) return 50000;
   if (p.endsWith(".lua")) return 9026;
   if (p.endsWith(".jar")) return 9025;
-  if (p.endsWith(".elf") || p.endsWith(".bin")) return PS5_LOADER_PORT;
+  if (p.endsWith(".elf") || p.endsWith(".bin")) return loaderPort();
   return null;
 }
 
@@ -123,7 +124,7 @@ export default function SendPanel() {
   // (picker writes both on success), and we want unsaved typing to not
   // disappear if the user clicks Send immediately.
   const [elfPathText, setElfPathText] = useState<string>("");
-  const [portText, setPortText] = useState<string>(String(PS5_LOADER_PORT));
+  const [portText, setPortText] = useState<string>(String(loaderPort()));
   // Once the user types in the port field (or replays a history record),
   // stop auto-deriving the port from the picked file's extension so a
   // deliberate custom port is never clobbered.
@@ -415,7 +416,7 @@ export default function SendPanel() {
                 setPortManuallyEdited(true);
                 clearSendBannerOnEdit();
               }}
-              placeholder={String(PS5_LOADER_PORT)}
+              placeholder={String(loaderPort())}
               inputMode="numeric"
               error={portValid ? undefined : " "}
             />
@@ -424,7 +425,7 @@ export default function SendPanel() {
             {tr("sendpayload_sent_to", undefined, "Sent to")}{" "}
             <code>{host || "…"}</code>:{parsedPort ?? portText}
             {tr("sendpayload_default", undefined, ". Default")}{" "}
-            {PS5_LOADER_PORT}{" "}
+            {loaderPort()}{" "}
             {tr(
               "sendpayload_elfldr_convention",
               undefined,
@@ -586,7 +587,7 @@ export default function SendPanel() {
                     undefined,
                     "Payload sent to",
                   )}{" "}
-                  {host}:{parsedPort ?? PS5_LOADER_PORT}
+                  {host}:{parsedPort ?? loaderPort()}
                 </div>
                 <div className="mt-0.5 text-[var(--color-muted)]">
                   {tr(
@@ -632,7 +633,7 @@ export default function SendPanel() {
         pick.
       </p>
 
-      <PlaylistsPanel host={host} port={parsedPort ?? PS5_LOADER_PORT} />
+      <PlaylistsPanel host={host} port={parsedPort ?? loaderPort()} />
     </div>
   );
 }
