@@ -1499,6 +1499,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+
+[[package]]
 name = "lzma-rust2"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2146,7 +2152,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "libc",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "num-bigint",
  "ps5upload-pkg",
  "serde",
@@ -2834,7 +2840,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "log",
- "lz4_flex",
+ "lz4_flex 0.13.1",
  "md-5",
  "md4",
  "num_enum",
