@@ -25,3 +25,7 @@ libc = "0.2"
 serde = { workspace = true }
 sha3 = "0.12"
 thiserror.workspace = true
+
+[dev-dependencies]
+# The exfat_read_bench example hashes files the way an image build's verify stage does.
+blake3.workspace = true

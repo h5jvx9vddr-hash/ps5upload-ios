@@ -1060,6 +1060,14 @@ name = "METHOD_USB_EJECT"
 ty = "u16"
 value = 144
 [[const]]
+name = "METHOD_SAVE_MOUNT"
+ty = "u16"
+value = 145
+[[const]]
+name = "METHOD_SAVE_UNMOUNT"
+ty = "u16"
+value = 146
+[[const]]
 name = "JOB_OP_DELETE"
 ty = "u8"
 value = 1

@@ -56,6 +56,9 @@ export interface AmprPacksReadiness {
   runtime_version?: string | null;
   /** Why packs cannot be used for this game; null when they can. */
   refusal?: string | null;
+  /** `ok`; `runtime` (installing ampr_emu 0.4.2.1 into the image makes packs possible);
+   *  `no_ampr` (the game does not read through AMPR: .ffpfsc is its compression). */
+  kind?: "ok" | "runtime" | "no_ampr";
 }
 
 /** Pack a game image's files into AMPR LZ4 asset packs first (exFAT images only). */
@@ -64,6 +67,8 @@ export interface AmprLz4Options {
   level?: number;
   /** A profile in drakmor's ampr_pack TOML format, in place of the built-in one. */
   profileToml?: string;
+  /** Put ampr_emu 0.4.2.1 into the image when the game's own is missing or too old. */
+  installRuntime?: boolean;
 }
 
 export interface FpkgBuildRequest {
@@ -127,12 +132,18 @@ export const fpkg = {
     format: ImageFormat = "exfat",
     compress = false,
     lz4?: AmprLz4Options,
+    /** The read-back check's KiB per read (Convert's preference); the engine's default
+     *  when absent. */
+    verifyChunkKib?: number,
   ) =>
     invoke<{ job_id: string }>("exfat_build", {
       source,
       outputDir,
       format,
       compress,
-      amprLz4: lz4 ? { level: lz4.level, profile_toml: lz4.profileToml } : undefined,
+      amprLz4: lz4
+        ? { level: lz4.level, profile_toml: lz4.profileToml, install_runtime: lz4.installRuntime ?? false }
+        : undefined,
+      verifyChunkKib,
     }),
 };

@@ -58,18 +58,33 @@ async fn no_ava1_listener_surfaces_helper_not_running() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let (error, reason, detail) = wait_failed(&jobs).await;
     assert_eq!(reason.as_deref(), Some("helper_not_ava1"), "{error}");
-    let msg = "The PS5 helper is not running or is an old version. Desktop app: send it from the Connection screen, or click Update helper. Web UI: start the ps5upload payload on the console with your payload loader, or click Update helper.";
+    // Nothing listens on the helper's port; whether a loader answers on 9021 decides the
+    // wording (#447), and this machine normally has none.
+    let msg = not_running_message();
     assert_eq!(detail.as_deref(), Some(msg));
     assert_eq!(error, msg);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-const NOT_RUNNING: &str = "The PS5 helper is not running or is an old version. Desktop app: send it from the Connection screen, or click Update helper. Web UI: start the ps5upload payload on the console with your payload loader, or click Update helper.";
+/// The message a console with nothing on the helper's port gets (#447): it depends on
+/// whether a payload loader answers on this machine's port 9021 (normally not).
+fn not_running_message() -> &'static str {
+    let loader_up = std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:9021".parse().unwrap(),
+        std::time::Duration::from_secs(1),
+    )
+    .is_ok();
+    if loader_up {
+        ps5upload_ava1::console::HELPER_DOWN_LOADER_UP_MESSAGE
+    } else {
+        ps5upload_ava1::console::HELPER_DOWN_LOADER_DOWN_MESSAGE
+    }
+}
 
 async fn assert_helper_not_ava1(jobs: &Arc<Mutex<HashMap<Uuid, JobState>>>) {
     let (error, reason, _) = wait_failed(jobs).await;
     assert_eq!(reason.as_deref(), Some("helper_not_ava1"), "{error}");
-    assert_eq!(error, NOT_RUNNING);
+    assert_eq!(error, not_running_message());
 }
 
 #[tokio::test(flavor = "multi_thread")]

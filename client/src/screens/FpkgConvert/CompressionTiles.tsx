@@ -31,7 +31,7 @@ export function CompressionTiles({ value, onChange, estimates, disabled }: Compr
     <div
       role="radiogroup"
       aria-label={tr("fpkg.compression", undefined, "Compression")}
-      className="grid grid-cols-1 gap-2 min-[420px]:grid-cols-2 lg:grid-cols-4"
+      className="grid grid-cols-1 gap-2 min-[420px]:grid-cols-2 2xl:grid-cols-4"
     >
       {TILES.map((t) => {
         const checked = t.value === value;

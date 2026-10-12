@@ -756,6 +756,10 @@ pub(crate) struct ExfatBuildReq {
     /// Pack the game's files into AMPR LZ4 asset packs first (exFAT only, not with `compress`).
     #[serde(default)]
     ampr_lz4: Option<AmprLz4Req>,
+    /// How much of a file the read-back check reads per call, in KiB (1024 to 65536); 8192
+    /// when absent, which measured fastest.
+    #[serde(default)]
+    verify_chunk_kib: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -769,6 +773,10 @@ pub(crate) struct AmprLz4Req {
     /// A profile in drakmor's `ampr_pack` TOML format, used in place of the built-in one.
     #[serde(default)]
     profile_toml: Option<String>,
+    /// Put ampr_emu 0.4.2.1 into the image's `fakelib/libSceAmpr.sprx` (the game's own kept
+    /// as `.orig`) when the game ships none or one that predates asset packs.
+    #[serde(default)]
+    install_runtime: bool,
 }
 
 impl AmprLz4Req {
@@ -805,17 +813,26 @@ pub(crate) async fn exfat_build_handler(
     State(state): State<AppState>,
     Json(req): Json<ExfatBuildReq>,
 ) -> impl IntoResponse {
-    use ps5upload_fpkg::source::{FolderSource, SourceTree};
     let source = resolve_engine_path(&req.source);
-    if !tokio::fs::metadata(&source).await.is_ok_and(|m| m.is_dir()) {
+    // A game folder on this computer, on a saved server (`remote://`) or on a console
+    // (`ps5://`, read through the helper as a package build reads it): the opener below
+    // knows them all. A local path has to be a folder; an image or archive is not written
+    // as another image from here.
+    let remote = ps5upload_fpkg::remote_source::is_remote(&source);
+    let image_file = crate::image_build::is_image_file(&source);
+    if !remote && !image_file && !tokio::fs::metadata(&source).await.is_ok_and(|m| m.is_dir()) {
         return json_err(
             StatusCode::BAD_REQUEST,
-            format!("{} is not a folder", source.display()),
+            format!("{} is not a game folder or image", source.display()),
         )
         .into_response();
     }
     let format = match crate::image_build::ImageFormat::parse(req.format.as_deref()) {
         Ok(f) => f,
+        Err(e) => return json_err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let verify_chunk = match crate::image_build::verify_chunk(req.verify_chunk_kib) {
+        Ok(c) => c,
         Err(e) => return json_err(StatusCode::BAD_REQUEST, e).into_response(),
     };
     let packs = match &req.ampr_lz4 {
@@ -836,6 +853,17 @@ pub(crate) async fn exfat_build_handler(
     let out_dir = output_dir(req.output_dir.as_deref());
     let (out_name, inner_name) = crate::image_build::output_names(&source, format, req.compress);
     let output = out_dir.join(out_name);
+    if !remote
+        && image_file
+        && tokio::fs::canonicalize(&output).await.ok()
+            == tokio::fs::canonicalize(&source).await.ok()
+    {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "the image would be written over its own source: pick another format or output folder",
+        )
+        .into_response();
+    }
     if tokio::fs::try_exists(&output).await.unwrap_or(false) {
         return json_err(
             StatusCode::CONFLICT,
@@ -852,11 +880,32 @@ pub(crate) async fn exfat_build_handler(
     }
     let scan_source = source.clone();
     let check_packs = packs.is_some();
+    let install_runtime = req.ampr_lz4.as_ref().is_some_and(|r| r.install_runtime);
     let scanned = tokio::task::spawn_blocking(move || {
-        let mut tree = FolderSource::open(&scan_source).map_err(|e| e.to_string())?;
+        let mut tree = ps5upload_fpkg::source::open(&scan_source).map_err(|e| e.to_string())?;
+        if check_packs && install_runtime {
+            // The game's own ampr_emu is missing or too old for packs: the image gets the
+            // release one, its own kept beside it. Only for a game that reads through AMPR.
+            let ready = ps5upload_fpkg::ampr_pack::image::readiness(&mut *tree);
+            match ready.as_ref().map(|r| r.kind) {
+                Some("runtime") => {
+                    let bytes = crate::ampr_trace::release_runtime()?;
+                    tree = Box::new(
+                        ps5upload_fpkg::ampr_pack::image::RuntimeInstalled::new(tree, bytes)
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                Some("ok") => {}
+                _ => {
+                    return Err(ready
+                        .and_then(|r| r.refusal)
+                        .unwrap_or_else(|| "the game cannot use asset packs".into()))
+                }
+            }
+        }
         // Refused here, before a job exists, when the game cannot use the packs.
         if check_packs {
-            if let Some(why) = ps5upload_fpkg::ampr_pack::image::refusal(&mut tree) {
+            if let Some(why) = ps5upload_fpkg::ampr_pack::image::refusal(&mut *tree) {
                 return Err(why);
             }
         }
@@ -979,20 +1028,35 @@ pub(crate) async fn exfat_build_handler(
         let outcome = match &packs {
             Some(packs) => crate::image_build::build_packed(
                 format,
-                &mut tree,
+                &mut *tree,
                 &output,
                 packs,
+                verify_chunk,
                 &cancel,
                 &mut report,
             ),
-            None => crate::image_build::build(
-                format,
-                inner_name.as_deref(),
-                &mut tree,
-                &output,
-                &cancel,
-                &mut report,
-            ),
+            // A libSceAmpr game gets a fresh ampr_emu.index (#449), as a package does.
+            None => match crate::image_build::AmprIndexed::wrap(&mut *tree) {
+                Ok(Some(mut indexed)) => crate::image_build::build(
+                    format,
+                    inner_name.as_deref(),
+                    &mut indexed,
+                    &output,
+                    verify_chunk,
+                    &cancel,
+                    &mut report,
+                ),
+                Ok(None) => crate::image_build::build(
+                    format,
+                    inner_name.as_deref(),
+                    &mut *tree,
+                    &output,
+                    verify_chunk,
+                    &cancel,
+                    &mut report,
+                ),
+                Err(e) => Err(format!("ampr_emu.index: {e}")),
+            },
         };
         drop(writing);
         drop(spooling);

@@ -94,6 +94,8 @@ describe("PS5 to PS5", () => {
       to: "10.0.0.3",
       dest: "/data/b",
       tx_id: null,
+      route: "auto",
+      direct_addr: null,
     });
   });
 

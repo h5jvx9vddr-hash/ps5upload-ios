@@ -15,6 +15,7 @@ import type { FpkgInspection } from "../../api/fpkg";
 import { CompressionTiles } from "./CompressionTiles";
 import { firmwareLine, GameCard, type GameCardProps } from "./GameCard";
 import { MemoryRouter } from "react-router";
+import { MakeCard } from "./MakeCard";
 import { OptionsCard } from "./OptionsCard";
 import { pendingJournals, SwapJournalsView } from "./SwapJournals";
 import type { ConvertBuild, ConvertItem } from "../../state/convertQueue";
@@ -56,6 +57,56 @@ describe("CompressionTiles", () => {
       expect(out).not.toContain("Estimating");
       expect(out).toContain("—");
     }
+  });
+});
+
+describe("MakeCard", () => {
+  it("explains both, and marks the image for a PS5 game the firmware will not play as a package", () => {
+    const fw = renderToStaticMarkup(
+      <MakeCard make="pkg" onMake={() => {}} kernel="r229358/releases/13.60" contentId="UP9000-PPSA03671_00-X" checked />,
+    );
+    expect(fw).toContain("A package (.pkg)");
+    expect(fw).toContain("A game image");
+    expect(fw).toContain("Recommended on FW 13.60");
+    expect(fw).toContain("not play on FW 13.60");
+    const ps4 = renderToStaticMarkup(
+      <MakeCard make="pkg" onMake={() => {}} kernel="r229358/releases/13.60" contentId="UP9000-CUSA01234_00-X" checked />,
+    );
+    expect(ps4).not.toContain("Recommended on FW");
+    expect(ps4.match(/Recommended/g)).toHaveLength(1);
+    const none = renderToStaticMarkup(<MakeCard make="pkg" onMake={() => {}} kernel={null} contentId={null} checked={false} />);
+    expect(none).not.toContain("Recommended");
+    expect(none).toContain("Check a game under");
+  });
+});
+
+describe("OptionsCard for an image", () => {
+  const props = {
+    outputDir: "/out",
+    onChangeOutput: () => {},
+    onOutputTyped: () => {},
+    canBrowse: true,
+    compression: "balanced" as const,
+    onCompression: () => {},
+    estimates: undefined,
+    locked: false,
+  };
+  it("shows the image's options in place of the package's compression and language", () => {
+    const out = renderToStaticMarkup(
+      <OptionsCard
+        {...props}
+        make="image"
+        image={{ format: "ffpkg", compress: false, onChoice: () => {} }}
+        language="de-DE"
+        onLanguage={() => {}}
+      />,
+    );
+    expect(out).toContain(".ffpkg (UFS2), recommended");
+    expect(out).toContain("Compress it into a .ffpfsc");
+    expect(out).not.toContain("fpkg-language");
+    expect(out).not.toContain("Balanced");
+    const pkg = renderToStaticMarkup(<OptionsCard {...props} make="pkg" language="" onLanguage={() => {}} />);
+    expect(pkg).toContain("fpkg-language");
   });
 });
 

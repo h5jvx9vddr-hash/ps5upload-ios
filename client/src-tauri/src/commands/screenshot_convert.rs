@@ -58,9 +58,13 @@ pub async fn screenshot_convert(
     src_path: String,
     dst_path: String,
     delete_source: bool,
+    // `sdr` (default: tone-mapped 8-bit sRGB), `hdr` (16-bit PQ BT.2020 with a cICP chunk) or
+    // `hdr_plain` (the same without the chunk, for viewers that choke on it; #448).
+    mode: Option<String>,
 ) -> Result<String, String> {
+    let mode = mode.unwrap_or_else(|| "sdr".to_string());
     tokio::task::spawn_blocking(move || {
-        convert_in_child(&src_path, &dst_path)?;
+        convert_in_child(&src_path, &dst_path, &mode)?;
         // Only remove the original after the PNG is safely written, and
         // never if it somehow resolves to the same path as the output.
         if delete_source && src_path != dst_path {
@@ -89,12 +93,13 @@ const CHILD_ARG: &str = "--ps5upload-jxr-to-png";
     target_os = "ios",
     all(target_os = "windows", target_arch = "aarch64")
 )))]
-fn convert_in_child(src_path: &str, dst_path: &str) -> Result<(), String> {
+fn convert_in_child(src_path: &str, dst_path: &str, mode: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("locate the app: {e}"))?;
     let out = std::process::Command::new(exe)
         .arg(CHILD_ARG)
         .arg(src_path)
         .arg(dst_path)
+        .arg(mode)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("start the decoder: {e}"))?;
@@ -123,12 +128,13 @@ fn convert_in_child(src_path: &str, dst_path: &str) -> Result<(), String> {
 )))]
 pub fn child_mode() -> bool {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) != Some(CHILD_ARG) || args.len() != 4 {
+    if args.get(1).map(String::as_str) != Some(CHILD_ARG) || !(4..=5).contains(&args.len()) {
         return false;
     }
+    let mode = desktop::Mode::parse(args.get(4).map(String::as_str));
     let result = std::fs::read(&args[2])
         .map_err(|e| format!("read {}: {e}", args[2]))
-        .and_then(|bytes| desktop::convert_jxr_to_png(&bytes))
+        .and_then(|bytes| desktop::convert_jxr_to_png(&bytes, mode))
         .and_then(|png| {
             std::fs::write(&args[3], png).map_err(|e| format!("write {}: {e}", args[3]))
         });
@@ -165,6 +171,7 @@ pub async fn screenshot_convert(
     _src_path: String,
     _dst_path: String,
     _delete_source: bool,
+    _mode: Option<String>,
 ) -> Result<String, String> {
     Err("Screenshot conversion is available in the desktop app only.".into())
 }
@@ -179,8 +186,30 @@ mod desktop {
     use jpegxr::{ImageDecode, PixelFormat, PixelInfo};
     use std::io::Cursor;
 
-    /// Decode a JPEG XR byte buffer and return PNG-encoded bytes (RGB8).
-    pub fn convert_jxr_to_png(jxr: &[u8]) -> Result<Vec<u8>, String> {
+    /// What the PNG carries.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Mode {
+        /// Tone-mapped to SDR, 8-bit sRGB: opens everywhere.
+        Sdr,
+        /// 16-bit BT.2020 PQ, as captured, with a cICP chunk (primaries 9, transfer 16, matrix
+        /// 0, full range) so HDR-aware viewers and browsers show it as HDR (#448).
+        Hdr { cicp: bool },
+    }
+
+    impl Mode {
+        pub fn parse(s: Option<&str>) -> Self {
+            match s {
+                Some("hdr") => Mode::Hdr { cicp: true },
+                Some("hdr_plain") => Mode::Hdr { cicp: false },
+                _ => Mode::Sdr,
+            }
+        }
+    }
+
+    /// Decode a JPEG XR byte buffer and return PNG-encoded bytes: RGB8 tone-mapped for
+    /// [`Mode::Sdr`]; 16-bit PQ BT.2020 for [`Mode::Hdr`] when the capture is HDR (an SDR
+    /// capture has nothing more to give and comes out as 8-bit sRGB either way).
+    pub fn convert_jxr_to_png(jxr: &[u8], mode: Mode) -> Result<Vec<u8>, String> {
         // Validate the JPEG XR file signature before handing the buffer to
         // the C codec (jxrlib). A truncated or corrupted .jxr — common for
         // PS5 thumbnail variants that are still being written, or a
@@ -205,12 +234,198 @@ mod desktop {
                 &jxr[..4]
             ));
         }
+        if let Mode::Hdr { cicp } = mode {
+            if let Some((width, height, rgb16)) = decode_to_pq16(jxr)? {
+                // The capture's own ICC profile (Sony's "ScreenCapturePQ"): viewers that do
+                // not read cICP, and HDR-capable browsers, show the image as HDR through it.
+                let icc = jxr_icc_profile(jxr);
+                return encode_png16(width, height, &rgb16, cicp, icc.as_deref());
+            }
+        }
         let (width, height, rgb8) = decode_to_rgb8(jxr)?;
         let mut out = Vec::new();
         image::codecs::png::PngEncoder::new(Cursor::new(&mut out))
             .write_image(&rgb8, width, height, image::ExtendedColorType::Rgb8)
             .map_err(|e: ImageError| format!("png encode: {e}"))?;
         Ok(out)
+    }
+
+    /// The ICC profile embedded in a JPEG XR container, if any. The container is TIFF-like:
+    /// `II`/`MM`, 0xBC, version, then an IFD whose entries are (tag u16, type u16, count u32,
+    /// value-or-offset u32); the profile is TIFF's InterColorProfile tag 0x8773 (JXRMeta.h's
+    /// WMP_tagIccProfile), type UNDEFINED, its bytes at the offset.
+    pub fn jxr_icc_profile(jxr: &[u8]) -> Option<Vec<u8>> {
+        if jxr.len() < 8 || jxr[2] != 0xBC {
+            return None;
+        }
+        let le = match &jxr[0..2] {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        let u16_at = |at: usize| -> Option<u16> {
+            let b = jxr.get(at..at + 2)?;
+            Some(if le {
+                u16::from_le_bytes([b[0], b[1]])
+            } else {
+                u16::from_be_bytes([b[0], b[1]])
+            })
+        };
+        let u32_at = |at: usize| -> Option<u32> {
+            let b = jxr.get(at..at + 4)?;
+            Some(if le {
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            } else {
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            })
+        };
+        let ifd = u32_at(4)? as usize;
+        let entries = u16_at(ifd)? as usize;
+        for i in 0..entries.min(4096) {
+            let e = ifd + 2 + i * 12;
+            if u16_at(e)? != 0x8773 {
+                continue;
+            }
+            let count = u32_at(e + 4)? as usize;
+            let at = u32_at(e + 8)? as usize;
+            // Four bytes or fewer live in the entry itself; a profile never does.
+            if count <= 4 || count > 16 << 20 {
+                return None;
+            }
+            return jxr.get(at..at.checked_add(count)?).map(<[u8]>::to_vec);
+        }
+        None
+    }
+
+    /// A 16-bit RGB PNG (big-endian samples, as PNG stores them). Right after IHDR: the
+    /// capture's ICC profile as iCCP when it has one, and a cICP chunk when asked (BT.2020
+    /// primaries 9, PQ transfer 16, RGB 0, full range 1).
+    fn encode_png16(
+        width: u32,
+        height: u32,
+        rgb16: &[u16],
+        cicp: bool,
+        icc: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(rgb16.len() * 2 / 2);
+        {
+            let mut enc = png::Encoder::new(&mut out, width, height);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Sixteen);
+            let mut w = enc.write_header().map_err(|e| format!("png header: {e}"))?;
+            if let Some(profile) = icc {
+                w.write_chunk(png::chunk::ChunkType(*b"iCCP"), &iccp_chunk(profile))
+                    .map_err(|e| format!("png iCCP: {e}"))?;
+            }
+            if cicp {
+                w.write_chunk(png::chunk::ChunkType(*b"cICP"), &[9, 16, 0, 1])
+                    .map_err(|e| format!("png cICP: {e}"))?;
+            }
+            let mut bytes = Vec::with_capacity(rgb16.len() * 2);
+            for v in rgb16 {
+                bytes.extend_from_slice(&v.to_be_bytes());
+            }
+            w.write_image_data(&bytes)
+                .map_err(|e| format!("png data: {e}"))?;
+            w.finish().map_err(|e| format!("png finish: {e}"))?;
+        }
+        Ok(out)
+    }
+
+    /// An iCCP chunk body: profile name, NUL, compression method 0, zlib-compressed profile.
+    fn iccp_chunk(profile: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut body = b"ScreenCapturePQ\0\0".to_vec();
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        let _ = z.write_all(profile);
+        body.extend(z.finish().unwrap_or_default());
+        body
+    }
+
+    /// The capture as 16-bit BT.2020 PQ codes, or `None` for an SDR capture. A PS5 capture
+    /// is PQ already (10 bits in a 16-bit word on a 4K capture, scaled to the full 16 bits);
+    /// an scRGB float capture is converted to the same.
+    fn decode_to_pq16(jxr: &[u8]) -> Result<Option<(u32, u32, Vec<u16>)>, String> {
+        let (w, h, raw, bpp, kind) = decode_raw(jxr)?;
+        let npix = w * h;
+        let mut out: Vec<u16> = Vec::with_capacity(npix * 3);
+        for p in 0..npix {
+            let off = p * (bpp / 8);
+            let px = &raw[off..off + bpp / 8];
+            let (r, g, b) = match kind {
+                Kind::Sdr8 { .. } => return Ok(None),
+                Kind::PqInt { bits, channels } => read_int_rgb(px, bits, channels),
+                Kind::ScRgbFloat { half, channels } => {
+                    // Linear Rec.709 with 1.0 = SDR white (100 nits) → linear Rec.2020 as a
+                    // share of 10000 nits → PQ code.
+                    let lin = read_float_rgb(px, half, channels);
+                    let c = rec709_to_rec2020([lin[0].max(0.0), lin[1].max(0.0), lin[2].max(0.0)]);
+                    (
+                        pq_oetf(c[0] * 100.0 / 10000.0),
+                        pq_oetf(c[1] * 100.0 / 10000.0),
+                        pq_oetf(c[2] * 100.0 / 10000.0),
+                    )
+                }
+            };
+            out.push(to_u16(r));
+            out.push(to_u16(g));
+            out.push(to_u16(b));
+        }
+        Ok(Some((w as u32, h as u32, out)))
+    }
+
+    fn to_u16(v: f32) -> u16 {
+        (v.clamp(0.0, 1.0) * 65535.0).round() as u16
+    }
+
+    /// Inverse of [`pq_eotf`]: a share of 10000 nits → PQ code in [0,1] (SMPTE ST 2084).
+    fn pq_oetf(l: f32) -> f32 {
+        const M1: f32 = 0.159_301_76;
+        const M2: f32 = 78.84375;
+        const C1: f32 = 0.8359375;
+        const C2: f32 = 18.851_562;
+        const C3: f32 = 18.6875;
+        let lm = l.clamp(0.0, 1.0).powf(M1);
+        ((C1 + C2 * lm) / (1.0 + C3 * lm)).powf(M2)
+    }
+
+    /// Linear Rec.709 → linear Rec.2020 (the inverse of [`rec2020_to_rec709`]).
+    fn rec709_to_rec2020(c: [f32; 3]) -> [f32; 3] {
+        [
+            0.6274 * c[0] + 0.3293 * c[1] + 0.0433 * c[2],
+            0.0691 * c[0] + 0.9195 * c[1] + 0.0114 * c[2],
+            0.0164 * c[0] + 0.0880 * c[1] + 0.8956 * c[2],
+        ]
+    }
+
+    /// The decoded samples with their layout: shared by the SDR and HDR paths.
+    fn decode_raw(jxr: &[u8]) -> Result<(usize, usize, Vec<u8>, usize, Kind), String> {
+        let mut dec = ImageDecode::with_reader(Cursor::new(jxr))
+            .map_err(|e| format!("jxr open (not a JPEG XR file?): {e:?}"))?;
+        let (w, h) = dec.get_size().map_err(|e| format!("jxr size: {e:?}"))?;
+        if w <= 0 || h <= 0 {
+            return Err(format!("jxr bad size {w}x{h}"));
+        }
+        let (w, h) = (w as usize, h as usize);
+        let format = dec
+            .get_pixel_format()
+            .map_err(|e| format!("jxr format: {e:?}"))?;
+        let info = PixelInfo::from_format(format);
+        let bpp = info.bits_per_pixel();
+        if bpp == 0 || bpp % 8 != 0 {
+            return Err(format!("unsupported jxr packing: {format:?} ({bpp} bpp)"));
+        }
+        let stride = w * (bpp / 8);
+        let mut raw = vec![0u8; stride * h];
+        dec.copy_all(&mut raw, stride)
+            .map_err(|e| format!("jxr decode: {e:?}"))?;
+        let kind = classify(format).ok_or_else(|| {
+            format!(
+                "unsupported jxr pixel format: {format:?}. \
+                 Please report this so the converter can handle it."
+            )
+        })?;
+        Ok((w, h, raw, bpp, kind))
     }
 
     /// Decode + colour-pipeline a JPEG XR into a packed RGB8 buffer.

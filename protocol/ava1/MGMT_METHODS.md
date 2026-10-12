@@ -120,6 +120,8 @@ ones (`ava1-ctest/tests/mgmt*.rs`, `ps5upload-ava1/tests/mgmt*.rs`). Methods 119
 | ActivityReset 253 | 128 `activity.reset` | `MgmtText` | `src/runtime.c` `handle_activity_reset` | `ps5upload-core/src/activity.rs` |  |
 | AppIconSet 255 | 142 `app.icon_set` | `MgmtText` | `src/runtime.c` `handle_app_icon_set` | `ps5upload-core/src/diagnostics.rs` | hides or shows a title's home-screen icon (#407) |
 | AppHiddenList 257 | 143 `app.hidden_list` | `MgmtText` | `src/runtime.c` `handle_app_hidden_list` | `ps5upload-core/src/diagnostics.rs` |  |
+| SaveMount 261 | 145 `save.mount` | `MgmtText` {image} | `src/runtime.c` `handle_save_mount` | `ps5upload-core/src/saves.rs` | opens a save: copies its image under /data, unseals the key through /dev/pfsmgr, mounts it with sceFsMountSaveData at /data/ps5upload/save_mount; an empty image reports what is open |
+| SaveUnmount 263 | 146 `save.unmount` | `MgmtText` {} | `src/runtime.c` `handle_save_unmount` | `ps5upload-core/src/saves.rs` | closes the open save and copies the image back over the real one (`written_back`) |
 | UsbEject 259 | 144 `usb.eject` | `MgmtText` | `src/runtime.c` `handle_usb_eject` | `ps5upload-core/src/fs_ops.rs` | unmounts `/mnt/usbN` so the drive can be pulled; plain unmount, or `force` (after a sync) since the shell's own services keep the drive open (EBUSY on FW 13.60) |
 | — | 21 `job.list` | empty -> `JobListResult` | `ava1/ava1_data.c` (the data plane) | none | `ava1-ctest/tests/job_run.rs` `repeat_job_run_is_idempotent`, `at_most_eight_operations_run_at_once_and_an_unknown_op_is_refused` (listing); no engine caller yet |
 | — | 34 `fs.stat` | `FsPath` -> `FsStat` | native `src/mgmt_fs.c` `mgmt_run_fs_stat` | none | host-tested |

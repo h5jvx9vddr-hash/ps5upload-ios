@@ -21,6 +21,8 @@
       "ffpkg_inspect_sce_sys",
       "payloads_tab_manager",
       "processes_pid",
+      "screenshots_png_hdr",
+      "screenshots_png_sdr",
       "smp_meta_json"
     ]
   },
@@ -98,6 +100,8 @@
       "ffpkg_inspect_sce_sys",
       "payloads_tab_manager",
       "processes_pid",
+      "screenshots_png_hdr",
+      "screenshots_png_sdr",
       "smp_meta_json"
     ]
   },
@@ -119,6 +123,8 @@
       "remotePlay",
       "remotePlay_title",
       "remote_play",
+      "screenshots_png_hdr",
+      "screenshots_png_sdr",
       "smp_meta_json"
     ]
   },
@@ -169,6 +175,7 @@
       "ffpkg_inspect_sce_sys",
       "payloads_tab_manager",
       "processes_pid",
+      "screenshots_png_sdr",
       "smp_meta_json"
     ]
   },
@@ -182,6 +189,8 @@
       "ffpkg_inspect_sce_sys",
       "payloads_tab_manager",
       "processes_pid",
+      "screenshots_png_hdr",
+      "screenshots_png_sdr",
       "smp_meta_json"
     ]
   },
@@ -230,6 +239,8 @@
       "payloads_tab_manager",
       "power_wake_signin_rpkey",
       "processes_pid",
+      "screenshots_png_hdr",
+      "screenshots_png_sdr",
       "smp_meta_json"
     ]
   },
@@ -258,6 +269,8 @@
       "power_wake_signin_rpkey",
       "processes_pid",
       "remotePlay",
+      "screenshots_png_hdr",
+      "screenshots_png_sdr",
       "smp_meta_json"
     ]
   },
@@ -287,6 +300,7 @@
       "ffpkg_inspect_sce_sys",
       "payloads_tab_manager",
       "processes_pid",
+      "screenshots_png_sdr",
       "smp_meta_json"
     ]
   },
@@ -300,6 +314,7 @@
       "ffpkg_inspect_sce_sys",
       "payloads_tab_manager",
       "processes_pid",
+      "screenshots_png_sdr",
       "smp_meta_json"
     ]
   }

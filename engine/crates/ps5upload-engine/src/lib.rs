@@ -31,6 +31,7 @@
 //!   GET  /api/ps5/volumes             → list storage volumes detected by the payload
 //!   GET  /api/ps5/list-dir?path=...   → list immediate children of a directory on PS5
 
+mod ampr_trace;
 mod ava1_api;
 mod bundled_payload;
 mod collection;
@@ -1687,6 +1688,14 @@ struct Ps5ToPs5Req {
     /// Paces the relay like an upload's cap (the environment's cap otherwise).
     #[serde(default)]
     bandwidth_cap_mbps: Option<f64>,
+    /// `auto` (absent), `direct` (never through this computer) or `relay` (never direct); #444.
+    #[serde(default)]
+    route: Option<String>,
+    /// What the sending console dials to reach the receiving one (`host[:port]`, IPv4), in
+    /// place of the receiving console's own address: a local forward on the sending console
+    /// (ps5-tailscale), or a NAT the consoles see differently from this computer.
+    #[serde(default)]
+    direct_addr: Option<String>,
 }
 
 async fn ps5_to_ps5_handler(
@@ -1696,6 +1705,28 @@ async fn ps5_to_ps5_handler(
     let tx_id = match parse_or_random_tx_id(req.tx_id.as_deref()) {
         Ok(id) => id,
         Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    let route_options = {
+        let mode = match ps5upload_ava1::c2c::RouteMode::parse(req.route.as_deref()) {
+            Ok(m) => m,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST, e).into_response(),
+        };
+        let dial = req
+            .direct_addr
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+        if let Some(d) = &dial {
+            if let Err(e) = ps5upload_ava1::c2c::parse_dial(d) {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("the direct route address: {e}"),
+                )
+                .into_response();
+            }
+        }
+        ps5upload_ava1::c2c::RouteOptions { mode, dial }
     };
     let relay_cap = {
         let mut cfg = make_transfer_config(&req.to);
@@ -1798,6 +1829,7 @@ async fn ps5_to_ps5_handler(
                 progress.clone(),
                 cancel,
                 relay_cap,
+                &route_options,
                 |route| match route {
                     ps5upload_ava1::c2c::Route::Direct => route_notes.route.store(
                         ps5upload_core::transfer::LIVE_ROUTE_DIRECT,
@@ -3446,6 +3478,51 @@ async fn ps5_usb_eject(
             .and_then(|r| r);
     match r {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SaveOpenReq {
+    addr: Option<String>,
+    /// The save image under /user/home; empty or absent only reports what is open.
+    #[serde(default)]
+    image: String,
+}
+
+/// POST /api/ps5/saves/open `{addr, image}` — the helper mounts the save decrypted (copied
+/// under /data first) and says where; the Files screen then reads and writes it. One save
+/// open at a time; another one closes the first. Empty `image` reports what is open.
+async fn ps5_save_open(
+    State(state): State<AppState>,
+    Json(req): Json<SaveOpenReq>,
+) -> impl IntoResponse {
+    let addr = console_addr_or_default(req.addr, &state.default_ps5_addr);
+    let image = req.image;
+    crate::log_info!("save_open: addr={addr} image={image}");
+    let r = tokio::task::spawn_blocking(move || ps5upload_core::saves::save_open(&addr, &image))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r);
+    match r {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
+}
+
+/// POST /api/ps5/saves/close `{addr}` — unmounts the open save and writes it back.
+async fn ps5_save_close(
+    State(state): State<AppState>,
+    Json(req): Json<SaveOpenReq>,
+) -> impl IntoResponse {
+    let addr = console_addr_or_default(req.addr, &state.default_ps5_addr);
+    crate::log_info!("save_close: addr={addr}");
+    let r = tokio::task::spawn_blocking(move || ps5upload_core::saves::save_close(&addr))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r);
+    match r {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
     }
 }
@@ -9921,6 +9998,8 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/ps5/fs/mount", post(ps5_fs_mount))
         .route("/api/ps5/fs/unmount", post(ps5_fs_unmount))
         .route("/api/ps5/usb/eject", post(ps5_usb_eject))
+        .route("/api/ps5/saves/open", post(ps5_save_open))
+        .route("/api/ps5/saves/close", post(ps5_save_close))
         .route("/api/ps5/app/launch", post(ps5_app_launch))
         .route("/api/ps5/app/register", post(ps5_app_register))
         .route("/api/ps5/app/unregister", post(ps5_app_unregister))
@@ -9973,6 +10052,15 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route(
             "/api/console-ports",
             get(console_ports_get).post(console_ports_set),
+        )
+        .route("/api/ampr/trace", get(ampr_trace::status))
+        .route("/api/ampr/trace/start", post(ampr_trace::start))
+        .route("/api/ampr/trace/stop", post(ampr_trace::stop))
+        .route("/api/ampr/trace/collect", post(ampr_trace::collect))
+        .route("/api/ampr/trace/generate", post(ampr_trace::generate))
+        .route(
+            "/api/ampr/profile",
+            get(ampr_trace::profile_get).delete(ampr_trace::profile_delete),
         )
         .route("/api/ps5/pldmgr", get(pldmgr_api::overview))
         .route("/api/ps5/pldmgr/launch", post(pldmgr_api::launch))

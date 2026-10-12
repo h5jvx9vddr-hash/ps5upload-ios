@@ -11,6 +11,7 @@ vi.mock("../../state/lang", () => ({
 }));
 
 import type { Pipeline } from "../../state/fpkgConversion";
+import { ImageChoice } from "./ImageOptions";
 import { RunCard, deleteLabel, lz4Active, type Lz4Choice, type OutputChoiceProps } from "./RunCard";
 
 // No DOM here (vitest in node, no testing-library): render to markup and check what a user
@@ -175,11 +176,10 @@ describe("RunCard", () => {
       return [...sel.matchAll(/<option[^>]*>([^<]*)<\/option>/g)].map((m) => m[1].replace(/&amp;/g, "&"));
     };
 
-    it("asks what to make and what to do after, once", () => {
+    it("asks what to do after (what to make is chosen under ②)", () => {
       const out = idle({});
-      expect(out.match(/>Make</g)).toHaveLength(1);
-      expect(out).toContain("A package (.pkg)");
-      expect(out).toContain("A game image (.ffpkg)");
+      expect(out).not.toContain(">Make<");
+      expect(out).not.toContain("A package (.pkg)");
       expect(options(out, "After converting")).toEqual(["Keep the package", "Stream & install", "Upload & install"]);
       expect(button(out, "Add this game to the queue")?.disabled).toBe(false);
     });
@@ -203,9 +203,8 @@ describe("RunCard", () => {
     it("an image is kept or uploaded, never installed, and only a folder here becomes one", () => {
       const out = idle({ make: "image" }, { canImage: false });
       expect(options(out, "After converting")).toEqual(["Keep the image", "Upload it to the PS5"]);
-      expect(out).toContain(".ffpkg (UFS2), recommended");
       expect(button(out, "Make game image")?.disabled).toBe(true);
-      expect(out).toContain("Only a game folder on this computer can become a game image.");
+      expect(out).toContain("Only a game folder or game image (on this computer, a saved server or the PS5) can become a game image; unpack an archive first.");
       // Queueing still works: a folder of games can be queued as images.
       expect(button(out, "Add this game to the queue")?.disabled).toBe(false);
     });
@@ -343,23 +342,13 @@ describe("RunCard", () => {
       onToggle: noop,
       profileName: null,
       onProfile: noop,
+      installRuntime: false,
+      onInstallRuntime: noop,
       ...over,
     });
-    const choiceOf = choice;
+    // The image's options live under ③ (ImageChoice); the run card only runs.
     const idle = (format: "exfat" | "ffpkg", lz4Choice: Lz4Choice | undefined, compress = false) =>
-      renderToStaticMarkup(
-        <RunCard
-          pipeline={{ phase: "idle" }}
-          installTask={null}
-          host=""
-          canInstall={false}
-          isImage={false}
-          deleteArmed={false}
-          {...actions}
-          canImage
-          choice={choiceOf({ make: "image", imageFormat: format, imageCompress: compress, lz4: lz4Choice })}
-        />,
-      );
+      renderToStaticMarkup(<ImageChoice format={format} compress={compress} onChoice={noop} lz4={lz4Choice} />);
     /** The checkbox in the label whose text contains `text`. */
     const checkbox = (out: string, text: string) => {
       const re = /<label[^>]*>([\s\S]*?)<\/label>/g;
@@ -383,7 +372,6 @@ describe("RunCard", () => {
       const on = idle("exfat", lz4({ on: true }), true);
       expect(checkbox(on, "Compress it into a .ffpfsc")).toEqual({ checked: false, disabled: true });
       expect(checkbox(on, "AMPR LZ4 asset packs")).toEqual({ checked: true, disabled: false });
-      expect(button(on, "Make game image")).not.toBeNull();
       expect(on).toContain("Use a profile (.toml)");
       const named = idle("exfat", lz4({ on: true, profileName: "sm2.toml" }));
       expect(named).toContain("Profile: sm2.toml");

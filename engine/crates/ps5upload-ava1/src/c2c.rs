@@ -52,6 +52,67 @@ enum Direct {
     Failed(String),
 }
 
+/// The port a console dials for a direct send when the address names none: the helper's.
+pub const DIRECT_PORT: u16 = gen::DEFAULT_PORT;
+
+/// How a console-to-console copy may go (#444).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteOptions {
+    /// `Auto`: straight between the consoles when they can connect, else through this
+    /// computer. `DirectOnly`: never through this computer (a phone on mobile data, say); a
+    /// direct send that cannot run fails with its reason. `RelayOnly`: never direct.
+    pub mode: RouteMode,
+    /// What the sending console dials to reach the receiving one, `host:port` or `host`
+    /// (port 9120), in place of the receiving console's own address. For a console whose
+    /// outgoing connections go through a local forward (ps5-tailscale: `127.0.0.1:19120`
+    /// forwarded to the other console), or any setup where the address this computer uses is
+    /// not the one the consoles use between themselves. The ticket and the peer key still
+    /// decide who may send, not the address.
+    pub dial: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RouteMode {
+    #[default]
+    Auto,
+    DirectOnly,
+    RelayOnly,
+}
+
+impl RouteMode {
+    /// `auto` (or nothing), `direct`, `relay`.
+    pub fn parse(s: Option<&str>) -> std::result::Result<Self, String> {
+        match s.map(str::trim).filter(|s| !s.is_empty()) {
+            None | Some("auto") => Ok(Self::Auto),
+            Some("direct") => Ok(Self::DirectOnly),
+            Some("relay") => Ok(Self::RelayOnly),
+            Some(other) => Err(format!("route {other:?} is not auto, direct or relay")),
+        }
+    }
+}
+
+/// `host:port` or `host` (port [`DIRECT_PORT`]) as the sending console will dial it: an IPv4
+/// address, since that is what the helper's C2C_SEND carries.
+pub fn parse_dial(s: &str) -> std::result::Result<(String, u16), String> {
+    let s = s.trim();
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') => (
+            h,
+            p.parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| format!("port {p:?} is not 1 to 65535"))?,
+        ),
+        _ => (s, DIRECT_PORT),
+    };
+    if host.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(format!(
+            "{host:?} is not an IPv4 address (the console dials by address)"
+        ));
+    }
+    Ok((host.to_string(), port))
+}
+
 /// Copies `src` on `from` to `dest` on `to`: directly when it can, else through this computer.
 /// `on_route` hears the route as soon as it is known (and again if it changes).
 /// `bandwidth_cap` (bytes per second) paces the relay, which sends from this computer. The
@@ -67,6 +128,7 @@ pub fn ps5_to_ps5_routed(
     progress: Arc<Progress>,
     cancel: Arc<AtomicBool>,
     bandwidth_cap: Option<u64>,
+    options: &RouteOptions,
     on_route: impl Fn(&Route),
 ) -> Result<(SendReport, Route)> {
     routed(
@@ -80,6 +142,7 @@ pub fn ps5_to_ps5_routed(
         progress,
         cancel,
         bandwidth_cap,
+        options,
         on_route,
     )
 }
@@ -99,7 +162,18 @@ pub fn ps5_to_ps5_routed_between(
     on_route: impl Fn(&Route),
 ) -> Result<(SendReport, Route)> {
     routed(
-        from_pool, from, src, to_pool, to, dest, job_id, progress, cancel, None, on_route,
+        from_pool,
+        from,
+        src,
+        to_pool,
+        to,
+        dest,
+        job_id,
+        progress,
+        cancel,
+        None,
+        &RouteOptions::default(),
+        on_route,
     )
 }
 
@@ -115,16 +189,31 @@ fn routed(
     progress: Arc<Progress>,
     cancel: Arc<AtomicBool>,
     bandwidth_cap: Option<u64>,
+    options: &RouteOptions,
     on_route: impl Fn(&Route),
 ) -> Result<(SendReport, Route)> {
-    let direct = crate::block_on(direct(
-        from_pool, from, src, to_pool, to, dest, job_id, &progress, &cancel, &on_route,
-    ));
-    let reason = match direct {
-        Direct::Done(r) => return Ok((r, Route::Direct)),
-        Direct::Cancelled => return Err(anyhow!("transfer_cancelled")),
-        Direct::Failed(why) => return Err(anyhow!("{why}")),
-        Direct::Fallback(reason) => reason,
+    let dial = match options.dial.as_deref() {
+        Some(d) => Some(parse_dial(d).map_err(|e| anyhow!("the direct route address: {e}"))?),
+        None => None,
+    };
+    let reason = if options.mode == RouteMode::RelayOnly {
+        "a send through this computer was asked for".to_string()
+    } else {
+        let direct = crate::block_on(direct(
+            from_pool, from, src, to_pool, to, dest, job_id, &progress, &cancel, dial, &on_route,
+        ));
+        match direct {
+            Direct::Done(r) => return Ok((r, Route::Direct)),
+            Direct::Cancelled => return Err(anyhow!("transfer_cancelled")),
+            Direct::Failed(why) => return Err(anyhow!("{why}")),
+            Direct::Fallback(reason) if options.mode == RouteMode::DirectOnly => {
+                // Nothing through this computer: the receiving console's half is still
+                // ended, so the next try (or a relay, if asked for) is not refused as busy.
+                crate::block_on(cancel_on(to_pool, to, job_id));
+                return Err(anyhow!("direct_route_unavailable: {reason}"));
+            }
+            Direct::Fallback(reason) => reason,
+        }
     };
     // The receiving console's half of the direct job may still be open (the sending console
     // that would have cancelled it may be the one that stopped answering); while it is, the
@@ -215,6 +304,7 @@ async fn direct(
     job_id: [u8; 16],
     progress: &Progress,
     cancel: &AtomicBool,
+    dial: Option<(String, u16)>,
     on_route: &impl Fn(&Route),
 ) -> Direct {
     let sa = match from_pool.session(from).await {
@@ -249,8 +339,14 @@ async fn direct(
         }
         Err(e) => return Direct::Fallback(format!("the receiving console did not answer: {e}")),
     };
-    let Some((host, mut port)) = ipv4_of(&to_pool.addr_for(to)) else {
-        return Direct::Fallback("the receiving console has no IPv4 address to dial".into());
+    let (host, mut port) = match dial {
+        Some(d) => d,
+        None => match ipv4_of(&to_pool.addr_for(to)) {
+            Some(a) => a,
+            None => {
+                return Direct::Fallback("the receiving console has no IPv4 address to dial".into())
+            }
+        },
     };
     let test_port = TEST_PORT.load(Ordering::Relaxed);
     if test_port != 0 {

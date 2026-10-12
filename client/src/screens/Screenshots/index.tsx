@@ -19,6 +19,7 @@ import {
   saveArchiveMakeTemp,
   saveArchiveCleanupTemp,
   type ScreenshotEntry,
+  type ScreenshotPngMode,
 } from "../../api/ps5";
 import { useConnectionStore } from "../../state/connection";
 import { mgmtAddr } from "../../lib/addr";
@@ -40,6 +41,8 @@ import { formatBytes } from "../../lib/format";
 import { basename } from "../../lib/uploadDest";
 import {
   pngNameForJxr,
+  rememberPngMode,
+  storedPngMode,
   joinDir,
   isJxrScreenshot,
 } from "../../lib/screenshotConvert";
@@ -200,6 +203,12 @@ export default function ScreenshotsScreen({ tabs }: { tabs?: ReactNode } = {}) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // How a .jxr is written as PNG (#448), remembered per viewer.
+  const [pngMode, setPngMode] = useState<ScreenshotPngMode>(() => storedPngMode());
+  const choosePngMode = (m: ScreenshotPngMode) => {
+    rememberPngMode(m);
+    setPngMode(m);
+  };
   const [bulkBusy, setBulkBusy] = useState(false);
   const {
     deleting,
@@ -373,6 +382,7 @@ export default function ScreenshotsScreen({ tabs }: { tabs?: ReactNode } = {}) {
   // .png is what most people actually want (the .jxr won't open in normal
   // viewers); anyone who needs the HDR original uses Download instead.
   async function convertOne(item: ScreenshotEntry) {
+    const mode = pngMode;
     if (!host?.trim()) return;
     const dest = await pickPath({
       mode: "folder",
@@ -400,7 +410,7 @@ export default function ScreenshotsScreen({ tabs }: { tabs?: ReactNode } = {}) {
       // (deleteSource=true leaves only the viewable .png behind). An SDR
       // .jpg/.png download is already viewable as-is, so leave it.
       if (isJxrScreenshot(name)) {
-        await convertScreenshot(localJxr, localPng, true);
+        await convertScreenshot(localJxr, localPng, true, mode);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -571,6 +581,27 @@ export default function ScreenshotsScreen({ tabs }: { tabs?: ReactNode } = {}) {
               >
                 {tr("captures_bulk_delete", { n: selected.size }, `Delete ${selected.size}`)}
               </Button>
+            )}
+            {isTauriEnv() && !isMobile() && (
+              <label className="flex items-center gap-1.5 text-xs text-[var(--color-muted)]">
+                <span>{tr("screenshots_png_mode", undefined, "Convert as")}</span>
+                <select
+                  value={pngMode}
+                  onChange={(e) => choosePngMode(e.target.value as ScreenshotPngMode)}
+                  className="select w-auto! text-xs"
+                  aria-label={tr("screenshots_png_mode", undefined, "Convert as")}
+                  title={tr(
+                    "screenshots_png_mode_hint_v2",
+                    undefined,
+                    "SDR PNG opens everywhere (the HDR capture is tone-mapped). HDR PNG keeps the capture's brightness and colour as 16-bit BT.2020 PQ with the capture's own ICC profile and a cICP tag, which HDR-aware viewers and browsers show as captured; pick the one without the cICP tag for apps that refuse it.",
+                  )}
+                  data-testid="screenshots-png-mode"
+                >
+                  <option value="sdr">{tr("screenshots_png_sdr", undefined, "SDR PNG")}</option>
+                  <option value="hdr">{tr("screenshots_png_hdr", undefined, "HDR PNG (cICP)")}</option>
+                  <option value="hdr_plain">{tr("screenshots_png_hdr_plain", undefined, "HDR PNG, no cICP tag")}</option>
+                </select>
+              </label>
             )}
             <Button
               variant="secondary"

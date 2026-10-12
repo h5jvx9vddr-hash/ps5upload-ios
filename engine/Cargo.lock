@@ -147,7 +147,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "ava1"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "ava1-chaos",
  "blake2 0.11.0",
@@ -165,14 +165,14 @@ dependencies = [
 
 [[package]]
 name = "ava1-chaos"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "ava1-ctest"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "anyhow",
  "ava1",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "ava1-gen"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "serde",
  "toml",
@@ -314,6 +314,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures 0.3.0",
+ "rayon-core",
 ]
 
 [[package]]
@@ -602,6 +603,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -2016,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-pfs"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "flate2",
  "ps5-dump-forge-ufs2",
@@ -2025,7 +2045,7 @@ dependencies = [
 
 [[package]]
 name = "ps5-dump-forge-ufs2"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "ps5upload-fpkg",
  "ps5upload-pkg",
@@ -2034,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "ps5upload-ava1"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "anyhow",
  "ava1",
@@ -2054,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "ps5upload-core"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "aes 0.9.3",
  "anyhow",
@@ -2076,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "ps5upload-engine"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -2117,9 +2137,10 @@ dependencies = [
 
 [[package]]
 name = "ps5upload-fpkg"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "aes 0.9.3",
+ "blake3",
  "crc32fast",
  "flate2",
  "getrandom 0.4.3",
@@ -2138,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "ps5upload-lab"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "anyhow",
  "ava1",
@@ -2156,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "ps5upload-pkg"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "aes 0.9.3",
  "blake3",
@@ -2168,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "ps5upload-tests"
-version = "7.0.12"
+version = "7.0.22"
 dependencies = [
  "anyhow",
  "ava1",
@@ -2233,6 +2254,16 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
+]
 
 [[package]]
 name = "redox_syscall"

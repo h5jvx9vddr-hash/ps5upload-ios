@@ -25,15 +25,37 @@ pub struct Readiness {
     pub runtime_version: Option<String>,
     /// Why packing is refused; `None` when it can go ahead.
     pub refusal: Option<String>,
+    /// `ok`; `runtime` (the game's ampr_emu is missing or too old: installing
+    /// [`RUNTIME_VERSION`] into the image makes packs possible); `no_ampr` (the game does not
+    /// read through AMPR, so nothing could serve packs: .ffpfsc is its compression).
+    pub kind: &'static str,
 }
 
-/// `None` when the title does not import libSceAmpr: nothing but `ampr_emu` reads asset packs.
-/// Otherwise whether the `libSceAmpr.sprx` the game ships serves them — an older `ampr_emu`
-/// (0.3) would find every packed file missing. The module is recognised by its own strings
-/// (see [`runtime_support`]); no runtime is shipped or swapped in.
+/// The ampr_emu release the engine can put into an image (`fakelib/libSceAmpr.sprx`) when the
+/// game's own is missing or predates asset packs; the game's own copy is kept beside it as
+/// `libSceAmpr.sprx.orig`. drakmor/ampr_emu, GPL-3.0; fetched on first use, never bundled.
+pub const RUNTIME_VERSION: &str = "0.4.2.1";
+pub const RUNTIME_URL: &str =
+    "https://github.com/drakmor/ampr_emu/releases/download/0.4.2.1/libSceAmpr.sprx";
+pub const RUNTIME_SHA256: &str = "69e6c4d5e4f5fb83c9e01815db5861c4c75734acbf4595cafa50d4c218116d1a";
+/// Where the game's own module goes when the engine installs the release one.
+pub const RUNTIME_MODULE_ORIG: &str = "fakelib/libSceAmpr.sprx.orig";
+
+/// `Some(no_ampr)` when the title does not import libSceAmpr: nothing but `ampr_emu` reads
+/// asset packs. Otherwise whether the `libSceAmpr.sprx` the game ships serves them — an
+/// older `ampr_emu` (0.3) would find every packed file missing. The module is recognised by
+/// its own strings (see [`runtime_support`]).
 pub fn readiness(tree: &mut dyn SourceTree) -> Option<Readiness> {
     if !crate::source::imports_ampr(tree, "eboot.bin") {
-        return None;
+        return Some(Readiness {
+            runtime_version: None,
+            refusal: Some(
+                "this game does not read its files through AMPR, so nothing could serve \
+                 asset packs; compress it into a .ffpfsc instead"
+                    .into(),
+            ),
+            kind: "no_ampr",
+        });
     }
     let Some(module) = tree
         .files()
@@ -47,6 +69,7 @@ pub fn readiness(tree: &mut dyn SourceTree) -> Option<Readiness> {
                 "LZ4 asset packs need ampr_emu 0.4 or later with pack support in the game's \
                  {RUNTIME_MODULE}, and the folder has none"
             )),
+            kind: "runtime",
         });
     };
     let support = match tree.read(&module) {
@@ -55,6 +78,7 @@ pub fn readiness(tree: &mut dyn SourceTree) -> Option<Readiness> {
             return Some(Readiness {
                 runtime_version: None,
                 refusal: Some(format!("{module} could not be read: {e}")),
+                kind: "runtime",
             })
         }
     };
@@ -69,9 +93,108 @@ pub fn readiness(tree: &mut dyn SourceTree) -> Option<Readiness> {
         )
     });
     Some(Readiness {
+        kind: if refusal.is_some() { "runtime" } else { "ok" },
         runtime_version: support.version,
         refusal,
     })
+}
+
+/// A game with the release ampr_emu in place of its own `fakelib/libSceAmpr.sprx` (kept as
+/// `libSceAmpr.sprx.orig`), or added when it had none. `bytes` must serve packs.
+pub struct RuntimeInstalled {
+    inner: Box<dyn SourceTree>,
+    files: Vec<crate::source::SourceFile>,
+    runtime: Vec<u8>,
+    orig_path: Option<String>,
+}
+
+impl RuntimeInstalled {
+    pub fn new(inner: Box<dyn SourceTree>, runtime: Vec<u8>) -> crate::Result<Self> {
+        let support = runtime_support(&runtime);
+        if !support.packs {
+            return Err(crate::Error::Format(
+                "the ampr_emu to install does not serve asset packs".into(),
+            ));
+        }
+        let orig_path = inner
+            .files()
+            .iter()
+            .find(|f| f.path.eq_ignore_ascii_case(RUNTIME_MODULE))
+            .map(|f| f.path.clone());
+        let mut files: Vec<crate::source::SourceFile> = inner
+            .files()
+            .iter()
+            .filter(|f| {
+                !f.path.eq_ignore_ascii_case(RUNTIME_MODULE)
+                    && !f.path.eq_ignore_ascii_case(RUNTIME_MODULE_ORIG)
+            })
+            .cloned()
+            .collect();
+        if let Some(orig) = &orig_path {
+            let size = inner
+                .files()
+                .iter()
+                .find(|f| &f.path == orig)
+                .map_or(0, |f| f.size);
+            files.push(crate::source::SourceFile {
+                path: RUNTIME_MODULE_ORIG.to_string(),
+                size,
+            });
+        }
+        files.push(crate::source::SourceFile {
+            path: RUNTIME_MODULE.to_string(),
+            size: runtime.len() as u64,
+        });
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Self {
+            inner,
+            files,
+            runtime,
+            orig_path,
+        })
+    }
+
+    fn resolve(&self, path: &str) -> Option<&str> {
+        if path.eq_ignore_ascii_case(RUNTIME_MODULE_ORIG) {
+            return self.orig_path.as_deref();
+        }
+        None
+    }
+}
+
+impl SourceTree for RuntimeInstalled {
+    fn files(&self) -> &[crate::source::SourceFile] {
+        &self.files
+    }
+    fn empty_dirs(&self) -> &[String] {
+        self.inner.empty_dirs()
+    }
+    fn read(&mut self, path: &str) -> crate::Result<Vec<u8>> {
+        if path.eq_ignore_ascii_case(RUNTIME_MODULE) {
+            return Ok(self.runtime.clone());
+        }
+        if let Some(orig) = self.resolve(path).map(str::to_string) {
+            return self.inner.read(&orig);
+        }
+        self.inner.read(path)
+    }
+    fn read_range(&mut self, path: &str, offset: u64, len: usize) -> crate::Result<Vec<u8>> {
+        if path.eq_ignore_ascii_case(RUNTIME_MODULE) {
+            let start = (offset as usize).min(self.runtime.len());
+            let end = start.saturating_add(len).min(self.runtime.len());
+            return Ok(self.runtime[start..end].to_vec());
+        }
+        if let Some(orig) = self.resolve(path).map(str::to_string) {
+            return self.inner.read_range(&orig, offset, len);
+        }
+        self.inner.read_range(path, offset, len)
+    }
+    fn describe(&self) -> String {
+        format!(
+            "{} (ampr_emu {RUNTIME_VERSION} installed)",
+            self.inner.describe()
+        )
+    }
 }
 
 /// Why `tree` cannot be packed for `ampr_emu`, or `None` when it can.
@@ -375,7 +498,7 @@ mod tests {
         std::fs::create_dir_all(root.join("fakelib")).unwrap();
         std::fs::write(root.join("eboot.bin"), vec![0u8; 4096]).unwrap();
         let check = || readiness(&mut crate::source::FolderSource::open(&root).unwrap());
-        assert_eq!(check(), None);
+        assert_eq!(check().unwrap().kind, "no_ampr");
 
         let mut eboot = vec![0u8; 4096];
         eboot[100..114].copy_from_slice(b"libSceAmpr.prx");
@@ -391,9 +514,37 @@ mod tests {
             check(),
             Some(Readiness {
                 runtime_version: Some("0.4.2.1".into()),
-                refusal: None
+                refusal: None,
+                kind: "ok",
             })
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The release runtime goes in as the game's module, the game's own kept as `.orig`;
+    /// a game that had none just gains it.
+    #[test]
+    fn installing_the_runtime_replaces_and_keeps_the_original() {
+        use crate::source::SourceTree;
+        let root = std::env::temp_dir().join(format!("ps5upload-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("fakelib")).unwrap();
+        std::fs::write(root.join("eboot.bin"), b"libSceAmpr.prx").unwrap();
+        std::fs::write(root.join("fakelib/libSceAmpr.sprx"), b"old module").unwrap();
+        let good = b"x\x000.4.2.1 (c) Drakmor\0..AMPRPAK4..ampr_assets.index".to_vec();
+        let tree: Box<dyn SourceTree> = Box::new(crate::source::FolderSource::open(&root).unwrap());
+        assert!(RuntimeInstalled::new(
+            Box::new(crate::source::FolderSource::open(&root).unwrap()),
+            b"not a runtime".to_vec()
+        )
+        .is_err());
+        let mut t = RuntimeInstalled::new(tree, good.clone()).unwrap();
+        let paths: Vec<&str> = t.files().iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&RUNTIME_MODULE) && paths.contains(&RUNTIME_MODULE_ORIG));
+        assert_eq!(t.read(RUNTIME_MODULE).unwrap(), good);
+        assert_eq!(t.read(RUNTIME_MODULE_ORIG).unwrap(), b"old module");
+        assert_eq!(t.read_range(RUNTIME_MODULE, 2, 7).unwrap(), b"0.4.2.1");
+        assert_eq!(readiness(&mut t).unwrap().kind, "ok");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

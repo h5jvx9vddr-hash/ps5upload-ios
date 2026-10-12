@@ -3,6 +3,7 @@ import { trStatic } from "../../lib/trStatic";
 import { rememberDestination } from "../../lib/moveTo";
 import { MoveToDialog, type MoveItem } from "./MoveToDialog";
 import { SendToConsoleDialog } from "./SendToConsoleDialog";
+import { useC2cRoutes } from "../../state/c2cRoutes";
 import { useUploadQueueStore } from "../../state/uploadQueue";
 import type { SendItem } from "../../lib/consoleSend";
 import { queueLinkFor } from "../../lib/gamePage";
@@ -1469,6 +1470,7 @@ export default function FileSystemScreen() {
   };
   const confirmSend = (target: string, _destDir: string, dests: string[]) => {
     const items = sendItems ?? [];
+    const route = useC2cRoutes.getState().routeFor(hostOf(host), target);
     setSendItems(null);
     if (items.length === 0) return;
     setSelected(new Set());
@@ -1477,6 +1479,8 @@ export default function FileSystemScreen() {
       q.add({
         sourceKind: "ps5",
         fromConsole: hostOf(host),
+        route: route.mode,
+        directAddr: route.directAddr || null,
         sourcePath: it.path,
         displayName: it.name,
         resolvedDest: dests[i],

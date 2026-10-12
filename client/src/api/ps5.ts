@@ -2380,6 +2380,39 @@ export interface SaveList {
   saves: SaveEntry[];
 }
 
+/** What the helper has open as a decrypted save (`/api/ps5/saves/open`, `/close`). */
+export interface OpenSave {
+  mounted: boolean;
+  /** The save image under /user/home; "" when nothing is open. */
+  image: string;
+  mount_point: string;
+  kind: "ps5" | "ps4" | "";
+  was_open?: boolean | null;
+  written_back?: boolean | null;
+}
+
+async function engineJson<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${getEngineUrl()}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const out = (await res.json().catch(() => ({}))) as T & { error?: string };
+  if (!res.ok) throw new Error(out.error || `${path} failed (${res.status})`);
+  return out;
+}
+
+/** Mount a save image decrypted on the PS5 (the helper copies it under /data first); an
+ *  empty `image` reports what is open. Its files then show under `mount_point` in Files. */
+export function savesOpen(addr: string, image: string): Promise<OpenSave> {
+  return engineJson<OpenSave>("/api/ps5/saves/open", { addr, image });
+}
+
+/** Unmount the open save and write the image back into the real save when it changed. */
+export function savesClose(addr: string): Promise<OpenSave> {
+  return engineJson<OpenSave>("/api/ps5/saves/close", { addr });
+}
+
 /** List save data folders. user_id=0 lists every user's saves. */
 export async function savesList(
   addr: string,
@@ -2426,13 +2459,19 @@ export async function convertScreenshot(
   srcPath: string,
   dstPath: string,
   deleteSource: boolean,
+  /** `sdr` (tone-mapped 8-bit, the default), `hdr` (16-bit PQ BT.2020 with a cICP chunk) or
+   *  `hdr_plain` (the same without the chunk, for viewers that refuse it); #448. */
+  mode: ScreenshotPngMode = "sdr",
 ): Promise<string> {
   return invoke<string>("screenshot_convert", {
     srcPath,
     dstPath,
     deleteSource,
+    mode,
   });
 }
+
+export type ScreenshotPngMode = "sdr" | "hdr" | "hdr_plain";
 
 // ─── Save data .zip backup / restore ──────────────────────────────────
 //

@@ -193,6 +193,10 @@ export interface QueueItem {
   addr: string;
   /** `ps5` items only: the console the file or folder is copied from (#433). */
   fromConsole?: string | null;
+  /** `ps5` items only (#444): never through this computer (`direct`), never direct (`relay`). */
+  route?: "auto" | "direct" | "relay";
+  /** `ps5` items only (#444): what the sending console dials, when not the receiver's address. */
+  directAddr?: string | null;
   strategy: UploadStrategy;
   reconcileMode: ReconcileMode;
   excludes: string[];
@@ -356,6 +360,8 @@ export type AddQueueItem = Pick<
   | "resolvedDest"
   | "addr"
   | "fromConsole"
+  | "route"
+  | "directAddr"
   | "strategy"
   | "reconcileMode"
   | "excludes"
@@ -1052,6 +1058,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         item.addr,
         item.resolvedDest,
         item.txIdHex,
+        { mode: item.route, directAddr: item.directAddr },
       );
     } else if (isArchive) {
       // A .zip/.7z is decompressed host-side and streamed in (lands

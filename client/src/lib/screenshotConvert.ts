@@ -41,3 +41,24 @@ export function joinDir(dir: string, name: string): string {
   const trimmed = dir.replace(/[\\/]+$/g, "");
   return `${trimmed}/${name}`;
 }
+
+import type { ScreenshotPngMode } from "../api/ps5";
+import { safeGetItem, safeSetItem } from "./safeStorage";
+
+const MODE_KEY = "ps5upload.screenshots.png_mode";
+const MODES: readonly ScreenshotPngMode[] = ["sdr", "hdr", "hdr_plain"];
+
+/** How a .jxr is written as PNG (#448): tone-mapped SDR (opens everywhere), HDR with a cICP
+ *  chunk (HDR-aware viewers and browsers show it as captured) or HDR without the chunk (for
+ *  viewers that refuse the chunk, Discord for one). Remembered per viewer. */
+export function parsePngMode(v: string | null): ScreenshotPngMode {
+  return MODES.includes(v as ScreenshotPngMode) ? (v as ScreenshotPngMode) : "sdr";
+}
+
+export function storedPngMode(): ScreenshotPngMode {
+  return parsePngMode(safeGetItem(MODE_KEY));
+}
+
+export function rememberPngMode(mode: ScreenshotPngMode): void {
+  safeSetItem(MODE_KEY, mode);
+}

@@ -120,6 +120,8 @@ export async function startPs5ToPs5(
   to: string,
   dest: string,
   txId?: string | null,
+  /** #444: `auto` (absent), `direct` or `relay`, and what the sending console dials. */
+  route?: { mode?: "auto" | "direct" | "relay"; directAddr?: string | null },
 ): Promise<string> {
   const res = await fetchStart("the PS5 to PS5 copy", `${getEngineUrl()}/api/transfer/ps5-to-ps5`, {
     method: "POST",
@@ -130,6 +132,8 @@ export async function startPs5ToPs5(
       to: consoleAddr(to),
       dest,
       tx_id: txId ?? null,
+      route: route?.mode ?? "auto",
+      direct_addr: route?.directAddr?.trim() || null,
     }),
   });
   const body = (await res.json().catch(() => ({}))) as {

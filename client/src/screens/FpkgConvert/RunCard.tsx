@@ -6,15 +6,18 @@ import { useEffect, useState } from "react";
 
 import { CheckCircle2, Circle, ListPlus, Loader2, XCircle } from "lucide-react";
 
-import { Button, Card, Checkbox, ProgressBar, SegmentedControl, Toggle } from "../../components";
-import { buildExtension, type ConvertThen } from "../../state/convertQueue";
+import { Button, Card, Checkbox, ProgressBar, Toggle } from "../../components";
+import type { ConvertThen } from "../../state/convertQueue";
 import { makesImage } from "../../state/fpkgConversion";
 import type { InstallMethod, Pipeline, PipelineStage } from "../../state/fpkgConversion";
 import { useTr } from "../../state/lang";
 import { formatBytes } from "../../lib/format";
 import type { Task } from "../../state/tasks";
-import type { AmprPacksReadiness, ImageFormat } from "../../api/fpkg";
+import type { ImageFormat } from "../../api/fpkg";
 import { overallProgress, stageRows, type StageRow } from "./stages";
+import { lz4Active, type Lz4Choice } from "./ImageOptions";
+
+export { lz4Active, type Lz4Choice } from "./ImageOptions";
 
 /** The app's one size formatter (IEC), kept under this name for the Convert cards. */
 export const prettyBytes = formatBytes;
@@ -73,6 +76,8 @@ export interface RunCardProps {
   onRun: () => void;
   /** The source is a game folder on this computer, so it can become an image here. */
   canImage?: boolean;
+  /** One line saying what the run makes, of which game, where (from ① to ③). */
+  summary?: string;
   /** Add the current game to the queue, with the same choice. */
   onQueue?: () => void;
   canQueue?: boolean;
@@ -129,7 +134,16 @@ export function RunCard(props: RunCardProps) {
   const { pipeline: p, installTask } = props;
   const now = useNow(p.phase === "running");
   const rows = stageRows(p, installTask);
-  const label = (s: PipelineStage) => tr(LABEL[s][0], undefined, LABEL[s][1]);
+  // An image build plans, writes and verifies an image, not a package.
+  const image = p.phase !== "idle" && makesImage(p.mode);
+  const label = (s: PipelineStage) =>
+    image && s === "plan"
+      ? tr("fpkg.stage.plan_image", undefined, "Plan image")
+      : image && s === "write"
+        ? tr("fpkg.stage.write_image", undefined, "Write image")
+        : image && s === "verify"
+          ? tr("fpkg.stage.verify_image", undefined, "Read the image back")
+          : tr(LABEL[s][0], undefined, LABEL[s][1]);
 
   /** " · 96 MiB/s · 21 min left" for the active row: the install task's figures while sending,
    *  else measured from the stage's own bytes since it began. */
@@ -152,7 +166,7 @@ export function RunCard(props: RunCardProps) {
 
   const title = (
     <div className="text-sm font-medium">
-      {tr("fpkg.card.run", undefined, "③ Build & install")}
+      {tr("fpkg.card.run_v2", undefined, "④ Build & install")}
     </div>
   );
 
@@ -175,6 +189,11 @@ export function RunCard(props: RunCardProps) {
       <Card>
         <div className="flex flex-col gap-3">
           {title}
+          {props.summary && (
+            <div className="text-xs text-[var(--color-muted)]" data-testid="run-summary">
+              {props.summary}
+            </div>
+          )}
           <OutputChoice {...c} />
           <div className="flex flex-wrap gap-2 border-t border-[var(--color-border)] pt-3">
             <Button variant="primary" onClick={props.onRun} disabled={!canRun}>
@@ -194,9 +213,9 @@ export function RunCard(props: RunCardProps) {
           {image && !props.canImage && props.canConvert !== false && (
             <div className="text-xs text-[var(--color-muted)]">
               {tr(
-                "fpkg.image.folderOnly",
+                "fpkg.image.folderOnly_v3",
                 undefined,
-                "Only a game folder on this computer can become a game image.",
+                "Only a game folder or game image (on this computer, a saved server or the PS5) can become a game image; unpack an archive first.",
               )}
             </div>
           )}
@@ -502,98 +521,9 @@ function ImageUpload({
   );
 }
 
-/** The AMPR LZ4 asset-pack option for a libSceAmpr game's .exfat image. */
-export interface Lz4Choice {
-  /** What the check found about the game's own ampr_emu. */
-  readiness: AmprPacksReadiness;
-  on: boolean;
-  onToggle: (on: boolean) => void;
-  /** A profile read from a .toml file (its name); null packs with the built-in one. */
-  profileName: string | null;
-  onProfile: (profile: { name: string; text: string } | null) => void;
-}
-
-/** Packing replaces .ffpfsc compression: the packs are already compressed, and the engine
- *  writes them into a plain exFAT image only. */
-export function lz4Active(format: ImageFormat, lz4: Lz4Choice | undefined): boolean {
-  return format === "exfat" && !!lz4?.on && !lz4.readiness.refusal;
-}
-
-function Lz4Option({ lz4 }: { lz4: Lz4Choice }) {
-  const tr = useTr();
-  const refusal = lz4.readiness.refusal;
-  return (
-    <div className="space-y-1" data-testid="lz4-option">
-      <label className="flex cursor-pointer items-start gap-2.5 text-xs">
-        <input
-          type="checkbox"
-          checked={lz4.on && !refusal}
-          disabled={!!refusal}
-          onChange={(e) => lz4.onToggle(e.target.checked)}
-          className="checkbox mt-px h-4 w-4 shrink-0"
-        />
-        <span className="min-w-0">
-          <span className="block font-medium text-[var(--color-text)]">
-            {tr("fpkg.image.lz4", undefined, "AMPR LZ4 asset packs (smaller, for ShadowMount+)")}
-          </span>
-          <span className="mt-0.5 block leading-relaxed text-[var(--color-muted)]">
-            {tr(
-              "fpkg.image.lz4_body",
-              undefined,
-              "Packs the game's data into LZ4 asset packs that the game's own ampr_emu (fakelib/libSceAmpr.sprx) reads back, so the image is smaller. Executables, system files and already-compressed media stay as they are. Plain .exfat only, without .ffpfsc compression.",
-            )}
-          </span>
-        </span>
-      </label>
-      {refusal ? (
-        <div className="text-xs text-[var(--color-warn)]">
-          {tr("fpkg.image.lz4_unavailable", { reason: refusal }, "Not available for this game: {reason}")}
-        </div>
-      ) : (
-        lz4.readiness.runtime_version && (
-          <div className="text-xs text-[var(--color-muted)]">
-            {tr(
-              "fpkg.image.lz4_runtime",
-              { version: lz4.readiness.runtime_version },
-              "The game's ampr_emu: {version}",
-            )}
-          </div>
-        )
-      )}
-      {lz4.on && !refusal && (
-        <div className="flex flex-wrap items-center gap-2 text-xs">
-          {lz4.profileName ? (
-            <>
-              <span className="text-[var(--color-muted)]">
-                {tr("fpkg.image.lz4_profile_named", { name: lz4.profileName }, "Profile: {name}")}
-              </span>
-              <Button variant="ghost" onClick={() => lz4.onProfile(null)}>
-                {tr("fpkg.image.lz4_profile_clear", undefined, "Use the built-in profile")}
-              </Button>
-            </>
-          ) : (
-            <label className="cursor-pointer text-[var(--color-accent)] underline">
-              {tr("fpkg.image.lz4_profile", undefined, "Use a profile (.toml)…")}
-              <input
-                type="file"
-                accept=".toml"
-                className="hidden"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  e.target.value = "";
-                  if (file) void file.text().then((text) => lz4.onProfile({ name: file.name, text }));
-                }}
-              />
-            </label>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
 /** What Convert makes and what happens after: one set of choices, used by Convert and by
- *  the queue alike. */
+ *  the queue alike. What to make is chosen under ② and the image's own options under ③;
+ *  this card asks what happens after, and runs. */
 export interface OutputChoiceProps {
   make: "pkg" | "image";
   onMake: (make: "pkg" | "image") => void;
@@ -615,42 +545,8 @@ export interface OutputChoiceProps {
 function OutputChoice(c: OutputChoiceProps) {
   const tr = useTr();
   const image = c.make === "image";
-  const imageExt = buildExtension({ kind: "image", format: c.imageFormat, compress: c.imageCompress });
   return (
     <div className="flex flex-col gap-3" data-testid="output-choice">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
-        <span className="min-w-28 text-[var(--color-muted)]">{tr("cq_build", undefined, "Make")}</span>
-        <SegmentedControl
-          ariaLabel={tr("cq_build", undefined, "Make")}
-          value={c.make}
-          onChange={(v) => {
-            const make = v as "pkg" | "image";
-            c.onMake(make);
-            if (make === "image" && c.then === "stream") c.onThen("upload");
-          }}
-          segments={[
-            { value: "pkg", label: tr("cq_build_pkg", undefined, "A package (.pkg)") },
-            { value: "image", label: tr("cq_build_image", { ext: imageExt }, "A game image ({ext})") },
-          ]}
-        />
-      </div>
-      {image && (
-        <div className="flex flex-col gap-1">
-          <div className="text-xs text-[var(--color-muted)]">
-            {tr(
-              "fpkg.image.what",
-              undefined,
-              "One file you copy to a PS5 drive, which ShadowMount+ mounts and shows on the home screen. Nothing is installed.",
-            )}
-          </div>
-          <ImageChoice
-            format={c.imageFormat}
-            compress={c.imageCompress}
-            onChoice={c.onImageChoice}
-            lz4={c.lz4}
-          />
-        </div>
-      )}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
         <label className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <span className="min-w-28 text-[var(--color-muted)]">{tr("cq_after", undefined, "After converting")}</span>
@@ -696,94 +592,3 @@ function OutputChoice(c: OutputChoiceProps) {
   );
 }
 
-/** Which image to make: the filesystem (UFS2 .ffpkg, what ShadowMount+ recommends, or exFAT),
- *  and whether to compress it into a .ffpfsc. */
-function ImageChoice({
-  format,
-  compress,
-  onChoice,
-  lz4,
-}: {
-  format: ImageFormat;
-  compress: boolean;
-  onChoice: (format: ImageFormat, compress: boolean) => void;
-  lz4?: Lz4Choice;
-}) {
-  const tr = useTr();
-  const setFormat = (f: ImageFormat) => onChoice(f, compress);
-  const setCompress = (c: boolean) => onChoice(format, c);
-  const packing = lz4Active(format, lz4);
-  const options: { id: ImageFormat; label: string; body: string }[] = [
-    {
-      id: "ffpkg",
-      label: tr("fpkg.image.ffpkg", undefined, ".ffpkg (UFS2), recommended"),
-      body: tr(
-        "fpkg.image.ffpkg_body",
-        undefined,
-        "What ShadowMount+ recommends for most games.",
-      ),
-    },
-    {
-      id: "exfat",
-      label: tr("fpkg.image.exfat_choice", undefined, ".exfat"),
-      body: tr(
-        "fpkg.image.exfat_body",
-        undefined,
-        "For games that only work like content on an external drive.",
-      ),
-    },
-    {
-      id: "ffpfs",
-      label: tr("fpkg.image.ffpfs", undefined, ".ffpfs (PFS), experimental"),
-      body: tr(
-        "fpkg.image.ffpfs_body",
-        undefined,
-        "Experimental in ShadowMount+ 1.7. File names must be plain ASCII; the image's own name is kept to 63 characters.",
-      ),
-    },
-  ];
-  return (
-    <div className="mt-1 space-y-2" data-testid="image-choice">
-      <div className="grid gap-2 sm:grid-cols-3">
-        {options.map((o) => (
-          <button
-            key={o.id}
-            type="button"
-            aria-pressed={format === o.id}
-            onClick={() => setFormat(o.id)}
-            className={`border rounded-[var(--radius-card)] transition-[background-color,border-color,box-shadow] px-3.5 py-3 text-left text-xs ${
-              format === o.id
-                ? "border-[color-mix(in_srgb,var(--color-accent)_45%,transparent)] bg-[var(--color-surface-raised)] shadow-[var(--edge-highlight),var(--shadow-1)] ring-1 ring-[color-mix(in_srgb,var(--color-accent)_30%,transparent)]"
-                : "border-[var(--color-border)] bg-[var(--color-surface)] hover:bg-[var(--color-surface-raised)]"
-            }`}
-          >
-            <div className="font-semibold text-[var(--color-text)]">{o.label}</div>
-            <div className="mt-0.5 text-[var(--color-muted)]">{o.body}</div>
-          </button>
-        ))}
-      </div>
-      <label className="flex cursor-pointer items-start gap-2.5 text-xs">
-        <input
-          type="checkbox"
-          checked={compress && !packing}
-          disabled={packing}
-          onChange={(e) => setCompress(e.target.checked)}
-          className="checkbox mt-px h-4 w-4 shrink-0"
-        />
-        <span className="min-w-0">
-          <span className="block font-medium text-[var(--color-text)]">
-            {tr("fpkg.image.compress", undefined, "Compress it into a .ffpfsc")}
-          </span>
-          <span className="mt-0.5 block leading-relaxed text-[var(--color-muted)]">
-            {tr(
-              "fpkg.image.compress_body_v2",
-              undefined,
-              "Usually 40–60% smaller, slower to make, and always mounted read-only. It is compressed as it is written, so only the compressed file is ever on disk.",
-            )}
-          </span>
-        </span>
-      </label>
-      {lz4 && format === "exfat" && <Lz4Option lz4={lz4} />}
-    </div>
-  );
-}

@@ -155,7 +155,7 @@ CFLAGS := -Wall -Wextra -Werror -g $(INCLUDES)
 # it and work, so this is hardening that follows upstream, not a proven cause
 # of any specific report.
 LIBS := -lSceSystemService -lSceUserService -lSceIpmi -lSceAppInstUtil \
-        -lSceNotification -lSceRegMgr -lkernel_sys
+        -lSceNotification -lSceRegMgr -lSceFsInternalForVsh -lkernel_sys
 
 SRCS := src/main.c src/runtime.c src/shell_builtin.c src/takeover.c src/takeover_flag.c src/ownership_record.c src/ava1_stop.c src/register.c src/hw_info.c \
         src/drive_sensors.c \

@@ -67,7 +67,7 @@ export function DrivesCard({
               </Button>
             </div>
           )}
-          <ul className="flex flex-col gap-2" data-testid="game-copies">
+          <ul className="flex flex-col gap-1.5" data-testid="game-copies">
             {copies.map((l) => (
               <CopyRow
                 key={`${l.root}|${l.path}`}

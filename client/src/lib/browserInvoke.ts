@@ -788,6 +788,7 @@ export async function browserInvoke<T>(
         format: args["format"],
         compress: args["compress"] ?? false,
         ampr_lz4: args["amprLz4"],
+        verify_chunk_kib: args["verifyChunkKib"],
       });
     }
     case "job_status": {

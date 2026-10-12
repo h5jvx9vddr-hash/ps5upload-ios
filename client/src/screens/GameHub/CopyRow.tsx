@@ -1,10 +1,10 @@
 import { formatDate } from "../../lib/formatDate";
 import { useState } from "react";
 import { useNavigate } from "react-router";
-import { Check, Copy, Download, FolderOpen, Link2, PackageOpen, Trash2, Upload } from "lucide-react";
+import { Copy, Download, FolderOpen, Link2, PackageOpen, Trash2, Upload } from "lucide-react";
 
 import type { CollectionLocation } from "../../api/collection";
-import { Badge } from "../../components";
+import { Badge, OverflowMenu, type OverflowMenuItem } from "../../components";
 import { pushNotification } from "../../state/notifications";
 import { createPkgLink } from "../../state/pkgLinks";
 import { writeClipboard } from "../../lib/clipboard";
@@ -24,73 +24,9 @@ import { gamePath } from "../../lib/gamePage";
 import { installOffers } from "./collectionInstall";
 import { ActivityLine } from "./ActivityLine";
 
-// One copy of a game on the drives: what it is, where, and what can be done with it.
-
-export function CopyButton({ text, label }: { text: string; label: string }) {
-  const [done, setDone] = useState(false);
-  return (
-    <button
-      type="button"
-      onClick={async () => {
-        if (await writeClipboard(text)) {
-          setDone(true);
-          setTimeout(() => setDone(false), 1200);
-        }
-      }}
-      className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] px-3 py-1 text-xs text-[var(--color-muted)] hover:text-[var(--color-text)]"
-      title={label}
-      aria-label={label}
-    >
-      {done ? <Check size={12} /> : <Copy size={12} />}
-      {label}
-    </button>
-  );
-}
-
-/** Hosts the package for the selected console and copies the link it can install from. */
-function InstallLinkButton({ host, path }: { host: string; path: string }) {
-  const tr = useTr();
-  const [state, setState] = useState<"idle" | "busy" | "done">("idle");
-  return (
-    <button
-      type="button"
-      disabled={state === "busy"}
-      onClick={async () => {
-        setState("busy");
-        try {
-          const link = await createPkgLink(host, path);
-          await writeClipboard(link.url);
-          setState("done");
-          pushNotification(
-            "info",
-            tr("collection.link_copied", undefined, "Install link copied"),
-            { body: link.url },
-          );
-          setTimeout(() => setState("idle"), 1500);
-        } catch (e) {
-          setState("idle");
-          pushNotification(
-            "error",
-            tr(
-              "collection.link_failed",
-              { error: e instanceof Error ? e.message : String(e) },
-              "Could not make a link: {error}",
-            ),
-          );
-        }
-      }}
-      className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] px-3 py-1 text-xs text-[var(--color-muted)] hover:text-[var(--color-text)] disabled:opacity-60"
-      title={tr(
-        "collection.copy_link_hint_v2",
-        undefined,
-        "A link this PS5 can install the package from by itself (a browser or a package installer on the console). It works while this computer is on, until you stop it under Serving or the app quits.",
-      )}
-    >
-      {state === "done" ? <Check size={12} /> : <Link2 size={12} />}
-      {tr("collection.copy_link", undefined, "Copy install link")}
-    </button>
-  );
-}
+// One copy of a game on the drives: what it is, where, and what can be done with it. One
+// line of facts, one of path, the primary action as a button and the rest behind a menu, so
+// a game with several copies reads as a list rather than a stack of panels.
 
 function kindTone(kind?: string) {
   return kind === "patch" ? "accent" : kind === "dlc" ? "ps5" : "neutral";
@@ -120,6 +56,7 @@ export function CopyRow({
   const navigate = useNavigate();
   const [activity] = useCopyActivity([loc.absolute_path], host);
   const connectedHost = useConnectionStore((s) => s.host);
+  const [linkBusy, setLinkBusy] = useState(false);
   const sendable = !!sendKind(loc) && loc.pkg?.complete !== false && !loc.pkg?.error;
   const noTrash = useCollectionStore(
     (s) => s.settings?.trash_available === false,
@@ -137,176 +74,187 @@ export function CopyRow({
   const onServer = isRemotePath(loc.absolute_path);
   // A file manager can open it only when the engine's disk is this computer's.
   const canReveal = isTauriEnv() && engineIsOnThisDevice() && !onServer;
+  const usable = loc.type === "pkg" && p?.complete !== false && !p?.error;
+  const path = loc.absolute_path || loc.path;
+
+  const install = () => {
+    installOffers(hostOf(host), [
+      {
+        game: { title: game.title },
+        offer: {
+          path: loc.absolute_path,
+          name: loc.path.split(/[\\/]/).pop() || loc.path,
+          version: p?.version ?? "",
+          content_id: p?.content_id ?? "",
+          title: p?.title ?? game.title,
+          size_bytes: loc.size_bytes,
+          category: categoryOf(p?.kind),
+        },
+      },
+    ]);
+    pushNotification("info", tr("collection.queued", { n: 1 }, "{n} packages queued for install"), {
+      link: gamePath(game.titleId),
+    });
+  };
+  const copyLink = async () => {
+    setLinkBusy(true);
+    try {
+      const link = await createPkgLink(host, loc.absolute_path);
+      await writeClipboard(link.url);
+      pushNotification("info", tr("collection.link_copied", undefined, "Install link copied"), {
+        body: link.url,
+      });
+    } catch (e) {
+      pushNotification(
+        "error",
+        tr(
+          "collection.link_failed",
+          { error: e instanceof Error ? e.message : String(e) },
+          "Could not make a link: {error}",
+        ),
+      );
+    } finally {
+      setLinkBusy(false);
+    }
+  };
+
+  // The one thing most people want from this copy: send a folder or image, install a package.
+  const primary =
+    host && sendable
+      ? { icon: <Upload size={12} />, label: tr("collection.send_go", undefined, "Send to PS5"), run: onSend }
+      : host && usable
+        ? { icon: <Download size={12} />, label: tr("game_install", undefined, "Install"), run: install }
+        : null;
+  const more: OverflowMenuItem[] = [
+    {
+      icon: <Copy size={12} />,
+      label: tr("collection.copy_path", undefined, "Copy path"),
+      onSelect: () => {
+        void writeClipboard(path).then((ok) => {
+          if (ok) pushNotification("info", tr("collection.path_copied", undefined, "Path copied"), { body: path });
+        });
+      },
+    },
+    ...(host && usable && !onServer
+      ? [
+          {
+            icon: <Link2 size={12} />,
+            label: tr("collection.copy_link", undefined, "Copy install link"),
+            onSelect: () => void copyLink(),
+            loading: linkBusy,
+            title: tr(
+              "collection.copy_link_hint_v2",
+              undefined,
+              "A link this PS5 can install the package from by itself (a browser or a package installer on the console). It works while this computer is on, until you stop it under Serving or the app quits.",
+            ),
+          },
+        ]
+      : []),
+    ...(loc.type !== "pkg"
+      ? [
+          {
+            // Folders, images and archives are what Convert takes: to a package, or another image.
+            icon: <PackageOpen size={12} />,
+            label: tr("collection.convert", undefined, "Convert…"),
+            onSelect: () => navigate("/convert", { state: { source: loc.absolute_path } }),
+            title: tr(
+              "collection.convert_hint",
+              undefined,
+              "Open it in Convert: make an installable package, or a different game image.",
+            ),
+          },
+        ]
+      : []),
+    ...(canReveal
+      ? [
+          {
+            icon: <FolderOpen size={12} />,
+            label: tr("collection.show_in_files", undefined, "Show in file manager"),
+            onSelect: () => void openLocalPath(loc.absolute_path),
+          },
+        ]
+      : []),
+    ...(onTrash && !onServer
+      ? [
+          {
+            icon: <Trash2 size={12} />,
+            label: noTrash
+              ? tr("collection.delete_action", undefined, "Delete…")
+              : tr("collection.trash_go", undefined, "Move to Trash"),
+            onSelect: () => onTrash([loc.absolute_path]),
+            destructive: true,
+          },
+        ]
+      : []),
+  ];
+
   return (
-    <li className="rounded-[var(--radius-card)] border border-[var(--glass-edge)] bg-[var(--color-surface)] p-4 text-xs">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-medium text-[var(--color-text)]">
-          {locationKind(loc.type)}
-        </span>
+    <li
+      className="rounded-[var(--radius-card)] border border-[var(--glass-edge)] bg-[var(--color-surface)] px-3.5 py-2.5 text-xs"
+      data-testid="game-copy"
+    >
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="font-medium text-[var(--color-text)]">{locationKind(loc.type)}</span>
         {kindLabel && (
           <Badge tone={kindTone(p?.kind)} size="sm" title={p?.kind_reason}>
             {kindLabel}
             {p?.kind_confident === false ? " ?" : ""}
           </Badge>
         )}
-        {p?.version && (
-          <span className="text-[var(--color-muted)]">v{p.version}</span>
-        )}
-        {p?.region && (
-          <span className="text-[var(--color-muted)]">{p.region}</span>
-        )}
+        {p?.title && p.kind === "dlc" && <span className="text-[var(--color-text)]">{p.title}</span>}
+        {p?.version && <span className="text-[var(--color-muted)]">v{p.version}</span>}
+        {p?.region && <span className="text-[var(--color-muted)]">{p.region}</span>}
         {p?.complete === false && (
           <Badge tone="warn" size="sm">
             {tr("collection.incomplete", undefined, "Incomplete")}
           </Badge>
         )}
-        <span className="ml-auto tabular-nums text-[var(--color-muted)]">
-          {formatCollectionBytes(loc.size_bytes)}
-        </span>
-      </div>
-      {p?.title && p.kind === "dlc" && (
-        <div className="mt-1 text-[var(--color-text)]">{p.title}</div>
-      )}
-      {p?.error && (
-        <div className="mt-1 text-[var(--color-warn)]">
-          {tr(
-            "collection.unreadable",
-            { why: p.error },
-            "Could not be read: {why}",
-          )}
-        </div>
-      )}
-      {p?.kind_confident === false && p.kind_reason && (
-        <div className="mt-1 text-[var(--color-muted)]">
-          {tr(
-            "collection.unsure",
-            { why: p.kind_reason },
-            "Not certain what this is: {why}",
-          )}
-        </div>
-      )}
-      <div className="mt-1.5 break-all font-mono text-[0.6875rem] text-[var(--color-muted)]">
-        {loc.absolute_path || loc.path}
-      </div>
-      <div className="mt-1 text-[0.6875rem] text-[var(--color-muted)]">
-        {loc.added_at
-          ? loc.date_source === "created"
-            ? tr(
-                "collection.added_on",
-                { date: formatDate(new Date(loc.added_at)) },
-                "Added {date}",
-              )
-            : tr(
-                "collection.modified_on",
-                { date: formatDate(new Date(loc.added_at)) },
-                "Last changed {date}",
-              )
-          : null}
-        {p?.content_id && (
-          <span className="ml-2 font-mono">{p.content_id}</span>
-        )}
-      </div>
-      <div className="mt-2 flex flex-wrap gap-1.5">
-        {host && sendable && (
-          <button
-            type="button"
-            onClick={onSend}
-            className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--color-accent)] px-3 py-1 text-xs font-medium text-[var(--color-text)] hover:bg-[var(--color-accent-soft)]"
-          >
-            <Upload size={12} />
-            {tr("collection.send_go", undefined, "Send to PS5")}
-          </button>
-        )}
-        <CopyButton
-          text={loc.absolute_path || loc.path}
-          label={tr("collection.copy_path", undefined, "Copy path")}
-        />
-        {host && loc.type === "pkg" && p?.complete !== false && !p?.error && (
-          // A package is installed, not sent: queue it streamed from here (or from the
-          // server it sits on), the same path as the console row's offers.
-          <button
-            type="button"
-            onClick={() => {
-              installOffers(hostOf(host), [
-                {
-                  game: { title: game.title },
-                  offer: {
-                    path: loc.absolute_path,
-                    name: loc.path.split(/[\\/]/).pop() || loc.path,
-                    version: p?.version ?? "",
-                    content_id: p?.content_id ?? "",
-                    title: p?.title ?? game.title,
-                    size_bytes: loc.size_bytes,
-                    category: categoryOf(p?.kind),
-                  },
-                },
-              ]);
-              pushNotification("info", tr("collection.queued", { n: 1 }, "{n} packages queued for install"), {
-                link: gamePath(game.titleId),
-              });
-            }}
-            className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--color-accent)] px-3 py-1 text-xs font-medium text-[var(--color-text)] hover:bg-[var(--color-accent-soft)]"
-          >
-            <Download size={12} />
-            {tr("game_install", undefined, "Install")}
-          </button>
-        )}
-        {host &&
-          !onServer &&
-          loc.type === "pkg" &&
-          p?.complete !== false &&
-          !p?.error && (
-            <InstallLinkButton host={host} path={loc.absolute_path} />
-          )}
-        {loc.type !== "pkg" && (
-          // Folders, images and archives are what Convert takes: to a package, or another image.
-          <button
-            type="button"
-            onClick={() =>
-              navigate("/convert", { state: { source: loc.absolute_path } })
-            }
-            className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] px-3 py-1 text-xs text-[var(--color-muted)] hover:text-[var(--color-text)]"
-            title={tr(
-              "collection.convert_hint",
-              undefined,
-              "Open it in Convert: make an installable package, or a different game image.",
-            )}
-          >
-            <PackageOpen size={12} />
-            {tr("collection.convert", undefined, "Convert…")}
-          </button>
-        )}
-        {canReveal && (
-          <button
-            type="button"
-            onClick={() => void openLocalPath(loc.absolute_path)}
-            className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] px-3 py-1 text-xs text-[var(--color-muted)] hover:text-[var(--color-text)]"
-          >
-            <FolderOpen size={12} />
-            {tr("collection.show_in_files", undefined, "Show in file manager")}
-          </button>
-        )}
-        {onTrash && !onServer && (
-          <button
-            type="button"
-            onClick={() => onTrash([loc.absolute_path])}
-            className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--color-border-strong)] px-3 py-1 text-xs text-[var(--color-bad)] hover:border-[var(--color-bad)]"
-          >
-            <Trash2 size={12} />
-            {noTrash
-              ? tr("collection.delete_action", undefined, "Delete…")
-              : tr("collection.trash_go", undefined, "Move to Trash")}
-          </button>
-        )}
-      </div>
-      {activity && (
-        <div className="mt-2">
+        <span className="tabular-nums text-[var(--color-muted)]">{formatCollectionBytes(loc.size_bytes)}</span>
+        {activity && (
           <ActivityLine
             activity={activity}
             onOpen={() =>
               navigate(queueLinkFor(host, connectedHost, "installing" in activity && activity.installing))
             }
           />
+        )}
+        <span className="ms-auto flex items-center gap-1">
+          {primary && (
+            <button
+              type="button"
+              onClick={primary.run}
+              className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--color-accent)] px-3 py-1 text-xs font-medium text-[var(--color-text)] hover:bg-[var(--color-accent-soft)]"
+            >
+              {primary.icon}
+              {primary.label}
+            </button>
+          )}
+          <OverflowMenu
+            items={more}
+            ariaLabel={tr("collection.more_actions", undefined, "More actions for this copy")}
+            buttonTitle={tr("collection.more_actions", undefined, "More actions for this copy")}
+          />
+        </span>
+      </div>
+      <div className="mt-1 break-all font-mono text-[0.6875rem] text-[var(--color-muted)]" title={path}>
+        {path}
+      </div>
+      {(loc.added_at || p?.content_id || p?.error || (p?.kind_confident === false && p.kind_reason)) && (
+        <div className="mt-0.5 text-[0.6875rem] text-[var(--color-muted)]">
+          {loc.added_at
+            ? loc.date_source === "created"
+              ? tr("collection.added_on", { date: formatDate(new Date(loc.added_at)) }, "Added {date}")
+              : tr("collection.modified_on", { date: formatDate(new Date(loc.added_at)) }, "Last changed {date}")
+            : null}
+          {p?.content_id && <span className="ms-2 font-mono">{p.content_id}</span>}
+          {p?.error && (
+            <span className="ms-2 text-[var(--color-warn)]">
+              {tr("collection.unreadable", { why: p.error }, "Could not be read: {why}")}
+            </span>
+          )}
+          {p?.kind_confident === false && p.kind_reason && (
+            <span className="ms-2">{tr("collection.unsure", { why: p.kind_reason }, "Not certain what this is: {why}")}</span>
+          )}
         </div>
       )}
     </li>

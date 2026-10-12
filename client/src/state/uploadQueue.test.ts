@@ -461,6 +461,7 @@ describe("an item from another console", () => {
       "192.168.1.99",
       "/data/homebrew/PPSA11386-app",
       item.txIdHex,
+      { mode: undefined, directAddr: undefined },
     );
     expect(item.status).toBe("done");
     expect(mockedStartFile).not.toHaveBeenCalledWith(

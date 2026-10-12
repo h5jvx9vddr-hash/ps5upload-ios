@@ -1,5 +1,6 @@
 // Convert a game folder or mount image (.exfat / .ffpkg) into an installable debug FPKG, and
-// optionally install it, as three guided cards: ① Game, ② Options, ③ Build & install.
+// optionally install it, as four guided cards: ① Game, ② What to make, ③ Options (the
+// package's or the image's), ④ Build & install.
 //
 // The work runs in the engine (desktop, Docker or Android); the console is only involved at the
 // install. `state/fpkgConversion` drives the run; this screen holds the source, its check and the
@@ -10,7 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { PackagePlus } from "lucide-react";
 
-import { fpkg, type AmprLz4Options, type FpkgEstimates, type FpkgInspection, type ImageFormat } from "../../api/fpkg";
+import { fpkg, type AmprLz4Options, type FpkgEstimates, type FpkgInspection } from "../../api/fpkg";
 import { appLaunch } from "../../api/ps5";
 import { Callout, Card, PageHeader } from "../../components";
 import { FakeGameFirmwareNotice } from "../../components/FakeGameFirmwareNotice";
@@ -25,7 +26,7 @@ import { profileNameForHost, useRosterStore } from "../../state/roster";
 import { useWebviewDrop } from "../../lib/useWebviewDrop";
 import { useConnectionStore } from "../../state/connection";
 import { useConvertPrefs } from "../../state/convertPrefs";
-import { isArchiveSource, useFpkgConversion } from "../../state/fpkgConversion";
+import { isArchiveSource, makesImage, useFpkgConversion } from "../../state/fpkgConversion";
 import { useUploadStore } from "../../state/upload";
 import { DEFAULT_IMAGE_SUBPATH } from "../../lib/imageUpload";
 import { useLocation, useNavigate } from "react-router";
@@ -33,14 +34,16 @@ import { useTr } from "../../state/lang";
 import { pickLocalPath } from "../../state/localPicker";
 import { useTaskStore } from "../../state/tasks";
 import { GameCard } from "./GameCard";
+import { MakeCard } from "./MakeCard";
 import { OptionsCard } from "./OptionsCard";
 import { RunCard, lz4Active, type Lz4Choice } from "./RunCard";
 import { SwapJournals } from "./SwapJournals";
 import { QueueCard } from "./QueueCard";
-import { thenFor, useConvertQueue, type ConvertBuild, type ConvertThen } from "../../state/convertQueue";
+import { buildExtension, thenFor, useConvertQueue, type ConvertBuild, type ConvertThen } from "../../state/convertQueue";
 import { gameFoldersAmong, gamesInFolder } from "../../lib/folderScan";
 import { usePackageViewer } from "../../state/packageViewer";
 import { consoleSwapDeps } from "../../lib/dumpSwapConsole";
+import { amprTrace, titleIdOf } from "../../api/amprTrace";
 
 /** How long a first press of Delete package stays armed. */
 const DELETE_ARM_MS = 5000;
@@ -84,14 +87,26 @@ export default function FpkgConvertScreen() {
   const [language, setLanguage] = useState("");
   // ③'s one choice of what to make: a package, or the image picked (format, compressed). The
   // queue builds exactly this, never a package in place of the image picked (#433 report).
-  const [imageFormat, setImageFormat] = useState<ImageFormat>("ffpkg");
-  const [imageCompress, setImageCompress] = useState(false);
-  const [make, setMake] = useState<"pkg" | "image">("pkg");
+  // What to make is remembered (prefs), and while a build runs it follows the build: coming
+  // back to the screen mid-image must not show it as a package build.
+  const make = useConvertPrefs((s) => s.make);
+  const setMake = useConvertPrefs((s) => s.setMake);
+  const imageFormat = useConvertPrefs((s) => s.imageFormat);
+  const imageCompress = useConvertPrefs((s) => s.imageCompress);
+  const setImageChoice = useConvertPrefs((s) => s.setImageChoice);
+  useEffect(() => {
+    if (pipeline.phase === "running") {
+      const building = makesImage(pipeline.mode) ? "image" : "pkg";
+      if (building !== make) setMake(building);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pipeline.phase]);
   // AMPR LZ4 asset packs for this game's .exfat image, and the profile it packs with. Per game
   // (they depend on the game's own ampr_emu), so only the game checked here carries them into
   // the queue.
   const [lz4On, setLz4On] = useState(false);
   const [lz4Profile, setLz4Profile] = useState<{ name: string; text: string } | null>(null);
+  const [lz4InstallRuntime, setLz4InstallRuntime] = useState(false);
   const build: ConvertBuild =
     make === "image" ? { kind: "image", format: imageFormat, compress: imageCompress } : { kind: "pkg" };
   const then = thenFor(build.kind, thenChoice, canInstall);
@@ -218,6 +233,7 @@ export default function FpkgConvertScreen() {
       setLanguage("");
       setLz4On(false);
       setLz4Profile(null);
+      setLz4InstallRuntime(false);
       void check(path);
     },
     [check, reset, setSource, setPassword],
@@ -315,7 +331,9 @@ export default function FpkgConvertScreen() {
               deleteAfter,
             }
           : undefined,
-        lz4Active(build.format, lz4Choice) ? { profileToml: lz4Profile?.text } : undefined,
+        lz4Active(build.format, lz4Choice)
+          ? { profileToml: lz4Profile?.text, installRuntime: lz4InstallRuntime }
+          : undefined,
       );
       return;
     }
@@ -366,6 +384,7 @@ export default function FpkgConvertScreen() {
     setLanguage("");
     setLz4On(false);
     setLz4Profile(null);
+    setLz4InstallRuntime(false);
     setInspection(null);
     setEstimates(null);
     setChecking(false);
@@ -376,16 +395,36 @@ export default function FpkgConvertScreen() {
   // converted in place only.
   const isImage = /\.(exfat|ffpkg)$/i.test(source.trim()) && !source.startsWith("ps5://");
   const noFiles = inspection !== null && inspection.files === 0;
-  // A game folder on this computer can be written as an image. One on the console or a
-  // saved server, an image, or an archive cannot from here (use Convert, or unpack first).
+  // A game folder or a game image can be written as an image (an .exfat into a .ffpkg, say):
+  // on this computer, on a saved server, or on the console (read through the helper, as a
+  // package build reads it). An archive cannot from here: unpack it first.
   const src = source.trim();
-  const isLocalFolder =
-    inspection !== null &&
-    !noFiles &&
-    !isImage &&
-    !isArchiveSource(src) &&
-    !/^(ps5|remote):\/\//.test(src) &&
-    !/\.(exfat|ffpkg|ffpfs|ffpfsc)$/i.test(src);
+  const isLocalFolder = inspection !== null && !noFiles && !isArchiveSource(src);
+  // A profile measured from play (the game page's Measure how it plays) is the LZ4 default
+  // for this title; a file picked by hand replaces it.
+  const measuredFor = titleIdOf(inspection?.content_id);
+  useEffect(() => {
+    if (!measuredFor || !inspection?.ampr_packs || inspection.ampr_packs.refusal) return;
+    let live = true;
+    amprTrace
+      .profile(measuredFor)
+      .then((p) => {
+        if (!live || !p) return;
+        setLz4Profile((cur) =>
+          cur
+            ? cur
+            : {
+                name: tr("trace_profile_name", { n: p.profile.sessions }, "measured from {n} play sessions"),
+                text: p.toml,
+              },
+        );
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [measuredFor, inspection?.ampr_packs?.refusal]);
   // Offered only for a game that reads its files through libSceAmpr (the check says so).
   const lz4Choice: Lz4Choice | undefined = inspection?.ampr_packs
     ? {
@@ -394,6 +433,8 @@ export default function FpkgConvertScreen() {
         onToggle: setLz4On,
         profileName: lz4Profile?.name ?? null,
         onProfile: setLz4Profile,
+        installRuntime: lz4InstallRuntime,
+        onInstallRuntime: setLz4InstallRuntime,
       }
     : undefined;
 
@@ -416,8 +457,8 @@ export default function FpkgConvertScreen() {
           homebrew and when the firmware is unknown. */}
       <FakeGameFirmwareNotice kernel={kernel} contentId={inspection?.content_id} />
 
-      {/* Wide windows: the game and its options on the left, building and the queue on
-          the right, so neither column is a long empty strip. */}
+      {/* Wide windows: ① and ② on the left, ③ and ④ on the right, so the steps read left to
+          right, top to bottom. */}
       <div className="grid items-start gap-4 xl:grid-cols-2">
         <div className="flex min-w-0 flex-col gap-4">
           <GameCard
@@ -452,12 +493,33 @@ export default function FpkgConvertScreen() {
             onPassword={setPassword}
           />
 
+          <MakeCard
+            make={make}
+            onMake={(m) => {
+              setMake(m);
+              if (m === "image" && then === "stream") setThen("upload");
+            }}
+            kernel={kernel}
+            contentId={inspection?.content_id}
+            checked={inspection !== null}
+            locked={locked}
+          />
+
+        </div>
+        <div className="flex min-w-0 flex-col gap-4">
           <OptionsCard
             outputDir={outputDir}
             onChangeOutput={() => void browseOutput()}
             onOutputTyped={setOutputDir}
             canBrowse={canBrowse}
             compression={compression}
+            make={make}
+            image={{
+              format: imageFormat,
+              compress: imageCompress,
+              onChoice: (f, c) => setImageChoice(f, c),
+              lz4: lz4Choice,
+            }}
             language={language}
             onLanguage={setLanguage}
             onCompression={setCompression}
@@ -466,8 +528,6 @@ export default function FpkgConvertScreen() {
             plannedSize={inspection?.planned_size}
             outputFree={inspection?.output_free}
           />
-        </div>
-        <div className="flex min-w-0 flex-col gap-4">
 
           <SwapJournals
             deps={swapDeps}
@@ -496,10 +556,7 @@ export default function FpkgConvertScreen() {
               onMake: setMake,
               imageFormat,
               imageCompress,
-              onImageChoice: (f, c) => {
-                setImageFormat(f);
-                setImageCompress(c);
-              },
+              onImageChoice: (f, c) => setImageChoice(f, c),
               then,
               onThen: setThen,
               deleteAfter,
@@ -509,13 +566,29 @@ export default function FpkgConvertScreen() {
             }}
             onRun={run}
             canImage={isLocalFolder}
+            summary={
+              inspection
+                ? tr(
+                    "fpkg.run.summary",
+                    {
+                      what:
+                        build.kind === "image"
+                          ? tr("fpkg.run.what_image", { ext: buildExtension(build) }, "a {ext} game image")
+                          : tr("fpkg.run.what_pkg", undefined, "a package (.pkg)"),
+                      title: inspection.title || inspection.content_id || source.trim(),
+                      dir: outputDir.trim() || "~/Downloads/fpkgs",
+                    },
+                    "Makes {what} of {title} in {dir}.",
+                  )
+                : undefined
+            }
             canQueue={!!source.trim() && !noFiles}
             onQueue={() => {
               const r = queueAdd(
                 source.trim(),
                 isLocalFolder,
                 build.kind === "image" && lz4Active(build.format, lz4Choice)
-                  ? { profileToml: lz4Profile?.text }
+                  ? { profileToml: lz4Profile?.text, installRuntime: lz4InstallRuntime }
                   : undefined,
               );
               if (r === "skipped") skippedNote(1);
@@ -568,57 +641,60 @@ export default function FpkgConvertScreen() {
             }
           />
 
-          <QueueCard
-            items={queueItems}
-            running={queueRunning}
-            onScanFolder={() =>
-              void (async () => {
-                const folder = !isTauriEnv()
-                  ? await pickLocalPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") })
-                  : await pickPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") });
-                if (!folder) return;
-                try {
-                  const found = await gamesInFolder(folder);
-                  queueAll(found.sources, found.skipped);
-                } catch (err) {
-                  setError(err instanceof Error ? err.message : String(err));
-                }
-              })()
-            }
-            onPickFolders={() =>
-              void (async () => {
-                const picked = await pickPaths({
-                  mode: "folder",
-                  title: tr("cq_pick_folders", undefined, "Pick game folders…"),
-                }).catch(() => [] as string[]);
-                if (!picked.length) return;
-                const { games, skipped } = await gameFoldersAmong(picked);
-                queueAll(
-                  games.map((path) => ({ path, isDir: true })),
-                  skipped,
-                );
-              })()
-            }
-            onPickFiles={() =>
-              void (async () => {
-                const picked = await pickPaths({
-                  title: tr("fpkg.pickImage", undefined, "Choose a game image or archive"),
-                  filters: [{ name: "Game image or archive", extensions: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "zip", "7z", "rar"] }],
-                }).catch(() => [] as string[]);
-                queueAll(
-                  picked.map((path) => ({ path, isDir: false })),
-                  0,
-                );
-              })()
-            }
-            onStart={() => void useConvertQueue.getState().start()}
-            onStop={() => useConvertQueue.getState().stop()}
-            onRemove={(id) => useConvertQueue.getState().remove(id)}
-            onMove={(id, d) => useConvertQueue.getState().move(id, d)}
-            onClearFinished={() => useConvertQueue.getState().clearFinished()}
-          />
         </div>
       </div>
+
+      {/* The queue takes the whole width: its rows are long, and it is the one card that is
+          not a step of converting the current game. */}
+      <QueueCard
+        items={queueItems}
+        running={queueRunning}
+        onScanFolder={() =>
+          void (async () => {
+            const folder = !isTauriEnv()
+              ? await pickLocalPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") })
+              : await pickPath({ mode: "folder", title: tr("batch_scan_pick", undefined, "Choose the folder that holds your games") });
+            if (!folder) return;
+            try {
+              const found = await gamesInFolder(folder);
+              queueAll(found.sources, found.skipped);
+            } catch (err) {
+              setError(err instanceof Error ? err.message : String(err));
+            }
+          })()
+        }
+        onPickFolders={() =>
+          void (async () => {
+            const picked = await pickPaths({
+              mode: "folder",
+              title: tr("cq_pick_folders", undefined, "Pick game folders…"),
+            }).catch(() => [] as string[]);
+            if (!picked.length) return;
+            const { games, skipped } = await gameFoldersAmong(picked);
+            queueAll(
+              games.map((path) => ({ path, isDir: true })),
+              skipped,
+            );
+          })()
+        }
+        onPickFiles={() =>
+          void (async () => {
+            const picked = await pickPaths({
+              title: tr("fpkg.pickImage", undefined, "Choose a game image or archive"),
+              filters: [{ name: "Game image or archive", extensions: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "zip", "7z", "rar"] }],
+            }).catch(() => [] as string[]);
+            queueAll(
+              picked.map((path) => ({ path, isDir: false })),
+              0,
+            );
+          })()
+        }
+        onStart={() => void useConvertQueue.getState().start()}
+        onStop={() => useConvertQueue.getState().stop()}
+        onRemove={(id) => useConvertQueue.getState().remove(id)}
+        onMove={(id, d) => useConvertQueue.getState().move(id, d)}
+        onClearFinished={() => useConvertQueue.getState().clearFinished()}
+      />
 
       <details className="text-sm">
         <summary className="cursor-pointer text-[var(--color-muted)]">

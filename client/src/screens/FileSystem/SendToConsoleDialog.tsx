@@ -2,13 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import { ArrowUp, Folder, HardDrive, Monitor, Send, Usb } from "lucide-react";
 
 import { fetchVolumes, fsListDir, type Volume } from "../../api/ps5";
-import { Button, Modal } from "../../components";
+import { Button, Modal, SegmentedControl } from "../../components";
 import { consoleAddr, hostOf } from "../../lib/addr";
 import { planConsoleSend, type SendItem } from "../../lib/consoleSend";
 import { formatBytes } from "../../lib/format";
 import { quickDestinations } from "../../lib/moveTo";
 import { useTr } from "../../state/lang";
 import { useRosterStore } from "../../state/roster";
+import { useC2cRoutes, type C2cRouteMode } from "../../state/c2cRoutes";
 
 function parentDir(p: string): string {
   if (p === "/" || p === "") return "/";
@@ -45,6 +46,12 @@ export function SendToConsoleDialog({
   const [dest, setDest] = useState(startDir);
   const [listing, setListing] = useState<{ dirs: string[]; names: string[] } | null>(null);
   const [missing, setMissing] = useState(false);
+  // #444: how it goes, remembered for this pair of consoles.
+  const routeFor = useC2cRoutes((s) => s.routeFor);
+  const setRoute = useC2cRoutes((s) => s.setRoute);
+  const route = routeFor(hostOf(fromHost), target);
+  const [routeOpen, setRouteOpen] = useState(() => route.mode !== "auto" || route.directAddr !== "");
+  const addrOk = route.directAddr === "" || /^(\d{1,3}\.){3}\d{1,3}(:\d{1,5})?$/.test(route.directAddr);
 
   // The other console's drives: also how we learn it answers at all.
   useEffect(() => {
@@ -95,7 +102,7 @@ export function SendToConsoleDialog({
   const targetName =
     others.find((p) => hostOf(p.host) === target)?.name || target;
   const plan = planConsoleSend(items, dest, volumes ?? [], listing?.names ?? []);
-  const blocked = !target || !!reachError || volumes === null || plan.fits === "no";
+  const blocked = !target || !!reachError || volumes === null || plan.fits === "no" || !addrOk;
   const what =
     items.length === 1
       ? `"${items[0].name}"`
@@ -293,13 +300,72 @@ export function SendToConsoleDialog({
             </span>
           )}
           <span className="text-xs text-[var(--color-muted)]">
-            {tr(
-              "fs_send_route",
-              undefined,
-              "Goes straight between the consoles when they can reach each other, otherwise through this computer.",
-            )}
+            {route.mode === "direct"
+              ? tr("fs_send_route_direct", undefined, "Goes straight between the consoles, never through this device; if they cannot connect, the send fails and says why.")
+              : route.mode === "relay"
+                ? tr("fs_send_route_relay", undefined, "Goes through this device.")
+                : tr(
+                    "fs_send_route",
+                    undefined,
+                    "Goes straight between the consoles when they can reach each other, otherwise through this computer.",
+                  )}{" "}
+            <button
+              type="button"
+              className="text-[var(--color-accent)] underline-offset-2 hover:underline"
+              aria-expanded={routeOpen}
+              onClick={() => setRouteOpen((v) => !v)}
+            >
+              {tr("fs_send_route_change", undefined, "Change…")}
+            </button>
           </span>
         </div>
+
+        {routeOpen && target && (
+          <div className="grid gap-2 text-xs" data-testid="send-console-route">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+              <span className="min-w-28 text-[var(--color-muted)]">{tr("fs_send_route_label", undefined, "Route")}</span>
+              <SegmentedControl
+                ariaLabel={tr("fs_send_route_label", undefined, "Route")}
+                value={route.mode}
+                onChange={(v) => setRoute(hostOf(fromHost), target, { ...route, mode: v as C2cRouteMode })}
+                segments={[
+                  { value: "auto", label: tr("fs_send_route_auto", undefined, "Auto") },
+                  { value: "direct", label: tr("fs_send_route_direct_only", undefined, "Direct only") },
+                  { value: "relay", label: tr("fs_send_route_via_here", undefined, "Through this device") },
+                ]}
+              />
+            </div>
+            {route.mode !== "relay" && (
+              <label className="grid gap-1">
+                <span className="text-[var(--color-muted)]">
+                  {tr("fs_send_dial_label", { name: targetName }, `Address the sending console dials to reach ${targetName} (optional)`)}
+                </span>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={route.directAddr}
+                  placeholder={`${target}:9120`}
+                  onChange={(e) => setRoute(hostOf(fromHost), target, { ...route, directAddr: e.target.value })}
+                  className={`input font-mono ${addrOk ? "" : "border-[var(--color-bad)]"}`}
+                  aria-invalid={!addrOk}
+                  data-testid="send-console-dial"
+                />
+                <span className="text-[var(--color-muted)]">
+                  {tr(
+                    "fs_send_dial_hint",
+                    undefined,
+                    "Leave it empty to dial the console's own address. For ps5-tailscale, set a local forward on the sending console (its status page: 127.0.0.1:19120 → the other console:9120) and enter 127.0.0.1:19120 here. Who may send is decided by the consoles' keys and a one-time ticket, not by the address.",
+                  )}
+                </span>
+                {!addrOk && (
+                  <span className="text-[var(--color-bad)]" role="alert">
+                    {tr("fs_send_dial_bad", undefined, "An IPv4 address, with an optional :port.")}
+                  </span>
+                )}
+              </label>
+            )}
+          </div>
+        )}
       </div>
     </Modal>
   );

@@ -261,6 +261,10 @@
 #define MGMT_FRAME_APP_HIDDEN_LIST_ACK 258u
 #define MGMT_FRAME_USB_EJECT 259u
 #define MGMT_FRAME_USB_EJECT_ACK 260u
+#define MGMT_FRAME_SAVE_MOUNT 261u
+#define MGMT_FRAME_SAVE_MOUNT_ACK 262u
+#define MGMT_FRAME_SAVE_UNMOUNT 263u
+#define MGMT_FRAME_SAVE_UNMOUNT_ACK 264u
 #define MGMT_FRAME_SDK_SCAN 214u
 #define MGMT_FRAME_SDK_SCAN_ACK 215u
 #define MGMT_FRAME_SDK_PATCH 216u
@@ -7018,6 +7022,297 @@ static int handle_app_hidden_list(runtime_state_t *state) {
  * after a sync(): the cache is flushed and the exFAT volume marked clean, which is
  * what makes pulling the stick safe; the caller is told to close any game or app
  * that reads from it first. */
+/* ── Open a save (mount its image decrypted) ─────────────────────────────────
+ *
+ * A PS5 save is one PFS image per save slot under
+ * /user/home/<uid>/savedata_prospero/<TITLE>/<name> (its sealed key sits in the image at
+ * 0x800); a PS4 save is /user/home/<uid>/savedata/<TITLE>/sdimg_<name> with the key beside
+ * it in <name>.bin. /dev/pfsmgr unseals the key (ioctl 0xc0845302, the same call the shell
+ * makes) and sceFsMountSaveData (libSceFsInternalForVsh) mounts the image with it, which
+ * gives plain files the app's Files screen can read and write. Mounting an image in place
+ * under /user/home fails with EPIPE, so the image is copied under /data first and copied
+ * back when the save is closed; that also means a crash mid-edit leaves the real save as it
+ * was. One save open at a time. What earthonion's garlic-savemgr does, in our helper. */
+typedef struct {
+    uint8_t reserved;
+    char *budgetid;
+} SceFsMountSaveDataOpt;
+typedef struct {
+    uint8_t dummy;
+} SceFsUmountSaveDataOpt;
+int sceFsInitMountSaveDataOpt(SceFsMountSaveDataOpt *opt);
+int sceFsMountSaveData(SceFsMountSaveDataOpt *opt, const char *image, const char *mount_point,
+                       uint8_t *key);
+int sceFsInitUmountSaveDataOpt(SceFsUmountSaveDataOpt *opt);
+int sceFsUmountSaveData(SceFsUmountSaveDataOpt *opt, const char *mount_point, int handle,
+                        int ignore);
+
+#define SAVE_MOUNT_POINT "/data/ps5upload/save_mount"
+#define SAVE_COPY_DIR "/data/ps5upload/save_open"
+
+static pthread_mutex_t g_save_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int g_save_mounted = 0;
+static char g_save_image[1024];      /* the real image, under /user/home */
+static char g_save_copy[1024];       /* the copy that is mounted */
+static char g_save_copy_key[1024];   /* PS4: the copied .bin, "" for PS5 */
+static int g_save_is_ps4 = 0;
+/* The mounted copy's mtime and size right after mounting: unchanged at unmount means the
+ * save was only looked at, and the real image is left as it was. */
+static time_t g_save_copy_mtime;
+static off_t g_save_copy_size;
+
+static int save_copy_file(const char *src, const char *dst) {
+    int sfd = open(src, O_RDONLY);
+    if (sfd < 0) return -1;
+    int dfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dfd < 0) { close(sfd); return -1; }
+    /* Heap, never the stack: a large stack buffer on a worker thread has wedged the console. */
+    const size_t bufsz = 256 * 1024;
+    char *buf = malloc(bufsz);
+    if (!buf) { close(sfd); close(dfd); return -1; }
+    ssize_t n;
+    int rc = 0;
+    while ((n = read(sfd, buf, bufsz)) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(dfd, buf + off, (size_t)(n - off));
+            if (w <= 0) { rc = -1; break; }
+            off += w;
+        }
+        if (rc) break;
+    }
+    if (n < 0) rc = -1;
+    if (fsync(dfd) != 0) rc = -1;
+    free(buf);
+    close(sfd);
+    close(dfd);
+    return rc;
+}
+
+/* The unsealed key of an image: PS5 from the image at 0x800, PS4 from `key_path`. */
+static int save_unseal_key(const char *image, const char *key_path, int is_ps4,
+                           uint8_t out[32], int *why_errno) {
+    /* The ioctl writes past the 0x60 input (the key at 0x60..0x80): give it room on the
+     * heap, as the shell does. */
+    uint8_t *data = calloc(1, 0x100);
+    if (!data) return -1;
+    int fd = open(is_ps4 ? key_path : image, O_RDONLY);
+    if (fd < 0) { *why_errno = errno; free(data); return -2; }
+    ssize_t r = is_ps4 ? read(fd, data, 0x60) : pread(fd, data, 0x60, 0x800);
+    close(fd);
+    if (r != 0x60) { *why_errno = EIO; free(data); return -3; }
+    int pfsmgr = open("/dev/pfsmgr", O_RDWR);
+    if (pfsmgr < 0) { *why_errno = errno; free(data); return -4; }
+    int ret = ioctl(pfsmgr, 0xc0845302, data);
+    int e = errno;
+    close(pfsmgr);
+    if (ret < 0) { *why_errno = e; free(data); return -5; }
+    memcpy(out, data + 0x60, 32);
+    free(data);
+    return 0;
+}
+
+static int save_do_unmount(int *written_back) {
+    *written_back = 0;
+    if (!g_save_mounted) return 0;
+    SceFsUmountSaveDataOpt uopt;
+    memset(&uopt, 0, sizeof uopt);
+    sceFsInitUmountSaveDataOpt(&uopt);
+    int rc = sceFsUmountSaveData(&uopt, SAVE_MOUNT_POINT, 0, 0);
+    sync();
+    if (rc < 0 && errno != EINVAL && errno != ENOENT) {
+        /* Still mounted: do not touch the real save. */
+        return -1;
+    }
+    if (g_save_copy[0] && g_save_image[0]) {
+        struct stat cst;
+        int changed = stat(g_save_copy, &cst) != 0 || cst.st_mtime != g_save_copy_mtime ||
+                      cst.st_size != g_save_copy_size;
+        if (!changed) {
+            unlink(g_save_copy);
+        } else if (save_copy_file(g_save_copy, g_save_image) == 0) {
+            *written_back = 1;
+            unlink(g_save_copy);
+        }
+    }
+    if (g_save_copy_key[0]) unlink(g_save_copy_key);
+    sync();
+    g_save_mounted = 0;
+    g_save_image[0] = g_save_copy[0] = g_save_copy_key[0] = 0;
+    return 0;
+}
+
+static int save_do_mount(const char *image, char *err, size_t err_sz, int *is_ps4_out) {
+    const char *bname = strrchr(image, '/');
+    bname = bname ? bname + 1 : image;
+    if (strncmp(image, "/user/home/", 11) != 0 || strstr(image, "/../") != NULL ||
+        bname[0] == 0 || strlen(bname) >= 200) {
+        snprintf(err, err_sz, "save_image_path: must be a save image under /user/home");
+        return -1;
+    }
+    struct stat st;
+    if (stat(image, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(err, err_sz, "save_image_missing: %s", strerror(errno));
+        return -1;
+    }
+    int is_ps4 = 0;
+    {
+        int fd = open(image, O_RDONLY);
+        uint8_t h = 0;
+        if (fd >= 0) {
+            if (pread(fd, &h, 1, 0) == 1 && h == 0x01) is_ps4 = 1;
+            close(fd);
+        }
+    }
+    if (is_ps4 && strncmp(bname, "sdimg_", 6) != 0) {
+        snprintf(err, err_sz, "save_image_not_sdimg: a PS4 save image is named sdimg_<name>");
+        return -1;
+    }
+    *is_ps4_out = is_ps4;
+    mkdir("/data/ps5upload", 0777);
+    mkdir(SAVE_COPY_DIR, 0777);
+    mkdir(SAVE_MOUNT_POINT, 0777);
+    char copy[1024], copy_key[1024] = {0};
+    snprintf(copy, sizeof copy, SAVE_COPY_DIR "/%s", bname);
+    if (save_copy_file(image, copy) != 0) {
+        snprintf(err, err_sz, "save_copy_failed: %s", strerror(errno));
+        return -1;
+    }
+    chmod(copy, 0755);
+    char real_key[1024] = {0};
+    if (is_ps4) {
+        const char *name = bname + 6;
+        size_t dirlen = (size_t)(bname - image);
+        snprintf(real_key, sizeof real_key, "%.*s%s.bin", (int)dirlen, image, name);
+        snprintf(copy_key, sizeof copy_key, SAVE_COPY_DIR "/%s.bin", name);
+        if (save_copy_file(real_key, copy_key) != 0) {
+            snprintf(err, err_sz, "save_key_missing: %s has no %s.bin beside it", bname, name);
+            unlink(copy);
+            return -1;
+        }
+        chmod(copy_key, 0755);
+    }
+    uint8_t key[32];
+    int why = 0;
+    int kr = save_unseal_key(copy, copy_key, is_ps4, key, &why);
+    if (kr != 0) {
+        snprintf(err, err_sz, "save_key_unseal_failed: step %d, %s", kr, strerror(why));
+        unlink(copy);
+        if (copy_key[0]) unlink(copy_key);
+        return -1;
+    }
+    SceFsMountSaveDataOpt mopt;
+    memset(&mopt, 0, sizeof mopt);
+    sceFsInitMountSaveDataOpt(&mopt);
+    mopt.budgetid = "system";
+    /* The mount talks to a shell service over a pipe; with SIGPIPE ignored (as our server
+     * runs) the call reports EPIPE instead of completing. */
+    void (*old)(int) = signal(SIGPIPE, SIG_DFL);
+    int ret = sceFsMountSaveData(&mopt, copy, SAVE_MOUNT_POINT, key);
+    int e = errno;
+    signal(SIGPIPE, old);
+    memset(key, 0, sizeof key);
+    if (ret < 0) {
+        snprintf(err, err_sz, "save_mount_failed: 0x%x, %s", (unsigned)ret, strerror(e));
+        unlink(copy);
+        if (copy_key[0]) unlink(copy_key);
+        return -1;
+    }
+    g_save_mounted = 1;
+    g_save_is_ps4 = is_ps4;
+    {
+        struct stat cst;
+        if (stat(copy, &cst) == 0) {
+            g_save_copy_mtime = cst.st_mtime;
+            g_save_copy_size = cst.st_size;
+        } else {
+            g_save_copy_mtime = 0;
+            g_save_copy_size = -1;
+        }
+    }
+    snprintf(g_save_image, sizeof g_save_image, "%s", image);
+    snprintf(g_save_copy, sizeof g_save_copy, "%s", copy);
+    snprintf(g_save_copy_key, sizeof g_save_copy_key, "%s", copy_key);
+    return 0;
+}
+
+static int save_status_json(char *resp, size_t sz, const char *extra) {
+    char esc[2100];
+    json_escape_into(g_save_image, esc, sizeof esc);
+    return snprintf(resp, sz,
+                    "{\"ok\":true,\"err\":null,\"mounted\":%s,\"image\":\"%s\","
+                    "\"mount_point\":\"%s\",\"kind\":\"%s\"%s}",
+                    g_save_mounted ? "true" : "false", g_save_mounted ? esc : "",
+                    g_save_mounted ? SAVE_MOUNT_POINT : "",
+                    g_save_mounted ? (g_save_is_ps4 ? "ps4" : "ps5") : "",
+                    extra ? extra : "");
+}
+
+/* save.mount {image}: opens the save, replacing one already open (which is closed and
+ * written back first). An empty `image` only reports what is open. */
+static int handle_save_mount(runtime_state_t *state, const char *body, uint64_t body_len) {
+    if (!state) return -1;
+    char image[1024] = {0};
+    char resp[2600];
+    int n;
+    (void)parse_json_string_field_local(body, body_len, "image", image, sizeof(image));
+    pthread_mutex_lock(&g_save_mtx);
+    if (image[0] == 0) {
+        n = save_status_json(resp, sizeof resp, NULL);
+    } else if (g_save_mounted && strcmp(image, g_save_image) == 0) {
+        n = save_status_json(resp, sizeof resp, NULL);
+    } else {
+        char err[512] = {0};
+        int wb = 0;
+        if (g_save_mounted && save_do_unmount(&wb) != 0) {
+            n = snprintf(resp, sizeof resp,
+                         "{\"ok\":false,\"err\":\"save_unmount_failed: the open save could not be closed\"}");
+        } else {
+            int is_ps4 = 0;
+            if (save_do_mount(image, err, sizeof err, &is_ps4) != 0) {
+                char eesc[1100];
+                json_escape_into(err, eesc, sizeof eesc);
+                n = snprintf(resp, sizeof resp, "{\"ok\":false,\"err\":\"%s\"}", eesc);
+            } else {
+                n = save_status_json(resp, sizeof resp, NULL);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_save_mtx);
+    int rc = mgmt_reply(MGMT_FRAME_SAVE_MOUNT_ACK, resp, (uint64_t)(n > 0 ? n : 0));
+    pthread_mutex_lock(&state->state_mtx);
+    state->command_count += 1;
+    pthread_mutex_unlock(&state->state_mtx);
+    return rc;
+}
+
+/* save.unmount {}: closes the open save and writes the image back. */
+static int handle_save_unmount(runtime_state_t *state, const char *body, uint64_t body_len) {
+    (void)body;
+    (void)body_len;
+    if (!state) return -1;
+    char resp[2600];
+    int n;
+    pthread_mutex_lock(&g_save_mtx);
+    int wb = 0;
+    int was = g_save_mounted;
+    if (save_do_unmount(&wb) != 0) {
+        n = snprintf(resp, sizeof resp,
+                     "{\"ok\":false,\"err\":\"save_unmount_failed: the save is still in use (a game open?)\"}");
+    } else {
+        char extra[64];
+        snprintf(extra, sizeof extra, ",\"was_open\":%s,\"written_back\":%s", was ? "true" : "false",
+                 wb ? "true" : "false");
+        n = save_status_json(resp, sizeof resp, extra);
+    }
+    pthread_mutex_unlock(&g_save_mtx);
+    int rc = mgmt_reply(MGMT_FRAME_SAVE_UNMOUNT_ACK, resp, (uint64_t)(n > 0 ? n : 0));
+    pthread_mutex_lock(&state->state_mtx);
+    state->command_count += 1;
+    pthread_mutex_unlock(&state->state_mtx);
+    return rc;
+}
+
 static int handle_usb_eject(runtime_state_t *state, const char *body,
                             uint64_t body_len) {
     if (!state) return -1;

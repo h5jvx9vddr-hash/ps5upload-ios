@@ -34,6 +34,7 @@ pub mod glob;
 pub mod image;
 pub mod lz4;
 pub mod pack;
+pub mod profile_gen;
 pub mod read;
 
 pub use config::{default_profile, Config};

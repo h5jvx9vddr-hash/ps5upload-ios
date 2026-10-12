@@ -1002,6 +1002,17 @@ fn main() -> Result<()> {
     }
 
     match rest[0].as_str() {
+        "save-open" => {
+            let image = rest.get(1).map(String::as_str).unwrap_or("");
+            let r = ps5upload_core::saves::save_open(addr, image)?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            Ok(())
+        }
+        "save-close" => {
+            let r = ps5upload_core::saves::save_close(addr)?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            Ok(())
+        }
         "ava1-ping" | "ava1-lanes" | "ava1-cryptobench" | "ava1-pairing-open" | "chaos-proxy" => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {

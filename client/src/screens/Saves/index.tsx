@@ -9,6 +9,8 @@ import {
   Upload as UploadIcon,
   FolderOpen,
   HardDrive,
+  LockOpen,
+  Lock,
 } from "lucide-react";
 import { openInFileSystem } from "../../state/fsNavigation";
 import {
@@ -26,6 +28,9 @@ import {
   saveArchiveBackupFinalize,
   saveArchiveRestorePrepare,
   type SaveEntry,
+  savesOpen,
+  savesClose,
+  type OpenSave,
 } from "../../api/ps5";
 import { beginTask, type TaskHandle } from "../../state/trackTask";
 import { localFs } from "../../api/localFs";
@@ -41,6 +46,7 @@ import {
   GameIcon,
   OverflowMenu,
   Spinner,
+  Modal,
 } from "../../components";
 // Direct import to avoid the barrel's circular-dep warning at build.
 import { useConfirm } from "../../components/ConfirmDialog";
@@ -77,6 +83,78 @@ export default function SavesScreen() {
   const navigate = useNavigate();
   const host = useConnectionStore((s) => s.host);
   const payloadStatus = useConnectionStore((s) => s.payloadStatus);
+  // A save opened decrypted on the console (one at a time), and the picker for a folder
+  // holding more than one save image.
+  const [openSave, setOpenSave] = useState<OpenSave | null>(null);
+  const [openBusy, setOpenBusy] = useState(false);
+  const [picker, setPicker] = useState<{ entry: SaveEntry; images: string[] } | null>(null);
+  useEffect(() => {
+    if (!host?.trim() || payloadStatus !== "up") {
+      setOpenSave(null);
+      return;
+    }
+    let live = true;
+    savesOpen(consoleAddr(host.trim()), "")
+      .then((r) => live && setOpenSave(r.mounted ? r : null))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [host, payloadStatus]);
+  const doOpenSave = async (image: string) => {
+    if (!host?.trim()) return;
+    setOpenBusy(true);
+    try {
+      const r = await savesOpen(consoleAddr(host.trim()), image);
+      setOpenSave(r.mounted ? r : null);
+      pushNotification("success", tr("saves_opened", undefined, "Save open"), {
+        body: tr("saves_opened_body", { path: r.mount_point }, "Browse and edit it under {path} in Files. Close it from Save data when done."),
+      });
+      openInFileSystem(navigate, r.mount_point);
+    } catch (e) {
+      pushNotification("error", tr("saves_open_failed", { error: e instanceof Error ? e.message : String(e) }, "Could not open the save: {error}"));
+    } finally {
+      setOpenBusy(false);
+    }
+  };
+  const handleOpenSave = async (entry: SaveEntry) => {
+    if (!host?.trim() || openBusy) return;
+    setOpenBusy(true);
+    try {
+      const children = await fsListDir(consoleAddr(host.trim()), entry.path, { limit: 4096 });
+      const images = children
+        .filter((c) => c.kind === "file" && !/\.bin$/i.test(c.name) && (entry.kind !== "ps4" || c.name.startsWith("sdimg_")))
+        .map((c) => (entry.path.endsWith("/") ? `${entry.path}${c.name}` : `${entry.path}/${c.name}`));
+      if (images.length === 0) {
+        pushNotification("info", tr("saves_open_none", undefined, "No save image in this folder."));
+        return;
+      }
+      setOpenBusy(false);
+      if (images.length === 1) await doOpenSave(images[0]);
+      else setPicker({ entry, images });
+    } catch (e) {
+      pushNotification("error", tr("saves_open_failed", { error: e instanceof Error ? e.message : String(e) }, "Could not open the save: {error}"));
+    } finally {
+      setOpenBusy(false);
+    }
+  };
+  const handleCloseSave = async () => {
+    if (!host?.trim() || openBusy) return;
+    setOpenBusy(true);
+    try {
+      const r = await savesClose(consoleAddr(host.trim()));
+      setOpenSave(null);
+      pushNotification("success", tr("saves_closed", undefined, "Save closed"), {
+        body: r.written_back
+          ? tr("saves_closed_written", undefined, "The image was written back into the save.")
+          : tr("saves_closed_unchanged", undefined, "Nothing changed; the save is as it was."),
+      });
+    } catch (e) {
+      pushNotification("error", tr("saves_open_failed", { error: e instanceof Error ? e.message : String(e) }, "Could not close the save: {error}"));
+    } finally {
+      setOpenBusy(false);
+    }
+  };
   const guard = useStaleHostGuard();
   const [saves, setSaves] = useState<SaveEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -894,6 +972,52 @@ export default function SavesScreen() {
               )}
             </div>
           )}
+          {openSave?.mounted && (
+            <div
+              className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-[var(--radius-card)] border border-[color-mix(in_srgb,var(--color-accent)_45%,transparent)] bg-[var(--color-accent-soft)] p-3 text-xs"
+              data-testid="save-open-banner"
+            >
+              <LockOpen size={14} className="shrink-0 text-[var(--color-accent-bright)]" aria-hidden />
+              <span className="min-w-0 flex-1">
+                {tr(
+                  "saves_open_banner",
+                  { name: openSave.image.split("/").pop() ?? openSave.image, path: openSave.mount_point },
+                  "{name} is open at {path}. Changes are written back into the save when you close it.",
+                )}
+              </span>
+              <Button size="sm" variant="secondary" leftIcon={<FolderOpen size={11} />} onClick={() => openInFileSystem(navigate, openSave.mount_point)}>
+                {tr("saves_open_in_files", undefined, "Open in Files")}
+              </Button>
+              <Button size="sm" variant="primary" leftIcon={<Lock size={11} />} disabled={openBusy} onClick={() => void handleCloseSave()}>
+                {tr("saves_close", undefined, "Close & write back")}
+              </Button>
+            </div>
+          )}
+          {picker && (
+            <Modal
+              open
+              onClose={() => setPicker(null)}
+              title={tr("saves_open_pick_title", { title: picker.entry.title_id }, "Which save of {title}?")}
+              size="md"
+            >
+              <ul className="flex flex-col gap-1" data-testid="save-open-picker">
+                {picker.images.map((img) => (
+                  <li key={img}>
+                    <button
+                      type="button"
+                      className="w-full rounded-[var(--radius-field)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-left font-mono text-xs hover:bg-[var(--color-surface-raised)]"
+                      onClick={() => {
+                        setPicker(null);
+                        void doOpenSave(img);
+                      }}
+                    >
+                      {img.split("/").pop()}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </Modal>
+          )}
           {grouped.map(({ title_id, entries }) => (
             <section
               key={title_id}
@@ -924,6 +1048,20 @@ export default function SavesScreen() {
                         {formatDate(e.mtime * 1000, "date")}
                       </div>
                     </div>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      leftIcon={<LockOpen size={11} />}
+                      onClick={() => void handleOpenSave(e)}
+                      disabled={isBusy(e.path) || openBusy}
+                      title={tr(
+                        "saves_open_hint",
+                        undefined,
+                        "Mount this save decrypted on the PS5 and browse its files in Files. Changes are written back when you close it.",
+                      )}
+                    >
+                      {tr("saves_open", undefined, "Open save")}
+                    </Button>
                     {isTauriEnv() && (
                       <>
                         <Button

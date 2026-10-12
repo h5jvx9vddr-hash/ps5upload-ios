@@ -1,6 +1,6 @@
 [package]
 name = "ps5upload-desktop"
-version = "7.0.12"
+version = "7.0.22"
 description = "The all-in-one PS5 companion app."
 edition = "2021"
 rust-version = "1.77"
@@ -125,6 +125,9 @@ tauri-plugin-drag = "2"
 [target.'cfg(not(any(target_os = "android", target_os = "ios", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
 jpegxr = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# 16-bit HDR PNGs with a cICP chunk (#448): `image`'s encoder cannot add chunks. Already in
+# the tree through `image`.
+png = "0.17"
 
 # Mobile (Android/iOS): link the engine as a library and run it
 # in-process (engine_mobile.rs). Desktop spawns it as a sidecar binary

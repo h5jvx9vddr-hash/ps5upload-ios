@@ -66,6 +66,7 @@ import { CollectionCover } from "../Collection/CollectionCover";
 import { CoverFrame, PlatformTag } from "../../components/GameIconFrame";
 import { ConsolesCard } from "./ConsolesCard";
 import { DrivesCard } from "./DrivesCard";
+import { TraceCard } from "./TraceCard";
 import { fetchRunningGames } from "../../lib/runningGames";
 import { killGame } from "../../lib/killGame";
 import { playFor, useTrackedPlay } from "../../lib/trackedPlay";
@@ -439,15 +440,34 @@ export default function GameHubScreen() {
               {playSeconds !== undefined && playSeconds > 0 && (
                 <FactChip icon={<Clock size={12} aria-hidden />}>{formatDuration(playSeconds)}</FactChip>
               )}
+              {lastSeenMs ? (
+                <FactChip>
+                  {tr("game_hub_last_played_on", { date: formatDate(new Date(lastSeenMs), "date") }, "Last played {date}")}
+                </FactChip>
+              ) : null}
               {running && (
                 <FactChip tone="good" icon={<CircleDot size={12} className="animate-pulse" aria-hidden />}>
                   {tr("installed_badge_playing", undefined, "Playing")}
                 </FactChip>
               )}
+              {/* Captures are filed by date, not by game, so this opens all of them. */}
+              <button
+                type="button"
+                onClick={() => navigate("/captures")}
+                className="inline-flex min-h-8 items-center gap-1.5 rounded-full border border-[var(--glass-edge)] bg-[var(--color-surface-raised)] px-3 text-xs font-medium text-[var(--color-text)] shadow-[var(--edge-highlight)] transition-colors hover:bg-[var(--color-surface)]"
+              >
+                <ImageIcon size={12} aria-hidden />
+                {tr("captures", undefined, "Screenshots & clips")}
+              </button>
             </div>
             {gv.view && (gv.view.consoles.length > 0 || gv.view.copies.length > 0) && (
               <p className="mt-3 text-sm text-[var(--color-muted)]" data-testid="game-summary">
                 {summaryLine(rosterOnly(gv.view, Object.keys(names)), names, tr)}
+              </p>
+            )}
+            {game.path && (
+              <p className="mt-2 truncate font-mono text-xs text-[var(--color-muted)]" title={game.path} data-testid="game-path">
+                {game.path}
               </p>
             )}
           </div>
@@ -486,6 +506,26 @@ export default function GameHubScreen() {
             onSend={() => setSendHost(connectedHost || null)}
             onChanged={() => void gv.reload()}
           />
+          {/* Measuring needs the game as a folder on the connected console (an image is
+              read-only, and the journal is written into the game's folder). */}
+          {(() => {
+            const folder =
+              connectedEntry?.installed && connectedEntry.registered_from
+                ? connectedEntry.registered_from
+                : game.source === "installed" && game.path
+                  ? game.path
+                  : null;
+            const isFolder = !!folder && /^\//.test(folder) && !/\.(exfat|ffpkg|ffpfs|ffpfsc)$/i.test(folder);
+            return (
+              <TraceCard
+                titleId={game.titleId}
+                host={connectedHost && isFolder ? connectedHost : null}
+                gamePath={isFolder ? folder : null}
+                consoleName={names[connectedHost] ?? connectedHost}
+                running={running}
+              />
+            );
+          })()}
         </div>
       )}
 
@@ -499,14 +539,7 @@ export default function GameHubScreen() {
       )}
 
       {/* Tab content */}
-      <GameTabContent
-        view={gv.view}
-        game={game}
-        host={host}
-        playSeconds={playSeconds}
-        lastSeenMs={lastSeenMs}
-        tab={activeTab}
-      />
+      <GameTabContent view={gv.view} game={game} host={host} tab={activeTab} />
     </div>
   );
 }
@@ -541,19 +574,16 @@ function GameTabContent({
   view,
   game,
   host,
-  playSeconds,
-  lastSeenMs,
 }: {
   tab: TabId;
   view: GameView | null;
   game: GameInfo;
   host: string | null;
-  playSeconds: number | undefined;
-  lastSeenMs: number | undefined;
 }) {
   switch (tab) {
     case "overview":
-      return <OverviewTab game={game} playSeconds={playSeconds} lastSeenMs={lastSeenMs} />;
+      // The consoles and drives cards above are the overview; the hero has the facts.
+      return null;
     case "cheats":
       return <CheatsTab titleId={game.titleId} host={host} />;
     case "saves":
@@ -1001,76 +1031,6 @@ interface GameInfo {
 }
 
 /** Overview tab — game info, description, play time, last played. */
-function OverviewTab({
-  game,
-  playSeconds,
-  lastSeenMs,
-}: {
-  game: GameInfo;
-  playSeconds: number | undefined;
-  lastSeenMs: number | undefined;
-}) {
-  const tr = useTr();
-  const navigate = useNavigate();
-  return (
-    <div className="grid gap-4 md:grid-cols-2">
-      <Card>
-        <h2 className="mb-4 flex items-center gap-3 text-[1.0625rem] font-semibold tracking-[-0.01em]">
-          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--color-accent-soft)] text-[var(--color-accent-bright)]">
-            <Info size={15} aria-hidden />
-          </span>
-          {tr("game_hub_overview", undefined, "Overview")}
-        </h2>
-        <dl className="text-sm [&>div]:min-h-10 [&>div]:items-center [&>div]:gap-4 [&>div]:border-b [&>div]:border-[var(--color-border)] [&>div:last-child]:border-b-0">
-          <div className="flex justify-between">
-            <dt className="text-[var(--color-muted)]">{tr("game_hub_title_id", undefined, "Title ID")}</dt>
-            <dd className="font-mono">{game.titleId}</dd>
-          </div>
-          <div className="flex justify-between">
-            <dt className="text-[var(--color-muted)]">{tr("game_hub_name", undefined, "Name")}</dt>
-            <dd className="truncate">{game.name}</dd>
-          </div>
-          {game.size > 0 && (
-            <div className="flex justify-between">
-              <dt className="text-[var(--color-muted)]">{tr("game_hub_size", undefined, "Size")}</dt>
-              <dd>{formatBytes(game.size)}</dd>
-            </div>
-          )}
-          <div className="flex justify-between">
-            <dt className="text-[var(--color-muted)]">{tr("game_hub_path", undefined, "Path")}</dt>
-            <dd className="max-w-[300px] truncate font-mono text-xs" title={game.path}>
-              {game.path || "—"}
-            </dd>
-          </div>
-          {playSeconds !== undefined && playSeconds > 0 && (
-            <div className="flex justify-between">
-              <dt className="text-[var(--color-muted)]">{tr("game_hub_total_play_time", undefined, "Total play time")}</dt>
-              <dd>{formatDuration(playSeconds)}</dd>
-            </div>
-          )}
-          {lastSeenMs && (
-            <div className="flex justify-between">
-              <dt className="text-[var(--color-muted)]">{tr("game_hub_last_played", undefined, "Last played")}</dt>
-              <dd>{formatDate(new Date(lastSeenMs), "date")}</dd>
-            </div>
-          )}
-        </dl>
-        {/* Captures are filed by date, not by game, so this opens all of them. */}
-        <div className="mt-4">
-          <Button
-            variant="secondary"
-            size="sm"
-            leftIcon={<ImageIcon size={14} />}
-            onClick={() => navigate("/captures")}
-          >
-            {tr("captures", undefined, "Screenshots & clips")}
-          </Button>
-        </div>
-      </Card>
-    </div>
-  );
-}
-
 /** Tab label lookup. */
 function tabLabel(
   id: TabId,

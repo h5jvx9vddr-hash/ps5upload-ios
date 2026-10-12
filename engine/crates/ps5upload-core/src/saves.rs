@@ -40,6 +40,45 @@ pub fn list_saves(addr: &str, user_id: i32) -> Result<SaveList> {
     Ok(parsed)
 }
 
+/// What the helper has open (`save.mount` / `save.unmount`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenSave {
+    pub mounted: bool,
+    /// The real image under /user/home ("" when nothing is open).
+    pub image: String,
+    pub mount_point: String,
+    pub kind: String,
+    #[serde(default)]
+    pub was_open: Option<bool>,
+    #[serde(default)]
+    pub written_back: Option<bool>,
+}
+
+fn open_save_reply(resp: &[u8]) -> Result<OpenSave> {
+    let v: serde_json::Value = serde_json::from_slice(resp)?;
+    if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        anyhow::bail!(
+            "{}",
+            v.get("err")
+                .and_then(|e| e.as_str())
+                .unwrap_or("save_failed")
+        );
+    }
+    Ok(serde_json::from_value(v)?)
+}
+
+/// Opens `image` (a save image under /user/home) decrypted at the helper's mount point; an
+/// empty `image` only reports what is open.
+pub fn save_open(addr: &str, image: &str) -> Result<OpenSave> {
+    let body = serde_json::to_vec(&serde_json::json!({ "image": image }))?;
+    open_save_reply(&mgmt::call(addr, m::SAVE_MOUNT, &body)?)
+}
+
+/// Closes the open save and writes its image back.
+pub fn save_close(addr: &str) -> Result<OpenSave> {
+    open_save_reply(&mgmt::call(addr, m::SAVE_UNMOUNT, b"{}")?)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenshotEntry {
     pub path: String,

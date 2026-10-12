@@ -57,11 +57,36 @@ impl ImageFormat {
 pub(crate) const PFS_NAME_MAX: usize = 63;
 
 /// A safe file stem from a game folder's name.
+/// Image files a build may read as its source (an .exfat into a .ffpkg, say).
+pub(crate) fn is_image_file(path: &Path) -> bool {
+    path.is_file()
+        && path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "exfat" | "ffpkg" | "ufs2" | "ffpfs" | "ffpfsc"
+            )
+        })
+}
+
 fn stem_of(source: &Path) -> String {
-    let stem: String = source
+    let name = source
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // An image source names its output after itself without the image extension.
+    let name = match name.rsplit_once('.') {
+        Some((base, ext))
+            if !base.is_empty()
+                && matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "exfat" | "ffpkg" | "ufs2" | "ffpfs" | "ffpfsc"
+                ) =>
+        {
+            base.to_string()
+        }
+        _ => name,
+    };
+    let stem: String = name
         .chars()
         .map(|c| {
             if c.is_control() || "\"*/:<>?\\|".contains(c) {
@@ -149,7 +174,7 @@ impl<'a> HashingTree<'a> {
         }
         let finished = match self.in_flight.get_mut(path) {
             Some((next, hasher)) if *next == offset => {
-                hasher.update(bytes);
+                hash_update(hasher, bytes);
                 *next += bytes.len() as u64;
                 *next >= size
             }
@@ -176,7 +201,7 @@ impl<'a> HashingTree<'a> {
             .map(|(p, s)| (p.clone(), *s))
             .collect();
         for (path, size) in missing {
-            let h = hash_file(self.inner, &path, size, cancel)?;
+            let h = hash_file(self.inner, &path, size, DEFAULT_VERIFY_CHUNK, cancel)?;
             self.done.insert(path, h);
         }
         Ok(self.done)
@@ -210,12 +235,42 @@ impl SourceTree for HashingTree<'_> {
     }
 }
 
-const CHUNK: u64 = 8 << 20;
+/// How much of a file the read-back check reads per call when the caller does not say.
+/// Measured on a 10 GB exFAT image in page cache: reads alone go 7 GiB/s at 1–8 MiB, hashing
+/// on all cores peaks at 8 MiB (3.7 GiB/s against 1.3 single-threaded); 1–32 MiB are within
+/// 15% of each other, and the FAT-walk fix in the exFAT reader mattered far more.
+pub(crate) const DEFAULT_VERIFY_CHUNK: u64 = 8 << 20;
+/// What a request may ask for, in KiB: 1 MiB to 64 MiB.
+pub(crate) const VERIFY_CHUNK_KIB_RANGE: std::ops::RangeInclusive<u32> = 1024..=65536;
+
+/// The read-back chunk a request asks for (`verify_chunk_kib`), or the default.
+pub(crate) fn verify_chunk(kib: Option<u32>) -> Result<u64, String> {
+    match kib {
+        None => Ok(DEFAULT_VERIFY_CHUNK),
+        Some(k) if VERIFY_CHUNK_KIB_RANGE.contains(&k) => Ok(u64::from(k) << 10),
+        Some(k) => Err(format!(
+            "verify_chunk_kib {k} is not {} to {}",
+            VERIFY_CHUNK_KIB_RANGE.start(),
+            VERIFY_CHUNK_KIB_RANGE.end()
+        )),
+    }
+}
+
+/// Feeds `bytes` to a hasher, on every core when there is enough to split (BLAKE3's own
+/// advice: multi-threading pays from about 128 KiB).
+fn hash_update(h: &mut blake3::Hasher, bytes: &[u8]) {
+    if bytes.len() >= 128 << 10 {
+        h.update_rayon(bytes);
+    } else {
+        h.update(bytes);
+    }
+}
 
 fn hash_file(
     tree: &mut dyn SourceTree,
     path: &str,
     size: u64,
+    chunk: u64,
     cancel: &AtomicBool,
 ) -> Result<blake3::Hash, String> {
     let mut h = blake3::Hasher::new();
@@ -224,14 +279,14 @@ fn hash_file(
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
-        let want = (size - at).min(CHUNK) as usize;
+        let want = (size - at).min(chunk) as usize;
         let buf = tree
             .read_range(path, at, want)
             .map_err(|e| format!("{path}: {e}"))?;
         if buf.is_empty() {
             return Err(format!("{path} ended at {at} of its {size} bytes"));
         }
-        h.update(&buf);
+        hash_update(&mut h, &buf);
         at += buf.len() as u64;
     }
     Ok(h.finalize())
@@ -265,12 +320,13 @@ fn open_image(
 }
 
 /// Reads the image back and compares it with the source: the same files at the same sizes,
-/// the same empty folders, and every file's BLAKE3 hash.
+/// the same empty folders, and every file's BLAKE3 hash. `chunk` bytes per read.
 fn verify(
     image: &mut dyn SourceTree,
     want: &HashMap<String, blake3::Hash>,
     want_sizes: &HashMap<String, u64>,
     want_empty: &[String],
+    chunk: u64,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<(), String> {
@@ -314,7 +370,7 @@ fn verify(
                 f.path, f.size
             ));
         }
-        let h = hash_file(image, &f.path, f.size, cancel)?;
+        let h = hash_file(image, &f.path, f.size, chunk, cancel)?;
         if Some(&h) != want.get(&f.path) {
             return Err(format!(
                 "{} differs between the image and the folder",
@@ -325,6 +381,84 @@ fn verify(
         progress(done, total);
     }
     Ok(())
+}
+
+/// A libSceAmpr game's folder with its `ampr_emu.index` regenerated from the files that go
+/// into the image (#449). The index ampr_emu reads must list every file at its size; a dump's
+/// copy is often stale (files added, trimmed or resized since), and a plain image used to
+/// carry it as it was, which crashes the game once it touches a file the index has wrong.
+/// LZ4 builds regenerate theirs in `ampr_pack::image::prepare`; this is the plain build's.
+pub(crate) struct AmprIndexed<'a> {
+    inner: &'a mut dyn SourceTree,
+    files: Vec<SourceFile>,
+    index: Vec<u8>,
+}
+
+impl<'a> AmprIndexed<'a> {
+    /// `None` when the game does not read through libSceAmpr and ships no index: nothing to
+    /// regenerate, the folder goes in as it is.
+    pub(crate) fn wrap(inner: &'a mut dyn SourceTree) -> Result<Option<Self>, String> {
+        let name = ps5upload_fpkg::ampr_index::NAME;
+        let had = inner
+            .files()
+            .iter()
+            .any(|f| f.path.eq_ignore_ascii_case(name));
+        if !had && !ps5upload_fpkg::source::imports_ampr(inner, "eboot.bin") {
+            return Ok(None);
+        }
+        let mut files: Vec<SourceFile> = inner
+            .files()
+            .iter()
+            .filter(|f| !f.path.eq_ignore_ascii_case(name))
+            .cloned()
+            .collect();
+        let listed: Vec<(String, u64)> = files.iter().map(|f| (f.path.clone(), f.size)).collect();
+        let mtime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let index = ps5upload_fpkg::ampr_index::build(&listed, mtime)?;
+        files.push(SourceFile {
+            path: name.to_string(),
+            size: index.len() as u64,
+        });
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(Some(Self {
+            inner,
+            files,
+            index,
+        }))
+    }
+}
+
+impl SourceTree for AmprIndexed<'_> {
+    fn files(&self) -> &[SourceFile] {
+        &self.files
+    }
+    fn empty_dirs(&self) -> &[String] {
+        self.inner.empty_dirs()
+    }
+    fn read(&mut self, path: &str) -> ps5upload_fpkg::Result<Vec<u8>> {
+        if path.eq_ignore_ascii_case(ps5upload_fpkg::ampr_index::NAME) {
+            return Ok(self.index.clone());
+        }
+        self.inner.read(path)
+    }
+    fn read_range(
+        &mut self,
+        path: &str,
+        offset: u64,
+        len: usize,
+    ) -> ps5upload_fpkg::Result<Vec<u8>> {
+        if path.eq_ignore_ascii_case(ps5upload_fpkg::ampr_index::NAME) {
+            let start = (offset as usize).min(self.index.len());
+            let end = start.saturating_add(len).min(self.index.len());
+            return Ok(self.index[start..end].to_vec());
+        }
+        self.inner.read_range(path, offset, len)
+    }
+    fn describe(&self) -> String {
+        format!("{} (ampr_emu.index regenerated)", self.inner.describe())
+    }
 }
 
 /// What a build wrote.
@@ -403,11 +537,13 @@ impl Planned {
 /// Builds `source` as an image at `output`: planned, written to `<output>.partial` (straight
 /// into a `.ffpfsc` container when `inner_name` is given), read back and hash-checked, then
 /// renamed. `stage(id, done, total)` reports `plan`, `write` (or `compress`) and `verify`.
+/// `verify_chunk`: how much the read-back check reads per call (see [`verify_chunk`]).
 pub(crate) fn build(
     format: ImageFormat,
     inner_name: Option<&str>,
     source: &mut dyn SourceTree,
     output: &Path,
+    verify_chunk: u64,
     cancel: &AtomicBool,
     stage: &mut dyn FnMut(&str, u64, u64),
 ) -> Result<ImageBuilt, String> {
@@ -474,6 +610,7 @@ pub(crate) fn build(
             &hashes,
             &want_sizes,
             &want_empty,
+            verify_chunk,
             cancel,
             &mut |d, t| stage("verify", d, t),
         )?;
@@ -537,6 +674,7 @@ pub(crate) fn build_packed(
     source: &mut dyn SourceTree,
     output: &Path,
     packs: &Lz4Packs,
+    verify_chunk: u64,
     cancel: &AtomicBool,
     stage: &mut dyn FnMut(&str, u64, u64),
 ) -> Result<ImageBuilt, String> {
@@ -566,9 +704,16 @@ pub(crate) fn build_packed(
         ampr_pack::image::prepare(source, &config, &spool, mtime, &mut control)
     };
     let result = match prepared {
-        Ok((mut overlay, report)) => {
-            build(format, None, &mut overlay, output, cancel, stage).map(|b| (b, report))
-        }
+        Ok((mut overlay, report)) => build(
+            format,
+            None,
+            &mut overlay,
+            output,
+            verify_chunk,
+            cancel,
+            stage,
+        )
+        .map(|b| (b, report)),
         Err(e) => Err(e.to_string()),
     };
     let _ = std::fs::remove_dir_all(&spool);
@@ -590,6 +735,18 @@ pub(crate) fn build_packed(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verify_chunk_takes_1_to_64_mib_in_kib_and_defaults_to_8() {
+        assert_eq!(verify_chunk(None).unwrap(), 8 << 20);
+        assert_eq!(verify_chunk(Some(1024)).unwrap(), 1 << 20);
+        assert_eq!(verify_chunk(Some(65536)).unwrap(), 64 << 20);
+        assert!(verify_chunk(Some(512))
+            .unwrap_err()
+            .contains("1024 to 65536"));
+        assert!(verify_chunk(Some(0)).is_err());
+        assert!(verify_chunk(Some(1 << 20)).is_err());
+    }
+
     use super::*;
     use ps5upload_fpkg::source::FolderSource;
 
@@ -611,6 +768,11 @@ mod tests {
         assert_eq!(
             output_names(Path::new("/"), ImageFormat::Exfat, false).0,
             "game.exfat"
+        );
+        // An image source: the output carries its name, not its old extension.
+        assert_eq!(
+            output_names(Path::new("/g/PPSA29343.exfat"), ImageFormat::Ffpkg, false).0,
+            "PPSA29343.ffpkg"
         );
         assert_eq!(
             output_names(src, ImageFormat::Exfat, true),
@@ -680,6 +842,7 @@ mod tests {
                     inner.as_deref(),
                     &mut tree,
                     &out,
+                    DEFAULT_VERIFY_CHUNK,
                     &cancel,
                     &mut |s, _, _| {
                         if stages.last().map(String::as_str) != Some(s) {
@@ -719,6 +882,7 @@ mod tests {
             None,
             &mut tree,
             &out,
+            DEFAULT_VERIFY_CHUNK,
             &cancel,
             &mut |_, _, _| {}
         )
@@ -756,7 +920,14 @@ mod tests {
         let _ = h.read("sce_sys/param.json").unwrap();
         let all = h.hashes(&cancel).unwrap();
         let mut again = FolderSource::open(&src).unwrap();
-        let direct = hash_file(&mut again, "eboot.bin", 300_000, &cancel).unwrap();
+        let direct = hash_file(
+            &mut again,
+            "eboot.bin",
+            300_000,
+            DEFAULT_VERIFY_CHUNK,
+            &cancel,
+        )
+        .unwrap();
         assert_eq!(all["eboot.bin"], direct);
         assert_eq!(all.len(), 4);
         let _ = std::fs::remove_dir_all(&root);
@@ -776,6 +947,7 @@ mod tests {
             None,
             &mut tree,
             &out,
+            DEFAULT_VERIFY_CHUNK,
             &AtomicBool::new(false),
             &mut |_, _, _| {},
         )
@@ -832,6 +1004,7 @@ mod tests {
                 level: 9,
                 block_shift: 16,
             },
+            DEFAULT_VERIFY_CHUNK,
             &cancel,
             &mut |s, _, _| {
                 if stages.last().map(String::as_str) != Some(s) {
@@ -895,6 +1068,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A plain image of a libSceAmpr game carries a fresh index listing the image's files
+    /// (#449), never the dump's stale one.
+    #[test]
+    fn a_plain_image_regenerates_a_stale_ampr_index() {
+        let root = std::env::temp_dir().join(format!("ps5upload-imgi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = ampr_game(&root);
+        std::fs::write(src.join("ampr_emu.index"), b"AMPRIDX3 stale").unwrap();
+        let out = root.join("plain.exfat");
+        let mut tree = FolderSource::open(&src).unwrap();
+        let files_in_source = tree.files().len();
+        let mut indexed = AmprIndexed::wrap(&mut tree).unwrap().expect("an AMPR game");
+        build(
+            ImageFormat::Exfat,
+            None,
+            &mut indexed,
+            &out,
+            DEFAULT_VERIFY_CHUNK,
+            &AtomicBool::new(false),
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+        let mut image = open_image(&out, ImageFormat::Exfat, false).unwrap();
+        let index =
+            ps5upload_fpkg::ampr_index::parse(&image.read("ampr_emu.index").unwrap()).unwrap();
+        // Every file but the index itself, each at its size.
+        assert_eq!(index.len(), files_in_source - 1);
+        assert!(index
+            .iter()
+            .any(|e| e.path == "eboot.bin" && e.size == 300_000));
+        // A game that does not read through libSceAmpr is left alone.
+        let plain = game(&root.join("noampr"));
+        let mut t2 = FolderSource::open(&plain).unwrap();
+        assert!(AmprIndexed::wrap(&mut t2).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Packing is exFAT-only and leaves nothing behind when it is refused.
     #[test]
     fn lz4_packs_are_refused_for_other_formats() {
@@ -912,6 +1122,7 @@ mod tests {
                 level: 9,
                 block_shift: 16,
             },
+            DEFAULT_VERIFY_CHUNK,
             &AtomicBool::new(false),
             &mut |_, _, _| {},
         )
@@ -932,6 +1143,7 @@ mod tests {
                     level: 9,
                     block_shift: 16,
                 },
+                DEFAULT_VERIFY_CHUNK,
                 &AtomicBool::new(false),
                 &mut |_, _, _| {},
             )
@@ -954,7 +1166,7 @@ mod tests {
         assert!(attempt(&src).contains("has none"));
         // A title that does not read through libSceAmpr.
         let plain = game(&root.join("plain"));
-        assert!(attempt(&plain).contains("does not import libSceAmpr"));
+        assert!(attempt(&plain).contains("does not read its files through AMPR"));
         assert!(!exfat.exists() && !lz4_spool(&exfat).exists());
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -5,6 +5,8 @@
 import { installErrorLink } from "../lib/installErrorDoc";
 import { create } from "zustand";
 
+import { useConvertPrefs } from "./convertPrefs";
+
 import { imageUploadItem, type ImageUploadPlan } from "../lib/imageUpload";
 import { useUploadQueueStore } from "./uploadQueue";
 
@@ -735,7 +737,14 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
     // game is not busy with it.
     beginRun("image", source, thenUpload?.host ?? null, lz4 ? "pack" : "plan");
     try {
-      const { job_id } = await fpkg.buildImage(source, outputDir, format, thenCompress, lz4);
+      const { job_id } = await fpkg.buildImage(
+        source,
+        outputDir,
+        format,
+        thenCompress,
+        lz4,
+        useConvertPrefs.getState().verifyChunkKib,
+      );
       update({ jobId: job_id });
       poll(job_id, null);
     } catch (error) {

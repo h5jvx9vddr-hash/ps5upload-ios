@@ -89,18 +89,45 @@ fn map_open_error(e: SzError) -> io::Error {
 
 /// A failure from a decoder read: a damaged or short stream is corruption; anything
 /// else (the disk) is an ordinary I/O error.
+/// Messages the LZMA/LZMA2 decoder (`lzma-rust2`) raises as plain `ErrorKind::Other` when the
+/// compressed stream is damaged or cut short. They are corruption like any `InvalidData`,
+/// and must be told apart from a disk that stopped answering: a job that fails on one of
+/// these is never retried (#446: a 70 GB archive hit "dist overflow" eight times in a row,
+/// each retry decoding the same bytes to the same end).
+const DECODER_CORRUPTION: &[&str] = &[
+    "dist overflow",
+    "corrupt",
+    "end reached",
+    "not properly terminated",
+];
+
 fn read_error(e: io::Error) -> io::Error {
+    let text = e.to_string();
     let bad = matches!(
         e.kind(),
         io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
     ) || e
         .get_ref()
         .and_then(|i| i.downcast_ref::<SzError>())
-        .is_some_and(|s| matches!(s, SzError::ChecksumVerificationFailed));
+        .is_some_and(|s| matches!(s, SzError::ChecksumVerificationFailed))
+        || DECODER_CORRUPTION.iter().any(|m| text.contains(m));
     if bad {
         fault(SevenzFault::Corrupt(format!("an entry is damaged: {e}")))
     } else {
         e
+    }
+}
+
+/// The same, naming the entry being decoded, with what to do about it.
+fn entry_read_error(e: io::Error, entry: &str, decoded: u64) -> io::Error {
+    let e = read_error(e);
+    match fault_of(&e) {
+        Some(SevenzFault::Corrupt(why)) => fault(SevenzFault::Corrupt(format!(
+            "{why}, in {entry:?} after {decoded} bytes of it. The archive is incomplete or damaged \
+             (a download that did not finish, or a .7z.001 set with a part missing): test it \
+             with 7-Zip before trying again"
+        ))),
+        _ => e,
     }
 }
 
@@ -346,7 +373,7 @@ impl SevenzSource {
                 match rd.read(buf) {
                     Ok(n) => break n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(read_error(e)),
+                    Err(e) => return Err(entry_read_error(e, &member.raw, total)),
                 }
             };
             if n == 0 {
@@ -508,6 +535,29 @@ impl Source for NoSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_corruption_reported_as_other_is_a_corrupt_fault_that_names_the_entry() {
+        // lzma-rust2 raises "dist overflow" (a match before the start of the window, what a
+        // cut-short or damaged stream decodes to) as ErrorKind::Other, not InvalidData.
+        let e = entry_read_error(io::Error::other("dist overflow"), "data/a.pak", 4096);
+        match fault_of(&e) {
+            Some(SevenzFault::Corrupt(why)) => {
+                assert!(why.contains("dist overflow"), "{why}");
+                assert!(why.contains("\"data/a.pak\" after 4096 bytes"), "{why}");
+                assert!(why.contains("7-Zip"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A disk that stops answering is still a plain read error: the job may retry it.
+        let e = entry_read_error(io::Error::other("Input/output error (os error 5)"), "x", 0);
+        assert!(fault_of(&e).is_none());
+        let e = read_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bcj2 decode error",
+        ));
+        assert!(matches!(fault_of(&e), Some(SevenzFault::Corrupt(_))));
+    }
 
     #[test]
     fn a_short_folder_is_corrupt_not_unsupported_layout() {

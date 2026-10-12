@@ -4,6 +4,132 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## 7.0.22
+
+- **HDR PNG carries the capture's ICC profile (#448).** 7.0.15 wrote the cICP tag only;
+  viewers that go by the ICC profile (and the reporter's) showed the image as SDR. Sony's
+  "ScreenCapturePQ" profile is now read out of the .jxr and embedded as iCCP in both HDR
+  variants, with cICP beside it in the tagged one.
+
+## 7.0.21
+
+- **Fix: the image format could not be changed.** Picking .exfat or .ffpfs snapped back to
+  .ffpkg (7.0.20 wrote the old format back a moment after the new one).
+- **An image can become another image.** An .exfat, .ffpkg or .ffpfs on this computer, a
+  saved server or the PS5 can be rewritten in another format (an .exfat into a .ffpkg, say);
+  the output is named after the source without its old extension, and never overwrites it.
+
+## 7.0.20
+
+- **Convert remembers what it is making.** Leaving the screen during an image build and
+  coming back showed "A package" selected and package stage names while the image kept
+  building. What to make and the image choice are now remembered, follow the build that is
+  running, and an image build's stages read "Plan image", "Write image", "Read the image
+  back".
+- **Fix: the game page could crash on "Measure how it plays".** When the engine's reply had
+  no state (an engine without the route, or a test stand-in), the card threw and the whole
+  game page fell back to the error screen. It now treats that as nothing recorded.
+
+## 7.0.18
+
+- **LZ4 packs for games whose ampr_emu is missing or too old.** When the check finds a game
+  that reads through AMPR but ships no `fakelib/libSceAmpr.sprx`, or one that predates asset
+  packs, the LZ4 option now offers "Put ampr_emu 0.4.2.1 into the image": the engine fetches
+  drakmor's release once (checked against a known digest, never bundled) and writes it into
+  the image, keeping the game's own copy beside it as `libSceAmpr.sprx.orig`. This is the
+  runtime gap behind #449.
+- **A game that does not use AMPR is told so.** The LZ4 option explains that nothing in such a
+  game could serve asset packs, and points at .ffpfsc, which ShadowMount+ decompresses for any
+  game, instead of just refusing.
+
+## 7.0.17
+
+- **Open a save and edit its files.** Save data has an Open save button per save: the helper
+  copies the save image under `/data`, unseals its key through the console's own pfsmgr and
+  mounts the image decrypted, and Files opens on it. Read, replace or add files; Close &
+  write back unmounts it and copies the image back into the real save only if something
+  changed, so a look leaves the save untouched. One save open at a time. PS5 saves verified
+  on FW 13.60 (an untouched open keeps the image's timestamp); PS4 saves (`sdimg_*` with the
+  key in `<name>.bin`) follow the same path but have not been tried. The recipe is
+  earthonion's garlic-savemgr, credited in the README. Needs the 7.0.17 helper.
+
+## 7.0.16
+
+- **Measure how a game plays, then pack it that way.** A game's page has a new card for a
+  folder game on the connected console: Start measuring puts drakmor's measuring build of
+  ampr_emu into the game's `fakelib2` (ShadowMount+ loads it over `fakelib`, nothing the
+  game ships is touched), you play, and each session is recorded when the game closes (or
+  with Record session). Build profile turns the sessions into a per-game LZ4 profile: block
+  size, layout and hot flag per file from how it was actually read, and the decoded cache,
+  physical cache and worker counts from an LRU simulation of those reads. Convert's LZ4
+  option picks the profile up for that title ("measured from N play sessions"). Stop
+  measuring removes the measuring build again. The generator is a port of drakmor's
+  `ampr_pack_profile.py` and matches its output byte for byte on a reference trace.
+
+## 7.0.15
+
+- **Game images of a libSceAmpr game get a fresh ampr_emu.index (#449).** A dump's index is
+  often stale (files added, trimmed or resized since it was written), and a plain .exfat,
+  .ffpkg or .ffpfs image carried it as it was, which crashes the game the moment it touches a
+  file the index has wrong. The image now carries one generated from its files, as a package
+  and an LZ4 image already did.
+- **Connection says which of three things is wrong (#447).** "The helper is not running or is
+  an old version" sent people in circles. The app now tells them apart: the helper is down
+  but the console's payload loader answers (so Update helper will work); nothing answers at
+  all (run your jailbreak's loader first); or an older helper is running (Update helper).
+- **HDR screenshots as HDR PNG (#448).** Screenshots has a "Convert as" choice: SDR PNG as
+  before (tone-mapped, opens everywhere), HDR PNG (16-bit BT.2020 PQ with a cICP tag, which
+  HDR-aware viewers and browsers show as captured) or HDR PNG without the tag, for apps that
+  refuse it. Desktop app only, like the converter itself.
+
+## 7.0.14
+
+- **A game on the PS5 or a saved server can become a game image.** Convert refused to write
+  an image unless the game folder was on this computer, while a package build happily read a
+  `ps5://` or `remote://` folder in place. Images now take the same sources: the game is read
+  through the helper (or from the server) as it is written, nothing is copied first.
+- **Convert walks you through it.** Four steps that read in order: ① the game, ② what to
+  make, ③ its options, ④ build & install. "What to make" explains a package and a game image
+  side by side and marks the one that suits the game on your PS5 (a PS5 game on firmware
+  above 11.60 installs as a package but will not play, so the image is marked there; a PS4
+  game or an older firmware marks the package). Options show only what applies: Kraken
+  compression and game language for a package; filesystem, .ffpfsc compression, LZ4 packs
+  and the read-back check for an image. Build & install says in one line what it will make,
+  of which game, where. The queue has the whole width below.
+
+## 7.0.13
+
+- **Game image builds: the read-back check is no longer the slow part.** After writing an
+  .exfat image the engine reads it back and hash-checks every file. The exFAT reader fetched
+  one 64 KiB cluster per read and, for a big file, walked its chain from the start on every
+  read, so the check crawled on fast drives. It now keeps the FAT in memory, continues where
+  the last read stopped and reads whole runs of clusters in one call, and hashing uses every
+  core. Measured on a 10 GB image in cache: 169 MiB/s before, 3.7 GiB/s after. Convert has a
+  new **read-back check, per read** choice (1 to 32 MiB) for anyone whose disk prefers a
+  different size; 8 MiB measured fastest and is the default. The check itself is unchanged.
+- **The game page is lighter.** The Overview card that repeated the hero (title id, name,
+  size, path) is gone: the path, last played and Screenshots & clips now sit in the hero. Each
+  copy on your drives is one compact row: its facts on one line, the path under it, the one
+  action most people want (Send to PS5 or Install) as a button and the rest (copy path, copy
+  install link, Convert, show in file manager, move to Trash) behind a ⋯ menu.
+- **7z uploads: a damaged archive stops instead of retrying (#446).** When the LZMA decoder
+  gives up on a cut-short or corrupt stream ("dist overflow"), the job used to fail as if the
+  connection had dropped, so the queue retried it again and again, decoding the same bytes to
+  the same end. It is now a corrupt-archive failure that names the entry and how far into it
+  the decoder got, and asks you to test the archive with 7-Zip before trying again. The
+  archive in the report was not available to us; if yours passes 7-Zip's test and still fails,
+  say so on the issue.
+- **Console to console: choose the route and the address (#444).** Send to another console…
+  has a **Change…** link under the route note: **Auto** (as before), **Direct only** (never
+  through this device, for a phone on mobile data; if the consoles cannot connect the send
+  fails and says why) or **Through this device**. With Auto or Direct only you can also give
+  the address the sending console dials to reach the other one, for setups where the address
+  this device uses is not the one the consoles use between themselves: with ps5-tailscale, a
+  local forward on the sending console (127.0.0.1:19120 → the other console:9120). The choice
+  is remembered per pair of consoles. The consoles' keys and the one-time ticket still decide
+  who may send, not the address. Taking over a running send from another device, and a
+  "test direct connection" button, are not in this release.
+
 ## 7.0.12
 
 - **Convert: a "Stored" package option (no compression).** Reports of packages that install but

@@ -2368,6 +2368,8 @@ pub async fn exfat_build(
     compress: Option<bool>,
     // AMPR LZ4 asset packs, passed through as the engine takes them ({level, profile_toml}).
     ampr_lz4: Option<JsonValue>,
+    // The read-back check's chunk in KiB; the engine's default when absent.
+    verify_chunk_kib: Option<u32>,
 ) -> Result<JsonValue, String> {
     let base = engine::url();
     let url = format!("{base}/api/exfat/build");
@@ -2379,6 +2381,7 @@ pub async fn exfat_build(
             "format": format,
             "compress": compress.unwrap_or(false),
             "ampr_lz4": ampr_lz4,
+            "verify_chunk_kib": verify_chunk_kib,
         }),
     )
     .await

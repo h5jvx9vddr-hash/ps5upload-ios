@@ -161,6 +161,8 @@ methods! {
     (APP_ICON_SET, 142, "APP_ICON_SET"),
     (APP_HIDDEN_LIST, 143, "APP_HIDDEN_LIST"),
     (USB_EJECT, 144, "USB_EJECT"),
+    (SAVE_MOUNT, 145, "SAVE_MOUNT"),
+    (SAVE_UNMOUNT, 146, "SAVE_UNMOUNT"),
 }
 
 /// A management call the payload refused.

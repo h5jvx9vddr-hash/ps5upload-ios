@@ -941,7 +941,8 @@ impl Pool {
 
 /// `<data dir>/ava` — the same rules as the engine's `remote::store::data_dir()`.
 /// Without a data directory no identity is created in the current directory.
-fn data_dir() -> Option<PathBuf> {
+/// The app's data directory (`PS5UPLOAD_DATA`, else `~/.ps5upload`): the pool, caches, traces.
+pub fn data_dir() -> Option<PathBuf> {
     let data = std::env::var("PS5UPLOAD_DATA_DIR").ok();
     let home = std::env::var("HOME").ok();
     let profile = std::env::var("USERPROFILE").ok();
