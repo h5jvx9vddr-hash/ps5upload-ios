@@ -8,9 +8,21 @@
  * patched by scripts/release/android-postinit-patch.sh) asks at launch and
  * exposes `window.PS5UploadNet` so the page can check and ask again.
  *
- * Everywhere the bridge is absent (desktop, browser build, iOS, Android below
- * 17 where it always reports granted) nothing is blocked.
+ * iOS has the same gate ("Local Network" in Settings → Privacy). The iOS
+ * shell (plugins/ios-picker) asks at launch too and injects the same
+ * `window.PS5UploadNet`, reporting a denial it detects through Bonjour.
+ *
+ * Everywhere the bridge is absent (desktop, browser build, Android below 17
+ * where it always reports granted) nothing is blocked.
  */
+
+import { isIOS } from "./platform";
+
+/** The Android wording of a local-network message, naming iOS on iOS. The
+ *  translations name the platform literally, so this keeps every locale. */
+export function localNetworkText(s: string): string {
+  return isIOS() ? s.replace(/Android/g, "iOS") : s;
+}
 
 interface LocalNetworkBridge {
   granted(): boolean;

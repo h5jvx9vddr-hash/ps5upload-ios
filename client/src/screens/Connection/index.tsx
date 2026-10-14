@@ -24,7 +24,8 @@ import {
 } from "../../state/helperSend";
 import { sendHelperTo } from "../../state/helperSendRuntime";
 import { looksLikeMacLocalNetworkBlock } from "../../lib/localNetworkHint";
-import { localNetworkBlocked } from "../../lib/androidLocalNetwork";
+import { localNetworkBlocked, localNetworkText } from "../../lib/androidLocalNetwork";
+import { isIOS } from "../../lib/platform";
 import { pairingAllow } from "../../api/ava1";
 import { parsePS5Firmware } from "../../lib/ps5Firmware";
 import { compareVersions } from "../../lib/semver";
@@ -505,11 +506,18 @@ export default function ConnectionScreen() {
       settleStep1(
         "fail",
         localNetworkBlocked()
-          ? tr(
-              "connection_android_local_network_hint",
-              undefined,
-              "Android is blocking PS5Upload from your local network. Tap Allow at the top, then check again.",
+          ? localNetworkText(
+              tr(
+                "connection_android_local_network_hint",
+                undefined,
+                "Android is blocking PS5Upload from your local network. Tap Allow at the top, then check again.",
+              ),
             )
+          : // iOS reports a denied Local Network permission as an immediate "No route to host"
+            // (errno 65, as on macOS) — but its user agent says "like Mac OS X", so it must not
+            // get the Mac's System Settings path.
+            isIOS() && /os error 65\b/i.test(probe.error ?? "")
+          ? `${detail}. ${tr("connection_ios_local_network_hint", undefined, "iOS may be blocking PS5Upload from your local network. Open Settings → Privacy & Security → Local Network, allow PS5Upload, then check again.")}`
           : looksLikeMacLocalNetworkBlock(probe.error, ua)
           ? `${detail}. ${tr("connection_mac_local_network_hint", undefined, "macOS may be blocking this app from your local network. Open System Settings → Privacy & Security → Local Network, allow PS5Upload, then check again.")}`
           : // A VPN on this computer sends the console's address out through the tunnel: the

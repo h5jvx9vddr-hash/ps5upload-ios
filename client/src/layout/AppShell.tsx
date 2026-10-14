@@ -2,7 +2,11 @@ import { saveLastRoute } from "../lib/lastRoute";
 import { useLocation, useNavigate, useOutlet } from "react-router";
 import { Activity, useEffect, useRef, useState, type ReactNode } from "react";
 import { Lock, Moon, RefreshCw, Search, Sun, WifiOff, X } from "lucide-react";
-import { localNetworkBlocked, requestLocalNetwork } from "../lib/androidLocalNetwork";
+import {
+  localNetworkBlocked,
+  localNetworkText,
+  requestLocalNetwork,
+} from "../lib/androidLocalNetwork";
 import StatusBar from "./StatusBar";
 import SessionBanner from "./SessionBanner";
 import EngineDownBanner from "./EngineDownBanner";
@@ -1334,10 +1338,12 @@ function AndroidLocalNetworkBanner() {
               )}
             </p>
             <p className="text-xs text-[var(--color-muted)]">
-              {tr(
-                "android_local_network_body",
-                undefined,
-                "Android blocks the app from reaching your PS5 until you allow it.",
+              {localNetworkText(
+                tr(
+                  "android_local_network_body",
+                  undefined,
+                  "Android blocks the app from reaching your PS5 until you allow it.",
+                ),
               )}
             </p>
           </div>

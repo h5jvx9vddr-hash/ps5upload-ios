@@ -41,6 +41,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "ios"))]
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use serde::Serialize;
 use tokio::net::TcpStream;
@@ -193,7 +194,7 @@ struct CandidateAccumulator {
 /// }
 /// ```
 #[tauri::command]
-pub async fn discover_ps5(timeout_secs: Option<u64>) -> serde_json::Value {
+pub async fn discover_ps5(app: tauri::AppHandle, timeout_secs: Option<u64>) -> serde_json::Value {
     let started = Instant::now();
     let budget_secs = timeout_secs
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
@@ -211,7 +212,7 @@ pub async fn discover_ps5(timeout_secs: Option<u64>) -> serde_json::Value {
         }
     }
 
-    let result = discover_ps5_inner(started, budget).await;
+    let result = discover_ps5_inner(app, started, budget).await;
 
     #[cfg(target_os = "android")]
     {
@@ -223,18 +224,100 @@ pub async fn discover_ps5(timeout_secs: Option<u64>) -> serde_json::Value {
     result
 }
 
-async fn discover_ps5_inner(started: Instant, budget: Duration) -> serde_json::Value {
+async fn discover_ps5_inner(
+    app: tauri::AppHandle,
+    started: Instant,
+    budget: Duration,
+) -> serde_json::Value {
+    // iOS refuses the raw multicast sockets mdns-sd needs (that takes Apple's
+    // multicast entitlement), so it browses through the system's Bonjour.
+    #[cfg(target_os = "ios")]
+    let accum = ios_bonjour_accum(&app, budget).await;
+    #[cfg(not(target_os = "ios"))]
+    let accum = {
+        let _ = &app;
+        match mdns_accum(budget).await {
+            Ok(a) => a,
+            Err(e) => {
+                return serde_json::json!({
+                    "ok": false,
+                    "error": e,
+                    "candidates": [],
+                    "scanned_ms": started.elapsed().as_millis() as u64,
+                    "browsed_services": BROWSED_SERVICES,
+                });
+            }
+        }
+    };
+    finish_discovery(accum, started).await
+}
+
+/// Bonjour browse via the iOS plugin, folded into the same accumulator the
+/// mdns-sd path fills.
+#[cfg(target_os = "ios")]
+async fn ios_bonjour_accum(
+    app: &tauri::AppHandle,
+    budget: Duration,
+) -> BTreeMap<String, CandidateAccumulator> {
+    use tauri::Manager;
+    let mut accum: BTreeMap<String, CandidateAccumulator> = BTreeMap::new();
+    let types: Vec<String> = BROWSED_SERVICES
+        .iter()
+        .map(|s| s.trim_end_matches("local.").to_string())
+        .collect();
+    let app = app.clone();
+    let budget_ms = budget.as_millis() as u64;
+    let hits = tokio::task::spawn_blocking(move || {
+        app.state::<tauri_plugin_ios_picker::IosPicker<tauri::Wry>>()
+            .bonjour_browse(types, budget_ms)
+    })
+    .await;
+    let hits = match hits {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            eprintln!("[discover] bonjour browse failed: {e}");
+            return accum;
+        }
+        Err(e) => {
+            eprintln!("[discover] bonjour browse task failed: {e}");
+            return accum;
+        }
+    };
+    for hit in hits {
+        let host = hit.host.trim_end_matches('.').to_string();
+        let key = if host.is_empty() { hit.name.clone() } else { host.clone() };
+        let entry = accum.entry(key).or_default();
+        if entry.hostname.is_none() && !host.is_empty() {
+            entry.hostname = Some(host);
+        }
+        for a in &hit.addresses {
+            // Drop an IPv6 zone suffix (fe80::1%en0) before parsing.
+            if let Ok(ip) = a.split('%').next().unwrap_or("").parse::<IpAddr>() {
+                if !entry.ips.contains(&ip) {
+                    entry.ips.push(ip);
+                }
+            }
+        }
+        let svc_clean = hit
+            .service
+            .trim_end_matches('.')
+            .trim_end_matches(".local")
+            .to_string();
+        if !entry.services.contains(&svc_clean) {
+            entry.services.push(svc_clean);
+        }
+        entry.ports.push(hit.port);
+    }
+    accum
+}
+
+/// mDNS-SD browse of BROWSED_SERVICES for `budget`. `Err` only when the
+/// daemon cannot start.
+#[cfg(not(target_os = "ios"))]
+async fn mdns_accum(budget: Duration) -> Result<BTreeMap<String, CandidateAccumulator>, String> {
     let daemon = match ServiceDaemon::new() {
         Ok(d) => d,
-        Err(e) => {
-            return serde_json::json!({
-                "ok": false,
-                "error": format!("mdns init failed: {e}"),
-                "candidates": [],
-                "scanned_ms": started.elapsed().as_millis() as u64,
-                "browsed_services": BROWSED_SERVICES,
-            });
-        }
+        Err(e) => return Err(format!("mdns init failed: {e}")),
     };
 
     let mut receivers = Vec::with_capacity(BROWSED_SERVICES.len());
@@ -321,6 +404,14 @@ async fn discover_ps5_inner(started: Instant, budget: Duration) -> serde_json::V
         let _ = daemon.stop_browse(svc);
     }
     let _ = daemon.shutdown();
+    Ok(accum)
+}
+
+/// Probe and score what the browse found, then the LAN-sweep fallback.
+async fn finish_discovery(
+    accum: BTreeMap<String, CandidateAccumulator>,
+    started: Instant,
+) -> serde_json::Value {
 
     // Promote mDNS accumulators to candidates: TCP-probe each one for
     // :9021 + :9120 in parallel, score them, and sort. We do this BEFORE
