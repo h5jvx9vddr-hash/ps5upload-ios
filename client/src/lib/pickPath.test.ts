@@ -10,7 +10,7 @@ const { mockIsAndroid, mockIsTauri, mockPickLocal, mockPickLocalMany, mockOpenDi
   mockOpenDialog: vi.fn(),
 }));
 
-vi.mock("./platform", () => ({ isAndroid: () => mockIsAndroid() }));
+vi.mock("./platform", () => ({ isAndroid: () => mockIsAndroid(), isIOS: () => false }));
 vi.mock("./tauriEnv", () => ({ isTauriEnv: () => mockIsTauri() }));
 vi.mock("../state/localPicker", () => ({
   pickLocalPath: (...a: unknown[]) => mockPickLocal(...a),

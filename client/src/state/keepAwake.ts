@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "../lib/invokeLogged";
-import { isAndroid } from "../lib/platform";
+import { isMobile } from "../lib/platform";
 import { isTauriEnv } from "../lib/tauriEnv";
 import {
   screenWakeSupported,
@@ -53,7 +53,7 @@ export const useKeepAwakeStore = create<KeepAwakeState>((set, get) => ({
     // Android arm), so drive a screen wake lock instead — and report
     // `supported` from the WebView API, not the backend. Kept entirely
     // client-side so the manual toggle works the same as desktop.
-    if (isAndroid()) {
+    if (isMobile()) {
       setScreenWakeReason(MANUAL_REASON, on);
       safeSetItem(STORAGE_KEY, on ? "on" : "off");
       set({ enabled: on, supported: screenWakeSupported(), lastError: null });
@@ -87,7 +87,7 @@ export const useKeepAwakeStore = create<KeepAwakeState>((set, get) => ({
     // Android: no backend state to read. Re-apply the persisted manual
     // preference (a screen wake lock doesn't survive an app restart) and
     // report support from the WebView.
-    if (isAndroid()) {
+    if (isMobile()) {
       const want = get().enabled;
       setScreenWakeReason(MANUAL_REASON, want);
       set({ supported: screenWakeSupported(), lastError: null });

@@ -81,6 +81,43 @@ class IosPickerPlugin: Plugin, UIDocumentPickerDelegate {
           try { window.webkit.messageHandlers.ps5uploadNet.postMessage("request"); } catch (e) {}
         }
       };
+      // WKWebView may lack the Screen Wake Lock API the app holds during
+      // transfers (as on Android); back it with the idle timer instead.
+      if (!navigator.wakeLock) {
+        var post = function (m) {
+          try { window.webkit.messageHandlers.ps5uploadNet.postMessage(m); } catch (e) {}
+        };
+        var current = null;
+        var makeSentinel = function () {
+          var listeners = [];
+          var s = {
+            released: false,
+            release: function () {
+              if (s.released) return Promise.resolve();
+              s.released = true;
+              if (current === s) { current = null; post("wake-off"); }
+              listeners.forEach(function (l) { try { l(); } catch (e) {} });
+              return Promise.resolve();
+            },
+            addEventListener: function (t, l) { if (t === "release") listeners.push(l); }
+          };
+          return s;
+        };
+        document.addEventListener("visibilitychange", function () {
+          if (document.visibilityState !== "visible" && current) current.release();
+        });
+        Object.defineProperty(navigator, "wakeLock", {
+          configurable: true,
+          value: {
+            request: function () {
+              if (current) current.release();
+              current = makeSentinel();
+              post("wake-on");
+              return Promise.resolve(current);
+            }
+          }
+        });
+      }
     })();
     """
 
@@ -94,7 +131,9 @@ class IosPickerPlugin: Plugin, UIDocumentPickerDelegate {
   }
 
   fileprivate func handleNetMessage(_ body: String) {
-    if body == "request" {
+    if body == "wake-on" || body == "wake-off" {
+      UIApplication.shared.isIdleTimerDisabled = body == "wake-on"
+    } else if body == "request" {
       if netDenied, let url = URL(string: UIApplication.openSettingsURLString) {
         // iOS shows its prompt once; after a denial only Settings can allow it.
         UIApplication.shared.open(url, options: [:], completionHandler: nil)

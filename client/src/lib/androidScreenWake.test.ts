@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Force Android on (the module gates on isAndroid) and run against minimal
+// Force mobile on (the module gates on isMobile) and run against minimal
 // hand-rolled `document`/`navigator` stubs — the repo deliberately avoids
 // pulling jsdom for one helper (same call as fsLastPath.test.ts).
-vi.mock("./platform", () => ({ isAndroid: () => true }));
+vi.mock("./platform", () => ({ isAndroid: () => true, isMobile: () => true }));
 
 type Listener = () => void;
 

@@ -32,7 +32,9 @@ const SOURCES = import.meta.glob("../**/*.{ts,tsx}", {
 }) as Record<string, string>;
 
 /** `pickPath.ts` IS the abstraction, so it necessarily calls the dialog. */
-const ALLOWED = new Set(["../lib/pickPath.ts"]);
+// openDialog.ts is the drop-in for open() (the iOS Files-app picker there);
+// its callers make the Android decision.
+const ALLOWED = new Set(["../lib/pickPath.ts", "./openDialog.ts"]);
 
 /**
  * Whether a module actually invokes the read dialog, under whatever name it

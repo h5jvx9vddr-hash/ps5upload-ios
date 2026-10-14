@@ -45,6 +45,7 @@ const SHIM_SOURCE = Object.values(
  * `isTauriEnv()` guards at the call sites).
  */
 const NATIVE_ONLY: Record<string, string> = {
+  ios_pick_paths: "native: the iOS Files-app picker; a browser tab has none",
   dragout_stage_dir: "stages a PS5 file for an OS drag out of the window; a browser tab has no OS drag",
   // Host filesystem / OS
   read_text_file: "native: reads a host path",

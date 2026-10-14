@@ -1,4 +1,4 @@
-import { isAndroid } from "./platform";
+import { isMobile } from "./platform";
 
 // Android screen keep-awake, via the W3C Screen Wake Lock API.
 //
@@ -46,10 +46,10 @@ function wakeLockApi(): WakeLockLike | null {
   return wl ?? null;
 }
 
-/** True when this platform can hold a screen wake lock (Android + the
+/** True when this platform can hold a screen wake lock (Android/iOS + the
  *  WebView exposes the API). Drives the Settings toggle's `supported`. */
 export function screenWakeSupported(): boolean {
-  return isAndroid() && wakeLockApi() !== null;
+  return isMobile() && wakeLockApi() !== null;
 }
 
 const reasons = new Set<string>();
@@ -109,7 +109,7 @@ function wireVisibility(): void {
  * Rust inhibitor, which is strictly better — it works while minimized).
  */
 export function setScreenWakeReason(reason: string, active: boolean): void {
-  if (!isAndroid()) return;
+  if (!isMobile()) return;
   wireVisibility();
   const had = reasons.size > 0;
   if (active) reasons.add(reason);
