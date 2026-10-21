@@ -148,7 +148,24 @@ struct CatalogueEntry {
 ///     use on the platform.
 ///   - etahen / itemzflow: best-effort entries; users can edit this
 ///     table to point at the variant they prefer.
+const CATALOGUE_HOSTS: &[&str] = &["github.com", "git.etawen.dev", "theghostonline.dev"];
 const CATALOGUE: &[CatalogueEntry] = &[
+    CatalogueEntry {
+        id: "elfldr",
+        display_name: "elfldr",
+        role: "ELF loader — load before ps5upload.elf",
+        description: "Initial ELF loader for WebKit/payload-listener setups. Download elfldr-ps5.elf and load it through your jailbreak or autoloader before the PS5Upload helper. Sending requires an already working loader; this cannot bootstrap a closed port. This is the upstream build; PS5Upload can replace the standard running loader with its bundled patched build once the helper is connected.",
+        repo_host: "github.com",
+        repo_owner: "ps5-payload-dev",
+        repo_name: "elfldr",
+        asset_name_hint: "elfldr-ps5.elf",
+        on_console_marker_path: None,
+        process_name_hint: Some("elfldr.elf"),
+        ports: &[9021],
+        autoload_priority: 1,
+        autoload_delay_ms: 1000,
+        homepage: "https://github.com/ps5-payload-dev/elfldr",
+    },
     CatalogueEntry {
         // display_name says "kstuff-lite (EchoStretch)" so this entry
         // must point at EchoStretch/kstuff-lite, not EchoStretch/kstuff
@@ -420,7 +437,7 @@ const CATALOGUE: &[CatalogueEntry] = &[
         display_name: "LZ4 Compression (theghostonline)",
         role: "Compresses games on the PS5 itself",
         description: "Shrinks a game that is already on the PS5 by LZ4-packing its AMPR assets, entirely on the console: the game never leaves it. Works on folder games and on mounted .exfat/.ffpfs images, packs in place with rollback, verifies every file, and can undo. Needs ShadowMount+ for image sources. Open its page on port 5920 from the Connection screen's scene tools once it is running. ps5upload's Convert does the same packing on this computer when the game is here instead.",
-        repo_host: "github.com",
+        repo_host: "theghostonline.dev",
         repo_owner: "theghostonline",
         repo_name: "PS5-LZ4-Compression",
         asset_name_hint: "lz4-compression",
@@ -429,7 +446,7 @@ const CATALOGUE: &[CatalogueEntry] = &[
         ports: &[5920],
         autoload_priority: 9,
         autoload_delay_ms: 500,
-        homepage: "https://github.com/theghostonline/PS5-LZ4-Compression",
+        homepage: "https://theghostonline.dev/theghostonline/PS5-LZ4-Compression",
     },
     CatalogueEntry {
         id: "np-fake-signin",
@@ -593,6 +610,27 @@ const CATALOGUE: &[CatalogueEntry] = &[
         autoload_priority: 4,
         autoload_delay_ms: 200,
         homepage: "https://github.com/StonedModder/Ghostpad",
+    },
+    CatalogueEntry {
+        // X-F1REBALL-X/HearBridge-PS5 (GPL-3) — plays the console's audio on ordinary
+        // Bluetooth (A2DP) headphones or speakers through the PS5's own radio, no dongle.
+        // Releases ship one asset, `HearBridge-<version>.elf`, so the hint stops before the
+        // version. Its own web page (pairing, volume, latency, EQ) is on TCP 8090, or the next
+        // free port up to 8095; /data/hearbridge/ holds its state.
+        id: "hearbridge",
+        display_name: "HearBridge",
+        role: "Bluetooth headphones and speakers for PS5 audio",
+        description: "Sends the PS5's game and system audio to ordinary Bluetooth headphones or speakers (A2DP), using the console's own Bluetooth radio, so no dongle is needed. Pair, switch headsets, set volume, latency, EQ and night mode, and keep per-game profiles from its own web page (port 8090), which also adds a HearBridge tile to the home screen. Tested by its author on the original PS5 (CFI-10xx) and the Slim (CFI-2000).",
+        repo_host: "github.com",
+        repo_owner: "X-F1REBALL-X",
+        repo_name: "HearBridge-PS5",
+        asset_name_hint: "HearBridge-",
+        on_console_marker_path: Some("/data/hearbridge/hearbridge.log"),
+        process_name_hint: Some("hearbridge.elf"),
+        ports: &[8090],
+        autoload_priority: 5,
+        autoload_delay_ms: 300,
+        homepage: "https://github.com/X-F1REBALL-X/HearBridge-PS5",
     },
     CatalogueEntry {
         // Pharaoh2k/ps5debug-NG — a debugger for jailbroken PS5s (GPL-3). The
@@ -995,6 +1033,13 @@ pub async fn payloads_remove_custom_repo(app: AppHandle, id: String) -> Result<b
 
 /// Subset of GitHub's release JSON we care about. Trailing fields are
 /// dropped silently by serde-derive's default.
+/// A text field GitHub sometimes sends as `null` instead of leaving it out (a release with no
+/// notes has `"body": null`). `#[serde(default)]` alone only covers a missing field, so a null
+/// failed the whole release list ("invalid type: null, expected a string").
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 struct GithubAsset {
     name: String,
@@ -1005,15 +1050,15 @@ struct GithubAsset {
 #[derive(Deserialize, Serialize, Clone)]
 struct GithubRelease {
     tag_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     body: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     published_at: String,
     #[serde(default)]
     assets: Vec<GithubAsset>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     html_url: String,
     /// GitHub/Gitea "this is a pre-release" flag. Surfaced so the UI can
     /// warn that a version may be unstable (payload dev moves fast).
@@ -1270,8 +1315,7 @@ pub async fn payloads_release(
     // fail fast. A CUSTOM repo's host was typed + approved by the user at
     // add-time (validated by `is_plausible_repo_host`), so it isn't subject to
     // this fixed list — that's the whole point of "custom".
-    const ALLOWED_HOSTS: &[&str] = &["github.com", "git.etawen.dev"];
-    if !entry.is_custom && !ALLOWED_HOSTS.contains(&entry.repo_host.as_str()) {
+    if !entry.is_custom && !CATALOGUE_HOSTS.contains(&entry.repo_host.as_str()) {
         return Err(format!(
             "catalog entry {} declares repo_host={:?} which is not in the allowlist",
             entry.id, entry.repo_host
@@ -1423,8 +1467,7 @@ pub async fn payloads_releases(
     }
 
     // Allowlist guard for catalogue entries only — see payloads_release.
-    const ALLOWED_HOSTS: &[&str] = &["github.com", "git.etawen.dev"];
-    if !entry.is_custom && !ALLOWED_HOSTS.contains(&entry.repo_host.as_str()) {
+    if !entry.is_custom && !CATALOGUE_HOSTS.contains(&entry.repo_host.as_str()) {
         return Err(format!(
             "catalog entry {} declares repo_host={:?} which is not in the allowlist",
             entry.id, entry.repo_host
@@ -1851,6 +1894,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_release_with_null_notes_still_parses() {
+        // websrv v0.35 shipped with `"body": null`, which failed the whole list.
+        let json = r#"[{"tag_name":"v0.35","name":null,"body":null,"published_at":null,
+            "html_url":null,"prerelease":false,"assets":[{"name":"websrv-ps5.elf",
+            "browser_download_url":"https://example/websrv-ps5.elf","size":1,"label":null}]}]"#;
+        let r: Vec<GithubRelease> = serde_json::from_str(json).unwrap();
+        assert_eq!(r[0].tag_name, "v0.35");
+        assert_eq!(r[0].body, "");
+        assert_eq!(r[0].assets[0].name, "websrv-ps5.elf");
+    }
+
+    #[test]
+    fn catalogue_hosts_allowed_and_loader_asset_pinned() {
+        for entry in CATALOGUE {
+            assert!(CATALOGUE_HOSTS.contains(&entry.repo_host), "{}", entry.id);
+        }
+        let lz4 = find_entry("lz4-compression").expect("LZ4 catalogue entry");
+        assert_eq!(lz4.repo_host, "theghostonline.dev");
+        let loader = find_entry("elfldr").unwrap();
+        assert_eq!(loader.asset_name_hint, "elfldr-ps5.elf");
+    }
+
+    #[test]
     fn catalogue_ids_unique() {
         let mut ids: Vec<&str> = CATALOGUE.iter().map(|e| e.id).collect();
         ids.sort();
@@ -2194,7 +2260,9 @@ mod tests {
             .filter(|e| e.autoload_priority == 1)
             .collect();
         assert!(p0.iter().all(|e| e.id.starts_with("kstuff-")));
-        assert!(p1.iter().all(|e| e.id == "shadowmountplus"));
+        assert!(p1
+            .iter()
+            .all(|e| matches!(e.id, "shadowmountplus" | "elfldr")));
     }
 
     #[test]

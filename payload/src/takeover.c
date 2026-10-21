@@ -40,9 +40,11 @@ int runtime_try_takeover(runtime_state_t *state) {
     /* A flag left from before this instance (a crash, a reboot) must not be mistaken for a request. */
     takeover_flag_unlink(PS5UPLOAD2_RUNTIME_DIR);
 
+    state->prior_asked = 0;
     if (takeover_port_responding((int)AVA1_DEFAULT_PORT)) {
         /* The old instance is still serving AVA1. */
         int ports[1] = {(int)AVA1_DEFAULT_PORT};
+        state->prior_asked = 1;
         if (takeover_flag_request(PS5UPLOAD2_RUNTIME_DIR, state->takeover_nonce, ports, 1,
                                   TAKEOVER_PORT_RELEASE_ATTEMPTS,
                                   TAKEOVER_PORT_RELEASE_INTERVAL_US) != 0) {

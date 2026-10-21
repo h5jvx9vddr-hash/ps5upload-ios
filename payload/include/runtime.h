@@ -22,6 +22,9 @@ typedef struct {
      * otherwise completely invisible. */
     int prior_verdict;
     int takeover_requested;
+    /* Set by runtime_try_takeover: a prior instance was serving AVA1 and was asked to hand over.
+     * Clear: nothing answered, so no prior was asked to exit and none will go by itself. */
+    int prior_asked;
     uint64_t started_at_unix;
     /* The prior instance's ownership record as read at startup, before the takeover made it
      * unlink the file. The reap backs a fresh (possibly lost) read with it (review 010). */
@@ -142,6 +145,15 @@ extern volatile int g_ucred_elevation_rc;
  * targets) — in that case the lexical check result is returned as-is
  * (there's no symlink to follow yet). */
 int is_path_allowed(const char *p);
+
+/* Mount a .ffpfsc read-only so the kernel decodes it (#453): at FS_MOUNT_BASE/.unpack/<tag>, the
+ * file inside readable at <mp>/<its name>. 0 with *unit_out set, or -1 with a cause token in err.
+ * `note` is a .part file the sweep removes if this helper dies before releasing. Always pair with
+ * fs_pfsc_release. fs_pfsc_sweep clears what a dead helper left mounted. */
+int fs_pfsc_mount_ro(const char *image, const char *tag, const char *note, char *mp, size_t mp_cap, int *unit_out,
+                     char *err, size_t err_cap);
+void fs_pfsc_release(const char *mp, int unit);
+void fs_pfsc_sweep(void);
 
 /* The read half of the unsafe-read rule: `/system*` paths the hard-coded management handlers
  * may read when the request asks for it. `is_path_allowed` OR this is the pair every

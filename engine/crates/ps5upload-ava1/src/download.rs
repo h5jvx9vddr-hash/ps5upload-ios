@@ -655,8 +655,10 @@ fn run(
             if work > last_work {
                 (last_at, last_work) = (Instant::now(), work);
             } else if last_at.elapsed() > STALL_LIMIT {
-                return Err(anyhow!(
-                    "no durable progress for {STALL_LIMIT:?}; giving up"
+                return Err(SessionGate::stalled(
+                    pool,
+                    console,
+                    format!("no durable progress for {STALL_LIMIT:?}; giving up"),
                 ));
             }
             let session = match pool.session(console).await {

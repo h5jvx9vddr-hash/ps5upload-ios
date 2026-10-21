@@ -19,6 +19,7 @@ pub mod identify;
 pub mod junk;
 pub mod online;
 pub mod organize;
+pub mod organize_fs;
 pub mod scan;
 pub mod store;
 
@@ -198,6 +199,11 @@ pub struct Library {
     pub generated_at: String,
     pub summary: Summary,
     pub games: BTreeMap<String, Game>,
+    /// Roots the last scan could not open (deleted, an unplugged drive, a server that is down).
+    /// They are skipped rather than failing the whole scan (#461), and their caches are kept
+    /// so they are cheap to read again when they come back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_roots: Vec<String>,
     #[serde(default, rename = "_folder_cache")]
     pub folder_cache: BTreeMap<String, FolderCacheEntry>,
     #[serde(default, rename = "_pkg_cache")]

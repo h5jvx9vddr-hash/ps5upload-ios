@@ -20,6 +20,7 @@ path = "src/main.rs"
 webui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 ava1 = { path = "../ava1" }
 ps5upload-ava1 = { path = "../ps5upload-ava1" }
 anyhow.workspace = true

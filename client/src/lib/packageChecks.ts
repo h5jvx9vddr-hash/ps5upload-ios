@@ -73,11 +73,18 @@ export type InstalledRelation =
 export function installedFromPreflight(
   pkgVer: string,
   pre: { state: string; installedVersion: string | null } | null,
+  platform?: string,
 ): { verdict: Verdict; relation: InstalledRelation; installedVer: string | null } | null {
   if (!pre || pre.state === "unknown") return null;
   const ver = pre.installedVersion;
   if (pre.state === "base_missing") {
-    return { verdict: "bad", relation: "base-missing", installedVer: null };
+    // A PS5 update can carry the whole app (a YouTube update installed on a console without
+    // YouTube), so the PS5 decides and this is a warning; a PS4 one is known not to apply.
+    return {
+      verdict: platform === "ps5" ? "warn" : "bad",
+      relation: "base-missing",
+      installedVer: null,
+    };
   }
   if (pre.state === "not_installed") {
     return { verdict: "ok", relation: "not-installed", installedVer: null };

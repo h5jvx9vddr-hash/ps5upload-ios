@@ -31,12 +31,16 @@
 //!   GET  /api/ps5/volumes             → list storage volumes detected by the payload
 //!   GET  /api/ps5/list-dir?path=...   → list immediate children of a directory on PS5
 
+mod activity;
 mod ampr_trace;
 mod ava1_api;
+mod browser_payload;
 mod bundled_payload;
+mod c2c_api;
 mod collection;
 mod collection_api;
 mod collection_tidy_api;
+mod console_files_api;
 mod console_read;
 mod console_snapshot;
 mod convert_source;
@@ -44,10 +48,13 @@ mod elfldr_guard;
 mod engine_log;
 mod event_journal;
 mod fakelibs_api;
+mod folder_build;
 mod fpkg_api;
 mod fpkg_firmware;
 mod games_api;
+mod hearbridge_api;
 mod helper_mirror;
+mod helper_stop;
 mod icon_cache;
 mod image_build;
 mod inspect;
@@ -61,6 +68,7 @@ mod net_health;
 mod pkg_install;
 mod pkg_sidecar;
 mod pldmgr_api;
+mod profile_image;
 mod remote;
 mod remote_download;
 mod remote_pkg;
@@ -121,6 +129,41 @@ use ps5upload_core::{
     volumes::{list_volumes, VolumeList},
 };
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+
+/// The renames a game folder upload needs so each module carries the letter case its
+/// `eboot.bin` loads it by. The console's /data is case-sensitive where the exFAT image a
+/// folder often came from is not: a Unity dump with `Il2cppUserAssemblies.prx`, loaded as
+/// `Il2CppUserAssemblies.prx`, played from the image and crashed a second in from the folder
+/// (PPSA22999, PPSA31909). Empty for anything that is not a game folder; never fails an upload.
+fn module_case_renames(
+    fs: Option<&dyn ps5upload_core::source_fs::SourceFs>,
+    root: &std::path::Path,
+    requested: &str,
+) -> Vec<(String, String)> {
+    let eboot = root.join("eboot.bin");
+    let is_game = match fs {
+        Some(fs) => fs.metadata(&eboot).is_ok_and(|m| !m.is_dir),
+        None => eboot.is_file(),
+    };
+    if !is_game {
+        return Vec::new();
+    }
+    let opened = match fs {
+        Some(_) => ps5upload_fpkg::source::open(std::path::Path::new(requested)),
+        None => ps5upload_fpkg::source::open(root),
+    };
+    let Ok(mut tree) = opened else {
+        return Vec::new();
+    };
+    let fixes = ps5upload_fpkg::module_case::tree_fixes(tree.as_mut());
+    if !fixes.is_empty() {
+        crate::log_info!(
+            "transfer_dir: uploading under the eboot's spelling: {}",
+            ps5upload_fpkg::module_case::describe(&fixes)
+        );
+    }
+    fixes.into_iter().map(|c| (c.from, c.to)).collect()
+}
 
 /// Build a `TransferConfig` for the given address. The transport's own knobs (in-flight
 /// window, pack sizes) belong to AVA1's governor, so the retired shard-tuning environment
@@ -1528,6 +1571,7 @@ pub(crate) fn set_job(
         }
     }
     if terminal {
+        activity::transfer_ended(&job_id.to_string(), &json);
         telemetry::on_state(job_id, &json);
         if let Some(e) = job_event(&job_id.to_string(), &json) {
             ps5upload_core::events::emit_event(e);
@@ -1696,12 +1740,21 @@ struct Ps5ToPs5Req {
     /// (ps5-tailscale), or a NAT the consoles see differently from this computer.
     #[serde(default)]
     direct_addr: Option<String>,
+    /// #444, a send another device started (its `tx_id`): `take` ends both consoles' halves and
+    /// sends again here, resuming from the receiving console's journal; `watch` follows a direct
+    /// send still running between the consoles and drives it from here on.
+    #[serde(default)]
+    adopt: Option<String>,
 }
 
 async fn ps5_to_ps5_handler(
     State(state): State<AppState>,
     Json(req): Json<Ps5ToPs5Req>,
 ) -> impl IntoResponse {
+    let adopt = match c2c_api::parse_adopt(req.adopt.as_deref(), req.tx_id.is_some()) {
+        Ok(a) => a,
+        Err(e) => return json_err(StatusCode::BAD_REQUEST, e).into_response(),
+    };
     let tx_id = match parse_or_random_tx_id(req.tx_id.as_deref()) {
         Ok(id) => id,
         Err(e) => return json_err(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -1726,7 +1779,12 @@ async fn ps5_to_ps5_handler(
                 .into_response();
             }
         }
-        ps5upload_ava1::c2c::RouteOptions { mode, dial }
+        ps5upload_ava1::c2c::RouteOptions {
+            mode,
+            dial,
+            attach: adopt.as_deref() == Some("watch"),
+            lease: None,
+        }
     };
     let relay_cap = {
         let mut cfg = make_transfer_config(&req.to);
@@ -1808,7 +1866,22 @@ async fn ps5_to_ps5_handler(
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     });
+    // What the shared record says about the send while it runs (#444).
+    let record_snapshot: ps5upload_ava1::c2c_record::Snapshot = {
+        let (notes, progress) = (route_notes.clone(), progress.clone());
+        Arc::new(move |r: &mut ps5upload_ava1::c2c_record::SendRecord| {
+            r.live_route = match notes.route.load(Ordering::Relaxed) {
+                ps5upload_core::transfer::LIVE_ROUTE_DIRECT => Some("direct".into()),
+                ps5upload_core::transfer::LIVE_ROUTE_RELAY => Some("relay".into()),
+                _ => None,
+            };
+            r.bytes_done = progress.bytes_sent.load(Ordering::Relaxed);
+            r.bytes_total = progress.bytes_total.load(Ordering::Relaxed);
+        })
+    };
     tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = (helper_stop::enter(&req.from), helper_stop::enter(&req.to));
         let _stop_guard = TickerStopGuard::new(stop_ticker.clone());
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
@@ -1820,33 +1893,41 @@ async fn ps5_to_ps5_handler(
             Err(f) => Err(anyhow::Error::from(f)),
             // #433: straight between the consoles when they reach each other, else through
             // this computer; the route (and why) shows on the job while it runs and after.
-            Ok(()) => ps5upload_ava1::c2c::ps5_to_ps5_routed(
-                &req.from,
-                &req.src,
-                &req.to,
-                &req.dest,
-                tx_id,
-                progress.clone(),
-                cancel,
-                relay_cap,
-                &route_options,
-                |route| match route {
-                    ps5upload_ava1::c2c::Route::Direct => route_notes.route.store(
-                        ps5upload_core::transfer::LIVE_ROUTE_DIRECT,
-                        Ordering::Relaxed,
-                    ),
-                    ps5upload_ava1::c2c::Route::Relay { reason } => {
-                        *route_notes
-                            .route_reason
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner()) = Some(reason.clone());
-                        route_notes.route.store(
-                            ps5upload_core::transfer::LIVE_ROUTE_RELAY,
-                            Ordering::Relaxed,
-                        );
-                    }
-                },
-            ),
+            // #444: inside the shared record another device finds, watches or takes over.
+            Ok(()) => {
+                c2c_api::with_record(&req, tx_id, adopt.as_deref(), record_snapshot, |lease| {
+                    ps5upload_ava1::c2c::ps5_to_ps5_routed(
+                        &req.from,
+                        &req.src,
+                        &req.to,
+                        &req.dest,
+                        tx_id,
+                        progress.clone(),
+                        cancel,
+                        relay_cap,
+                        &ps5upload_ava1::c2c::RouteOptions {
+                            lease,
+                            ..route_options.clone()
+                        },
+                        |route| match route {
+                            ps5upload_ava1::c2c::Route::Direct => route_notes.route.store(
+                                ps5upload_core::transfer::LIVE_ROUTE_DIRECT,
+                                Ordering::Relaxed,
+                            ),
+                            ps5upload_ava1::c2c::Route::Relay { reason } => {
+                                *route_notes
+                                    .route_reason
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) = Some(reason.clone());
+                                route_notes.route.store(
+                                    ps5upload_core::transfer::LIVE_ROUTE_RELAY,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        },
+                    )
+                })
+            }
         };
         let completed_at_ms = now_ms();
         let state = match result {
@@ -2290,6 +2371,8 @@ async fn ps5_fs_delete(
     // fs_copy / fs_move so behavior across the destructive trio matches.
     let io_timeout = std::time::Duration::from_secs(60 * 60);
     match tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         fs_delete_with_op_id(&addr, &path, op_id, Some(io_timeout))
     })
     .await
@@ -2320,6 +2403,52 @@ async fn ps5_fs_delete(
                 "fs_delete failed: {path_for_log} in {} ms: {e}",
                 started.elapsed().as_millis()
             );
+            json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response()
+        }
+    }
+}
+
+/// POST /api/ps5/fs/unpack `{addr, path, op_id}` — decompress a `.ffpfsc` on the console into
+/// the image it holds, beside it (#453). Progress and cancel go through `op-status`/`op-cancel`
+/// with the same `op_id`. 200 `{ok, path, size}`; 409 when cancelled; 502 with the helper's
+/// cause otherwise (`fs_unpack_no_space: ...`, `fs_unpack_destination_exists`, ...).
+async fn ps5_fs_unpack(
+    State(_state): State<AppState>,
+    Json(req): Json<FsPathReq>,
+) -> impl IntoResponse {
+    let Some(addr) = required_console_addr(req.addr) else {
+        return missing_console_addr();
+    };
+    let (path, op_id) = (req.path, req.op_id);
+    let started = std::time::Instant::now();
+    crate::log_info!("fs_unpack: addr={addr} path={path} op_id={op_id}");
+    let path_for_log = path.clone();
+    // A 136 GB image inflates for many minutes; the job is followed, not timed out.
+    let deadline = std::time::Duration::from_secs(12 * 60 * 60);
+    match tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
+        ps5upload_core::fs_ops::ffpfsc_unpack(&addr, &path, op_id, deadline)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r)
+    {
+        Ok(done) => {
+            crate::log_info!(
+                "fs_unpack ok: {path_for_log} -> {} ({} bytes) in {} ms",
+                done.path,
+                done.size,
+                started.elapsed().as_millis()
+            );
+            Json(serde_json::json!({ "ok": true, "path": done.path, "size": done.size }))
+                .into_response()
+        }
+        Err(e) if e.to_string() == "cancelled" => {
+            json_err(StatusCode::CONFLICT, "cancelled").into_response()
+        }
+        Err(e) => {
+            crate::log_warn!("fs_unpack failed: {path_for_log}: {e:#}");
             json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response()
         }
     }
@@ -2357,6 +2486,8 @@ async fn ps5_fs_move(
     // move (copy, then delete the source after a verified finish). `overwrite` travels with
     // it, so a move that was not allowed to clobber still refuses.
     match tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         match fs_move_with_timeout(&addr, &from, &to, Some(io_timeout)) {
             Err(e)
                 if {
@@ -2430,6 +2561,8 @@ async fn ps5_fs_copy(
     };
     let overwrite = req.overwrite;
     match tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         require_console_ready(&addr)?;
         ps5upload_ava1::copy::console_copy(&addr, &from, &to, op_id, false, overwrite)
     })
@@ -2636,9 +2769,11 @@ async fn ps5_app_register(
     }
 }
 
-/// Reverse of `app_register`. Best-effort — succeeds even when the
-/// Sony AppUninstall API isn't available, as long as the nullfs
-/// teardown succeeded.
+/// Reverse of `app_register`, and the uninstall of a package install. A
+/// Sony refusal is an error (502) from a 7.1.6 helper; from an older one it is
+/// `sony_uninstall_refused` in an `ok` reply, which the client must check
+/// (#476). `still_present` says the title's folders were still there after
+/// Sony accepted (`null` from an older helper).
 #[derive(Debug, serde::Deserialize)]
 struct AppUnregisterReq {
     addr: Option<String>,
@@ -2674,13 +2809,28 @@ async fn ps5_app_unregister(
             // flattening both into a bare `ok: true`, which is what let a
             // 0x80B21B02 refusal masquerade as a successful uninstall while
             // the title stayed in Settings → Storage.
-            if outcome.sony_refused() {
+            if outcome.sony_refused() && !outcome.refusal_stands() {
+                crate::log_warn!(
+                    "app_unregister: {title_for_log} — sceAppInstUtilAppUninstall refused with \
+                     rc=0x{:08X}, but our registration is gone and the title is no longer listed \
+                     ({} ms)",
+                    outcome.sony_uninstall_rc,
+                    started.elapsed().as_millis()
+                );
+            } else if outcome.sony_refused() {
                 crate::log_warn!(
                     "app_unregister: {title_for_log} — our teardown ok in {} ms, but \
                      sceAppInstUtilAppUninstall REFUSED with rc=0x{:08X}; the title may \
                      remain in Settings → Storage",
                     started.elapsed().as_millis(),
                     outcome.sony_uninstall_rc
+                );
+            } else if outcome.still_present == Some(true) {
+                // WARN so a bug report carries it: the game is still listed (#476).
+                crate::log_warn!(
+                    "app_unregister: {title_for_log} — Sony accepted in {} ms, but the \
+                     title's folders are still on the console",
+                    started.elapsed().as_millis()
                 );
             } else {
                 crate::log_info!(
@@ -2692,8 +2842,9 @@ async fn ps5_app_unregister(
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "ok": true,
-                    "sony_uninstall_refused": outcome.sony_refused(),
+                    "sony_uninstall_refused": outcome.refusal_stands(),
                     "sony_uninstall_rc": format!("0x{:08X}", outcome.sony_uninstall_rc),
+                    "still_present": outcome.still_present,
                 })),
             )
                 .into_response()
@@ -3452,6 +3603,23 @@ async fn ps5_hidden_icons(
     }
 }
 
+/// GET /api/ps5/net/ports — the ports held on the console (Discord ask). The helper binds
+/// each port and closes it, so nothing on the console sees a connection. About a second.
+async fn ps5_net_ports(
+    State(state): State<AppState>,
+    Query(q): Query<HiddenIconsParams>,
+) -> impl IntoResponse {
+    let addr = console_addr_or_default(q.addr, &state.default_ps5_addr);
+    let r = tokio::task::spawn_blocking(move || ps5upload_core::diagnostics::console_ports(&addr))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r);
+    match r {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct UsbEjectReq {
     addr: Option<String>,
@@ -3715,6 +3883,52 @@ async fn ps5_process_kill(
     match r {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
+}
+
+// ── Helper stop (#471) ──────────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+struct HelperStopReq {
+    addr: Option<String>,
+}
+
+/// POST /api/ps5/helper/stop — Body: `{ addr }`. Asks the console's helper to exit
+/// (`node.shutdown`), refused while this engine runs a job against that console.
+///
+/// 200 `{ "state": "stopped" }` once the helper's port went quiet, or `{ "state": "not_running" }`
+/// when nothing answered. 409 `{ "error", "reason": "busy" }` while a job runs; 502
+/// `{ "error", "reason": "refused" | "still_running" }` otherwise.
+async fn ps5_helper_stop(
+    installs: pkg_install::PkgInstallStateHandle,
+    req: HelperStopReq,
+) -> axum::response::Response {
+    // Disruptive: acts only on the console the request names, never the default one.
+    let Some(addr) = required_console_addr(req.addr) else {
+        return missing_console_addr();
+    };
+    let busy = helper_stop::is_busy(&addr) || installs.jobs.active_for(&addr);
+    let r = tokio::task::spawn_blocking(move || helper_stop::stop(&addr, busy)).await;
+    match r {
+        Ok(Ok(helper_stop::Stopped::Stopped)) => {
+            Json(serde_json::json!({ "state": "stopped" })).into_response()
+        }
+        Ok(Ok(helper_stop::Stopped::NotRunning)) => {
+            Json(serde_json::json!({ "state": "not_running" })).into_response()
+        }
+        Ok(Err(e)) => {
+            let code = if e == helper_stop::StopError::Busy {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                code,
+                Json(serde_json::json!({ "error": e.message(), "reason": e.reason() })),
+            )
+                .into_response()
+        }
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
 
@@ -4314,6 +4528,9 @@ async fn ps5_hw_set_fan_threshold(
 struct GameMetaQuery {
     addr: Option<String>,
     path: String,
+    /// game-icon only: 128, 256 or 384 for a scaled copy (see `icon_thumb_px`).
+    #[serde(default)]
+    size: Option<u32>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -4470,7 +4687,12 @@ async fn serve_cached_icon(
     // Tried in order; the first that has bytes wins.
     remote_paths: Vec<String>,
     if_none_match: Option<String>,
+    // A grid's size: the cover scaled down once and cached beside the full one (#450).
+    thumb: Option<u32>,
 ) -> axum::response::Response {
+    if let Some(px) = thumb {
+        return serve_icon_thumbnail(addr, kind, identity, remote_paths, if_none_match, px).await;
+    }
     // A revalidation we can answer from cache costs no console round-trip
     // and no body — this is the cheap path once max-age lapses.
     // Disk reads and writes of the cache run on the blocking pool, not the async workers.
@@ -4504,7 +4726,32 @@ async fn serve_cached_icon(
     // error must NOT be: a console that was briefly unreachable would
     // otherwise be recorded as having no artwork at all, and every
     // cover would vanish for the length of the negative TTL.
-    let result: Result<Option<Vec<u8>>, anyhow::Error> = tokio::task::spawn_blocking(move || {
+    let result = fetch_icon(addr, kind, identity, remote_paths).await;
+
+    match result {
+        Ok(Some(bytes)) => {
+            let etag = icon_cache::etag_for(&bytes);
+            icon_response(bytes, &etag)
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "no icon").into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "no icon").into_response(),
+    }
+}
+
+/// The full cover from the console, written to the cache. Ok(Some) = found; Ok(None) = every
+/// path cleanly absent; Err = at least one path failed for another reason (the console may just
+/// be busy). The cache is written in the same blocking task.
+///
+/// Only a clean "there is nothing there" is remembered. A transport error must NOT be: a console
+/// that was briefly unreachable would otherwise be recorded as having no artwork at all, and every
+/// cover would vanish for the length of the negative TTL.
+async fn fetch_icon(
+    addr: String,
+    kind: &'static str,
+    identity: String,
+    remote_paths: Vec<String>,
+) -> Result<Option<Vec<u8>>, anyhow::Error> {
+    tokio::task::spawn_blocking(move || {
         let mut transport_err = None;
         for p in &remote_paths {
             match fs_read(&addr, p, 0, 2 * 1024 * 1024) {
@@ -4527,23 +4774,112 @@ async fn serve_cached_icon(
     })
     .await
     .map_err(anyhow::Error::from)
-    .and_then(|inner| inner);
+    .and_then(|inner| inner)
+}
 
-    match result {
-        Ok(Some(bytes)) => {
-            let etag = icon_cache::etag_for(&bytes);
-            icon_response(bytes, &etag)
+/// The sizes a grid may ask an icon route for; any other `size` serves the full cover.
+fn icon_thumb_px(size: Option<u32>) -> Option<u32> {
+    size.filter(|s| [128, 256, 384].contains(s))
+}
+
+/// `bytes` (a cover, usually a 512 px icon0.png of 300-700 KiB) scaled to fit `px`: JPEG when
+/// it is opaque, which every PS4/PS5 cover measured was (about 20 KiB at 256 px), PNG when it
+/// has transparency. None when it is already that small or does not decode.
+fn icon_thumbnail(bytes: &[u8], px: u32) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    if img.width() <= px && img.height() <= px {
+        return None;
+    }
+    let small = img.resize(px, px, image::imageops::FilterType::Triangle);
+    let opaque = !small.color().has_alpha() || small.to_rgba8().pixels().all(|p| p.0[3] == 255);
+    let mut out = Vec::new();
+    if opaque {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+            .encode_image(&small.to_rgb8())
+            .ok()?;
+    } else {
+        small
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .ok()?;
+    }
+    Some(out)
+}
+
+/// [`serve_cached_icon`] for a grid: the cover scaled to `px`, cached under its own key so a
+/// shelf of covers costs a few KiB each to send and decode instead of the full PNGs (#450:
+/// a macOS Games tab with hundreds of 400 KiB covers stuttered, worse through the data-URL
+/// fallback). The full cover is fetched (or read from the cache) once to make it.
+async fn serve_icon_thumbnail(
+    addr: String,
+    kind: &'static str,
+    identity: String,
+    remote_paths: Vec<String>,
+    if_none_match: Option<String>,
+    px: u32,
+) -> axum::response::Response {
+    let tkind = format!("{kind}@{px}");
+    let cached = {
+        let (addr, identity, tkind) = (addr.clone(), identity.clone(), tkind.clone());
+        tokio::task::spawn_blocking(move || icon_cache::get(&addr, &tkind, &identity))
+            .await
+            .unwrap_or(icon_cache::Cached::Unknown)
+    };
+    match cached {
+        icon_cache::Cached::Hit { bytes, etag } => {
+            if icon_cache::etag_matches(if_none_match.as_deref(), &etag) {
+                return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag.as_str())]).into_response();
+            }
+            return icon_response(bytes, &etag);
         }
-        Ok(None) => (StatusCode::NOT_FOUND, "no icon").into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "no icon").into_response(),
+        icon_cache::Cached::KnownMissing => {
+            return (StatusCode::NOT_FOUND, "no icon").into_response();
+        }
+        icon_cache::Cached::Unknown => {}
+    }
+    let full = {
+        let (a, i) = (addr.clone(), identity.clone());
+        let hit = tokio::task::spawn_blocking(move || icon_cache::get(&a, kind, &i))
+            .await
+            .unwrap_or(icon_cache::Cached::Unknown);
+        match hit {
+            icon_cache::Cached::Hit { bytes, .. } => Ok(Some(bytes)),
+            icon_cache::Cached::KnownMissing => Ok(None),
+            icon_cache::Cached::Unknown => {
+                fetch_icon(addr.clone(), kind, identity.clone(), remote_paths).await
+            }
+        }
+    };
+    match full {
+        Ok(Some(full)) => {
+            let small = tokio::task::spawn_blocking(move || {
+                let small = icon_thumbnail(&full, px).unwrap_or(full);
+                icon_cache::put(&addr, &tkind, &identity, &small);
+                small
+            })
+            .await;
+            match small {
+                Ok(small) => {
+                    let etag = icon_cache::etag_for(&small);
+                    icon_response(small, &etag)
+                }
+                Err(_) => (StatusCode::NOT_FOUND, "no icon").into_response(),
+            }
+        }
+        _ => (StatusCode::NOT_FOUND, "no icon").into_response(),
     }
 }
 
 fn icon_response(bytes: Vec<u8>, etag: &str) -> axum::response::Response {
+    // A thumbnail may be JPEG; a cover from the console is PNG.
+    let content_type = if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "image/png"),
+            (header::CONTENT_TYPE, content_type),
             // Icons rarely change once uploaded — a 5-minute cache keeps
             // scrolling smooth across refreshes without sticking forever
             // on a stale file. Past it the ETag makes revalidation cheap.
@@ -4576,7 +4912,15 @@ async fn ps5_game_icon(
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    serve_cached_icon(addr, "game", path, vec![icon_path], inm).await
+    serve_cached_icon(
+        addr,
+        "game",
+        path,
+        vec![icon_path],
+        inm,
+        icon_thumb_px(q.size),
+    )
+    .await
 }
 
 // ─── Installed-apps inventory ─────────────────────────────────────────
@@ -4631,6 +4975,40 @@ struct InstalledAppsResponse {
     /// UI then can't reliably tag the "registered" group, so it shows
     /// everything under "installed" with a soft note rather than erroring.
     registered_unavailable: bool,
+    /// True when the list may be missing titles: a directory listing hit its page size,
+    /// or app.db could not be read in full (a failed query, or a helper that could not
+    /// deliver every row, #473). The titles shown are real; there may be more.
+    incomplete: bool,
+}
+
+/// app.db, read at most once per request: a paged read is several calls (#473), and the
+/// installed list asks it for names title by title.
+struct AppDbOnce<'a> {
+    addr: &'a str,
+    got: Option<Result<ps5upload_core::diagnostics::AppDbList, String>>,
+}
+
+impl<'a> AppDbOnce<'a> {
+    fn new(addr: &'a str) -> Self {
+        Self { addr, got: None }
+    }
+
+    fn get(&mut self) -> &Result<ps5upload_core::diagnostics::AppDbList, String> {
+        let addr = self.addr;
+        self.got
+            .get_or_insert_with(|| appdb_query(addr).map_err(|e| format!("{e:#}")))
+    }
+
+    /// app.db's display name for `title_id`, when it has one that is not the id itself.
+    fn name_of(&mut self, title_id: &str) -> Option<String> {
+        let list = self.get().as_ref().ok()?;
+        list.apps
+            .iter()
+            .filter(|a| a.title_id == title_id)
+            .map(|a| a.name.trim())
+            .find(|n| !n.is_empty() && *n != title_id)
+            .map(str::to_string)
+    }
 }
 
 /// PS5 title-ids are 4 uppercase letters + 5 digits (PPSA01234, NPXS39041,
@@ -4643,12 +5021,24 @@ fn looks_like_title_id(name: &str) -> bool {
         && b[4..].iter().all(|c| c.is_ascii_digit())
 }
 
+/// The title id of the console web UI's home-screen tile. It is a link to the PS5Upload page, not a
+/// game, so no PC library listing may show it. Keep in sync with `WEBUI_TILE_TITLE_ID` in
+/// payload/include/config.h (a test below checks they match).
+pub(crate) const CONSOLE_WEBUI_TILE_TITLE_ID: &str = "PSUP00001";
+
+/// True for the console page's tile, which the PC library hides.
+pub(crate) fn is_console_webui_tile(title_id: &str) -> bool {
+    title_id
+        .trim()
+        .eq_ignore_ascii_case(CONSOLE_WEBUI_TILE_TITLE_ID)
+}
+
 /// Best-effort title name from `/user/appmeta/<title_id>/`. Tries PS5
 /// `param.json` first, then falls back to PS4 `param.sfo`, then queries
 /// `app.db` (raw file scan when sqlite is unavailable). Returns None on
 /// any failure (no metadata file — common for system apps — bad JSON,
 /// bad SFO, path denied); the caller falls back to the bare title_id.
-fn appmeta_title_name(addr: &str, title_id: &str) -> Option<String> {
+fn appmeta_title_name(addr: &str, title_id: &str, appdb: &mut AppDbOnce<'_>) -> Option<String> {
     // /user/appmeta/<id> first; then the app's own sce_sys, which is all a
     // title installed by a homebrew installer has on FW 13.60.
     for dir in [
@@ -4679,17 +5069,7 @@ fn appmeta_title_name(addr: &str, title_id: &str) -> Option<String> {
     // This is the only way to resolve PS4 BC titles (CUSA IDs) whose
     // metadata lives solely in app.db — their appmeta dirs have no
     // param.sfo or param.json.
-    if let Ok(appdb) = appdb_query(addr) {
-        for app in &appdb.apps {
-            if app.title_id == title_id {
-                let name = app.name.trim();
-                if !name.is_empty() && name != title_id {
-                    return Some(name.to_string());
-                }
-            }
-        }
-    }
-    None
+    appdb.name_of(title_id)
 }
 
 /// Titles app.db knows are installed that the /user/appmeta scan missed,
@@ -4709,6 +5089,7 @@ fn appdb_installed_additions(
         let tid = id.trim();
         if !looks_like_title_id(tid)
             || tid.starts_with("NPXS")
+            || is_console_webui_tile(tid)
             || seen.contains(tid)
             || !app_dirs.contains(tid)
             || !taken.insert(tid.to_string())
@@ -4720,6 +5101,48 @@ fn appdb_installed_additions(
         out.push((tid.to_string(), name));
     }
     out
+}
+
+/// Candidates for titles whose app folder exists but that neither the /user/appmeta scan
+/// nor app.db produced (#473), taken from the helper's registered list.
+///
+/// Only when app.db could not be read in full (`appdb_whole` false): with a complete app.db, a
+/// folder it does not list is not an installed title (a failed install, a partial uninstall),
+/// and the helper's list holds every /user/app folder, not only titles we registered. System
+/// ids (NPXS) are left out, as in [`appdb_installed_additions`]. The caller still checks each
+/// candidate for evidence it is a title (a mount.lnk source or a param file). Sorted, so the
+/// list does not reshuffle between refreshes.
+fn registered_only_additions<'a>(
+    registered: impl IntoIterator<Item = &'a str>,
+    app_dirs: &std::collections::HashSet<String>,
+    seen: &std::collections::HashSet<String>,
+    appdb_whole: bool,
+) -> Vec<String> {
+    if appdb_whole {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = registered
+        .into_iter()
+        .map(str::trim)
+        .filter(|tid| {
+            looks_like_title_id(tid)
+                && !tid.starts_with("NPXS")
+                && app_dirs.contains(*tid)
+                && !seen.contains(*tid)
+        })
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// True when `/user/app/<id>/sce_sys` holds a param.json or param.sfo: the folder is a title,
+/// not the leftovers of a failed install.
+fn app_folder_has_param(addr: &str, title_id: &str) -> bool {
+    ["param.json", "param.sfo"]
+        .iter()
+        .any(|f| fs_read(addr, &format!("/user/app/{title_id}/sce_sys/{f}"), 0, 16).is_ok())
 }
 
 /// GET /api/ps5/apps/installed?addr=IP:MGMT_PORT
@@ -4748,6 +5171,7 @@ async fn ps5_apps_installed(
                 }
             };
 
+            let mut appdb = AppDbOnce::new(&addr);
             // Full installed set: every /user/appmeta/<title_id>/ dir.
             let listing = list_dir(
                 &addr,
@@ -4762,7 +5186,7 @@ async fn ps5_apps_installed(
             let listing_whole = listing.entries.len() < 512;
             let mut titles: Vec<InstalledApp> = Vec::new();
             for e in listing.entries {
-                if !looks_like_title_id(&e.name) {
+                if !looks_like_title_id(&e.name) || is_console_webui_tile(&e.name) {
                     continue;
                 }
                 let tid = e.name;
@@ -4772,7 +5196,7 @@ async fn ps5_apps_installed(
                     // the id (older registrations stored id-as-name), try
                     // param.json for a friendlier label.
                     let name = if reg.title_name.trim().is_empty() || reg.title_name == tid {
-                        appmeta_title_name(&addr, &tid).unwrap_or_else(|| tid.clone())
+                        appmeta_title_name(&addr, &tid, &mut appdb).unwrap_or_else(|| tid.clone())
                     } else {
                         reg.title_name.clone()
                     };
@@ -4785,7 +5209,8 @@ async fn ps5_apps_installed(
                         system,
                     });
                 } else {
-                    let name = appmeta_title_name(&addr, &tid).unwrap_or_else(|| tid.clone());
+                    let name =
+                        appmeta_title_name(&addr, &tid, &mut appdb).unwrap_or_else(|| tid.clone());
                     titles.push(InstalledApp {
                         title_id: tid.clone(),
                         title_name: name,
@@ -4836,40 +5261,92 @@ async fn ps5_apps_installed(
             complete = complete
                 && crate::console_snapshot::app_folders_whole(internal_listing, app_dirs.len());
             if !app_dirs.is_empty() {
-                match appdb_query(&addr) {
-                    Ok(appdb) => {
-                        let seen: std::collections::HashSet<String> =
-                            titles.iter().map(|t| t.title_id.clone()).collect();
-                        let rows: Vec<(String, String)> = appdb
-                            .apps
-                            .into_iter()
-                            .map(|a| (a.title_id, a.name))
-                            .collect();
-                        for (tid, db_name) in appdb_installed_additions(&rows, &app_dirs, &seen) {
-                            let name = match db_name {
-                                Some(n) => n,
-                                None => {
-                                    appmeta_title_name(&addr, &tid).unwrap_or_else(|| tid.clone())
-                                }
-                            };
-                            let (origin, image_backed, source) = match reg_map.get(&tid) {
-                                Some(reg) => ("registered", reg.image_backed, reg.src.clone()),
-                                None => ("pkg", false, String::new()),
-                            };
-                            titles.push(InstalledApp {
-                                title_id: tid,
-                                title_name: name,
-                                origin: origin.to_string(),
-                                image_backed,
-                                source,
-                                system: false,
-                            });
+                // Whether app.db answered in full: only then is a folder it does not list
+                // known not to be an installed title.
+                let mut appdb_whole = true;
+                let rows: Option<Vec<(String, String)>> = match appdb.get() {
+                    Ok(list) => {
+                        // `err` with no rows: the helper could not read app.db at all.
+                        if list.truncated || list.err.is_some() {
+                            // Every row the helper delivered is used; the list just may not be whole.
+                            crate::log_warn!(
+                                "apps/installed: app.db read incomplete ({} rows{})",
+                                list.apps.len(),
+                                list.err
+                                    .as_deref()
+                                    .map(|e| format!(": {e}"))
+                                    .unwrap_or_default()
+                            );
+                            complete = false;
+                            appdb_whole = false;
                         }
+                        Some(
+                            list.apps
+                                .iter()
+                                .map(|a| (a.title_id.clone(), a.name.clone()))
+                                .collect(),
+                        )
                     }
                     Err(e) => {
-                        crate::log_warn!("apps/installed: app.db query failed: {e:#}");
+                        crate::log_warn!("apps/installed: app.db query failed: {e}");
                         complete = false;
+                        appdb_whole = false;
+                        None
                     }
+                };
+                if let Some(rows) = rows {
+                    let seen: std::collections::HashSet<String> =
+                        titles.iter().map(|t| t.title_id.clone()).collect();
+                    for (tid, db_name) in appdb_installed_additions(&rows, &app_dirs, &seen) {
+                        let name = match db_name {
+                            Some(n) => n,
+                            None => appmeta_title_name(&addr, &tid, &mut appdb)
+                                .unwrap_or_else(|| tid.clone()),
+                        };
+                        let (origin, image_backed, source) = match reg_map.get(&tid) {
+                            Some(reg) => ("registered", reg.image_backed, reg.src.clone()),
+                            None => ("pkg", false, String::new()),
+                        };
+                        titles.push(InstalledApp {
+                            title_id: tid,
+                            title_name: name,
+                            origin: origin.to_string(),
+                            image_backed,
+                            source,
+                            system: false,
+                        });
+                    }
+                }
+                // When app.db could not be read in full, a title it did not get to still
+                // has its folder and its registration (#473): list it if the folder holds a
+                // title (our mount.lnk source, or a param file), never a bare leftover folder.
+                let seen: std::collections::HashSet<String> =
+                    titles.iter().map(|t| t.title_id.clone()).collect();
+                for tid in registered_only_additions(
+                    reg_map.keys().map(String::as_str),
+                    &app_dirs,
+                    &seen,
+                    appdb_whole,
+                ) {
+                    let Some(reg) = reg_map.get(&tid) else {
+                        continue;
+                    };
+                    if reg.src.trim().is_empty() && !app_folder_has_param(&addr, &tid) {
+                        continue;
+                    }
+                    let name = if reg.title_name.trim().is_empty() || reg.title_name == tid {
+                        appmeta_title_name(&addr, &tid, &mut appdb).unwrap_or_else(|| tid.clone())
+                    } else {
+                        reg.title_name.clone()
+                    };
+                    titles.push(InstalledApp {
+                        system: false,
+                        title_id: tid,
+                        title_name: name,
+                        origin: "registered".to_string(),
+                        image_backed: reg.image_backed,
+                        source: reg.src.clone(),
+                    });
                 }
             }
             // Kept for the game page. System apps are not games.
@@ -4909,6 +5386,7 @@ async fn ps5_apps_installed(
             Ok(InstalledAppsResponse {
                 titles,
                 registered_unavailable,
+                incomplete: !complete,
             })
         })
         .await
@@ -4924,6 +5402,9 @@ async fn ps5_apps_installed(
 struct AppIconQuery {
     addr: Option<String>,
     title_id: String,
+    /// 128, 256 or 384: a scaled copy for a grid. Absent: the full cover.
+    #[serde(default)]
+    size: Option<u32>,
 }
 
 /// GET /api/ps5/app-icon?addr=IP:MGMT_PORT&title_id=PPSA01234
@@ -4962,7 +5443,15 @@ async fn ps5_app_icon(
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    serve_cached_icon(addr, "app", q.title_id, icon_paths, inm).await
+    serve_cached_icon(
+        addr,
+        "app",
+        q.title_id,
+        icon_paths,
+        inm,
+        icon_thumb_px(q.size),
+    )
+    .await
 }
 
 /// One `.pkg` found on a connected external/USB drive.
@@ -5246,9 +5735,83 @@ async fn ps5_status(
                 Some(&console),
                 format!("{e:#}"),
             );
-            json_err(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response()
+            let power = ps5upload_ava1::console::recent_power(&console);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(status_failure_body(&e, power)),
+            )
+                .into_response()
         }
         Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+/// The 502 body of a failed status probe: `{ error, reason?, power? }`. `reason` is the token
+/// the error leads with (`console_rest_mode`, `ava1_unreachable`, `helper_not_ava1`,
+/// `not_paired`, ...); `power` is what DDP said (`awake` / `rest` / `unreachable`) when the
+/// engine asked it, and absent otherwise.
+fn status_failure_body(
+    e: &anyhow::Error,
+    power: Option<ps5upload_core::ddp::Power>,
+) -> serde_json::Value {
+    let reason = ps5upload_core::mgmt::error_token(e);
+    let power = power.or_else(|| {
+        (reason.as_deref() == Some(ps5upload_core::mgmt::CONSOLE_REST_MODE))
+            .then_some(ps5upload_core::ddp::Power::Rest)
+    });
+    let mut body = serde_json::json!({ "error": format!("{e:#}") });
+    if let Some(r) = reason {
+        body["reason"] = r.into();
+    }
+    if let Some(p) = power {
+        body["power"] = p.as_str().into();
+    }
+    body
+}
+
+#[cfg(test)]
+mod status_failure_body_tests {
+    use super::status_failure_body;
+    use ps5upload_core::ddp::Power;
+    use ps5upload_core::mgmt;
+
+    #[test]
+    fn a_console_in_rest_mode_carries_its_reason_and_power() {
+        let e = mgmt::console_unusable(
+            "NODE_STATUS",
+            mgmt::CONSOLE_REST_MODE,
+            mgmt::CONSOLE_REST_MODE_MESSAGE,
+        );
+        let b = status_failure_body(&e, Some(Power::Rest));
+        assert_eq!(b["reason"], "console_rest_mode");
+        assert_eq!(b["power"], "rest");
+        assert!(b["error"]
+            .as_str()
+            .unwrap()
+            .contains("The PS5 is in rest mode"));
+        // Named by its reason even when the verdict is no longer cached.
+        assert_eq!(status_failure_body(&e, None)["power"], "rest");
+    }
+
+    #[test]
+    fn unreachable_and_helper_down_keep_their_tokens() {
+        let e = mgmt::console_unusable(
+            "NODE_STATUS",
+            mgmt::AVA1_UNREACHABLE,
+            mgmt::CONSOLE_NOT_ANSWERING_MESSAGE,
+        );
+        let b = status_failure_body(&e, Some(Power::Unreachable));
+        assert_eq!(b["reason"], "ava1_unreachable");
+        assert_eq!(b["power"], "unreachable");
+        let b = status_failure_body(&mgmt::helper_not_ava1("NODE_STATUS"), Some(Power::Awake));
+        assert_eq!(b["reason"], "helper_not_ava1");
+        assert_eq!(b["power"], "awake");
+        // Not probed: no power at all, never a guess.
+        let b = status_failure_body(&mgmt::helper_not_ava1("NODE_STATUS"), None);
+        assert!(b.get("power").is_none(), "{b}");
+        let b = status_failure_body(&anyhow::anyhow!("timed out"), None);
+        assert!(b.get("reason").is_none(), "{b}");
+        assert_eq!(b["error"], "timed out");
     }
 }
 
@@ -5636,6 +6199,8 @@ async fn transfer_file_handler(
 
     let bandwidth_cap = req.bandwidth_cap_mbps;
     tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         // Drops at closure end (success OR panic), stopping the
         // progress ticker. Without this, a panic in
         // upload_file would leak the ticker task
@@ -5816,6 +6381,8 @@ async fn transfer_dir_handler(
     let events_tx = state.events_tx.clone();
 
     tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         // Guard installed first so a panic in the walk can't orphan the job
         // in Running forever (same rationale as the reconcile route).
         let mut fail_guard =
@@ -5878,6 +6445,7 @@ async fn transfer_dir_handler(
             return;
         }
 
+        let renames = module_case_renames(source_fs.as_deref(), &src_path, &req.src_dir);
         let walk_started = std::time::Instant::now();
         let planned = match &source_fs {
             Some(fs) => walk_plan_with(fs.as_ref(), &src_path, &req.excludes),
@@ -5962,6 +6530,7 @@ async fn transfer_dir_handler(
         // every shard boundary, flipped by POST /api/jobs/{id}/cancel.
         cfg.cancel = Some(register_transfer_cancel(job_id));
         cfg.excludes = req.excludes;
+        cfg.renames = renames;
         cfg.progress_bytes = Some(Arc::clone(&progress));
         cfg.progress_files = Some(Arc::clone(&progress_files));
         cfg.progress_files_finalized = Some(Arc::clone(&progress_files_finalized));
@@ -6150,6 +6719,44 @@ fn is_game_icon_path(p: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod game_icon_path_tests {
+    #[test]
+    fn a_grid_cover_is_a_small_jpeg_and_transparency_stays_png() {
+        let png = |img: image::DynamicImage| {
+            let mut out = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+                .unwrap();
+            out
+        };
+        // A 512 px opaque cover with detail, like icon0.png.
+        let opaque = image::RgbImage::from_fn(512, 512, |x, y| {
+            image::Rgb([(x ^ y) as u8, x as u8, y as u8])
+        });
+        let full = png(image::DynamicImage::ImageRgb8(opaque));
+        let small = super::icon_thumbnail(&full, 256).unwrap();
+        assert!(
+            small.starts_with(&[0xFF, 0xD8, 0xFF]),
+            "opaque covers become JPEG"
+        );
+        let back = image::load_from_memory(&small).unwrap();
+        assert_eq!((back.width(), back.height()), (256, 256));
+        assert!(
+            small.len() * 4 < full.len(),
+            "{} vs {}",
+            small.len(),
+            full.len()
+        );
+        // Transparency survives as PNG.
+        let clear = image::RgbaImage::from_pixel(512, 512, image::Rgba([0, 0, 0, 0]));
+        let t = super::icon_thumbnail(&png(image::DynamicImage::ImageRgba8(clear)), 128).unwrap();
+        assert!(t.starts_with(b"\x89PNG"));
+        // Already small, or not an image: the caller keeps what it has.
+        let tiny = png(image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 64)));
+        assert!(super::icon_thumbnail(&tiny, 128).is_none());
+        assert!(super::icon_thumbnail(b"not an image", 128).is_none());
+        assert_eq!(super::icon_thumb_px(Some(256)), Some(256));
+        assert_eq!(super::icon_thumb_px(Some(4096)), None);
+    }
+
     use super::is_game_icon_path;
     use std::path::Path;
 
@@ -6450,6 +7057,8 @@ async fn transfer_zip_handler(
     );
 
     tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
@@ -6716,6 +7325,8 @@ struct ProfileAvatarReq {
     uid: Option<u32>,
     #[serde(default)]
     username: Option<String>,
+    #[serde(default)]
+    crop: Option<ps5upload_core::profile::CropPosition>,
 }
 
 #[derive(Deserialize)]
@@ -6723,6 +7334,8 @@ struct ProfilePreviewReq {
     image_path: String,
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    crop: Option<ps5upload_core::profile::CropPosition>,
 }
 
 // ─── User create / delete ───────────────────────────────────────────────
@@ -7627,10 +8240,11 @@ async fn fw_spoof_status_handler(
 }
 
 async fn profile_avatar_preview_handler(Json(req): Json<ProfilePreviewReq>) -> impl IntoResponse {
-    let mode = ps5upload_core::profile::SquareMode::parse(req.mode.as_deref().unwrap_or("crop"));
+    let mode = ps5upload_core::profile::SquareMode::parse(req.mode.as_deref().unwrap_or("crop"))
+        .with_crop(req.crop);
     let path = req.image_path;
     let r: Result<Vec<u8>, anyhow::Error> = tokio::task::spawn_blocking(move || {
-        let bytes = std::fs::read(&path).map_err(|e| anyhow::anyhow!("read image {path}: {e}"))?;
+        let bytes = profile_image::read(&path)?;
         ps5upload_core::profile::avatar_preview_png(&bytes, mode)
     })
     .await
@@ -7703,15 +8317,20 @@ async fn profile_avatar_handler(
     Json(req): Json<ProfileAvatarReq>,
 ) -> impl IntoResponse {
     let addr = console_addr_or_default(req.addr, &state.default_ps5_addr);
-    let mode = ps5upload_core::profile::SquareMode::parse(req.mode.as_deref().unwrap_or("crop"));
+    let mode = ps5upload_core::profile::SquareMode::parse(req.mode.as_deref().unwrap_or("crop"))
+        .with_crop(req.crop);
     let uid = req.uid.unwrap_or(0);
     let username = req.username;
     let image_path = req.image_path;
     let started = std::time::Instant::now();
-    crate::log_info!("profile_avatar: addr={addr} image={image_path} mode={mode:?} uid={uid}");
+    let image_label = if image_path.starts_with("data:") {
+        "browser upload"
+    } else {
+        &image_path
+    };
+    crate::log_info!("profile_avatar: addr={addr} image={image_label} mode={mode:?} uid={uid}");
     let r = tokio::task::spawn_blocking(move || {
-        let bytes = std::fs::read(&image_path)
-            .map_err(|e| anyhow::anyhow!("read image {image_path}: {e}"))?;
+        let bytes = profile_image::read(&image_path)?;
         ps5upload_core::profile::profile_apply_avatar(&addr, uid, username.as_deref(), &bytes, mode)
     })
     .await
@@ -7842,6 +8461,8 @@ async fn transfer_7z_handler(
     );
 
     tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
@@ -8061,6 +8682,8 @@ async fn transfer_rar_handler(
     );
 
     tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
@@ -8409,6 +9032,8 @@ async fn link_download_handler(
     );
 
     tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
@@ -8658,6 +9283,8 @@ async fn transfer_file_list_handler(
     );
 
     tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let mut fail_guard =
             JobFailOnDropGuard::new(Arc::clone(&jobs), events_tx.clone(), job_id, started_at_ms);
@@ -8842,6 +9469,8 @@ fn start_ava1_download(
     // the job ends failed with `transfer_cancelled`, like a cancelled upload.
     let cancel = register_transfer_cancel(job_id);
     tokio::task::spawn_blocking(move || {
+        // Marks the console busy for the job: a helper stop is refused meanwhile.
+        let _busy = helper_stop::enter(&addr);
         let _stop_guard = TickerStopGuard::new(stop_ticker);
         let id = *job_id.as_bytes();
         let ready =
@@ -9440,6 +10069,36 @@ async fn engine_version() -> impl IntoResponse {
     )
 }
 
+/// GET /api/activity?since=<seq> — running jobs and the endings after `since`, for the app's
+/// background watcher (see `activity`).
+async fn activity_handler(
+    State(state): State<AppState>,
+    installs: pkg_install::PkgInstallStateHandle,
+    q: activity::SinceQuery,
+) -> impl IntoResponse {
+    let mut active: Vec<activity::Active> = {
+        let jobs = state.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.iter()
+            .filter_map(|(id, s)| match s {
+                JobState::Running {
+                    started_at_ms,
+                    bytes_sent,
+                    total_bytes,
+                    ..
+                } => Some(activity::transfer_active(
+                    &id.to_string(),
+                    *bytes_sent,
+                    *total_bytes,
+                    *started_at_ms,
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    active.extend(installs.jobs.running().iter().map(activity::install_active));
+    Json(activity::snapshot(q.since, active))
+}
+
 /// GET /api/jobs
 async fn list_jobs(State(state): State<AppState>) -> impl IntoResponse {
     let jobs = state.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -9834,7 +10493,7 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
 
     // The Collection's automatic refresh (a no-op until a folder is added).
     collection_api::spawn_auto_refresh();
-    // Install sessions live in their own state (served by pkg_install::router below); the helper
+    // Install sessions live in their own state (served by pkg_install::api_router below); the helper
     // log mirror also reads it, to stay off a console while an install runs.
     let pkg_state = std::sync::Arc::new(pkg_install::PkgInstallState::restored());
     // Copies each connected console's helper log into the event journal.
@@ -9850,8 +10509,19 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         }));
     }
 
+    let activity_installs = pkg_state.clone();
+    let helper_stop_installs = pkg_state.clone();
     let app = Router::new()
         .route("/", get(ui_handler))
+        .route(
+            "/api/activity",
+            get(
+                move |st: State<AppState>, Query(q): Query<activity::SinceQuery>| {
+                    activity_handler(st, activity_installs.clone(), q)
+                },
+            ),
+        )
+        .route("/api/activity/label", post(activity::label_handler))
         .route("/api/ps5/status", get(ps5_status))
         .route("/api/ps5/port-check", get(ps5_port_check))
         .route("/api/ps5/readiness", get(ps5_readiness))
@@ -9918,6 +10588,7 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
             post(fpkg_api::ffpfsc_compress_handler),
         )
         .route("/api/exfat/build", post(fpkg_api::exfat_build_handler))
+        .route("/api/folder/build", post(fpkg_api::folder_build_handler))
         .route(
             "/api/collection/settings",
             get(collection_api::get_settings).put(collection_api::put_settings),
@@ -9992,6 +10663,7 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/local/storage-roots", get(local_storage_roots_handler))
         .route("/api/ps5/fs/delete", post(ps5_fs_delete))
         .route("/api/ps5/fs/move", post(ps5_fs_move))
+        .route("/api/ps5/fs/unpack", post(ps5_fs_unpack))
         .route("/api/ps5/fs/copy", post(ps5_fs_copy))
         .route("/api/ps5/fs/op-status", get(ps5_fs_op_status))
         .route("/api/ps5/fs/op-cancel", post(ps5_fs_op_cancel))
@@ -10046,6 +10718,23 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
             get(ps5_hidden_icons).post(ps5_set_icon_hidden),
         )
         .route("/api/ps5/focus", get(ps5_focus))
+        .route("/api/ps5/net/ports", get(ps5_net_ports))
+        .route(
+            "/api/ps5/files/prefs",
+            get(console_files_api::prefs_get_handler),
+        )
+        .route(
+            "/api/ps5/files/prefs/set",
+            post(console_files_api::prefs_set_handler),
+        )
+        .route(
+            "/api/ps5/files/handoff/put",
+            post(console_files_api::handoff_put_handler),
+        )
+        .route(
+            "/api/ps5/files/handoff/take",
+            post(console_files_api::handoff_take_handler),
+        )
         .route("/api/ps5/fs/read-preview", post(ps5_fs_read_preview))
         .route("/api/ps5/process/list", get(ps5_process_list))
         .route("/api/ps5/elfldr/health", get(ps5_elfldr_health))
@@ -10067,9 +10756,16 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/ps5/pldmgr/delete", post(pldmgr_api::delete))
         .route("/api/ps5/pldmgr/autoload", post(pldmgr_api::autoload))
         .route("/api/ps5/pldmgr/store", post(pldmgr_api::store))
+        .merge(hearbridge_api::routes())
         .route("/api/ps5/elfldr/ensure", post(ps5_elfldr_ensure))
         .route("/api/ps5/process/kill", post(ps5_process_kill))
         .route("/api/ps5/power/control", post(ps5_power_control))
+        .route(
+            "/api/ps5/helper/stop",
+            post(move |Json(req): Json<HelperStopReq>| {
+                ps5_helper_stop(helper_stop_installs.clone(), req)
+            }),
+        )
         .route("/api/ps5/power/telemetry", get(ps5_power_telemetry))
         .route("/api/ps5/power/wake", post(ps5_power_wake))
         .route("/api/ps5/power/wake-login", post(ps5_power_wake_login))
@@ -10141,6 +10837,7 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
             "/api/remote/connections/{id}/test",
             post(remote::api::test_saved_handler),
         )
+        .merge(browser_payload::router())
         .route("/api/remote/test", post(remote::api::test_form_handler))
         .route("/api/remote/list", post(remote::api::list_dir_handler))
         .route(
@@ -10179,6 +10876,15 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         )
         .route("/api/ps5/hw/fan-threshold", post(ps5_hw_set_fan_threshold))
         .route("/api/ps5/peripheral", post(ps5_peripheral))
+        .route(
+            "/api/ps5/cheats/import",
+            post(console_files_api::cheat_import_handler),
+        )
+        .route(
+            "/api/ps5/minion/tile",
+            post(console_files_api::minion_tile_handler),
+        )
+        .route("/api/ps5/fs/stat", post(console_files_api::stat_handler))
         .route("/api/ps5/fs/chmod", post(ps5_fs_chmod))
         .route("/api/ps5/fs/mkdir", post(ps5_fs_mkdir))
         .route("/api/ps5/fs/write-bytes", post(ps5_fs_write_bytes))
@@ -10190,6 +10896,11 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .route("/api/transfer/dir", post(transfer_dir_handler))
         .route("/api/transfer/zip", post(transfer_zip_handler))
         .route("/api/transfer/ps5-to-ps5", post(ps5_to_ps5_handler))
+        .route(
+            "/api/transfer/ps5-to-ps5/remote",
+            get(c2c_api::remote_handler),
+        )
+        .route("/api/transfer/ps5-to-ps5/test", post(c2c_api::test_handler))
         .route("/api/local/path-kind", get(local_path_kind_handler))
         .route(
             "/api/local/inspect-folder",
@@ -10221,14 +10932,19 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
             post(profile_local_username_handler),
         )
         .route("/api/profile/activate", post(profile_activate_handler))
-        .route("/api/profile/avatar", post(profile_avatar_handler))
+        .route(
+            "/api/profile/avatar",
+            post(profile_avatar_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
         .route(
             "/api/profile/avatar/current",
             get(profile_avatar_current_handler),
         )
         .route(
             "/api/profile/avatar/preview",
-            post(profile_avatar_preview_handler),
+            post(profile_avatar_preview_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
         )
         .route(
             "/api/transfer/dir-reconcile",
@@ -10260,6 +10976,14 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         )
         .route("/api/debug/crash", get(debug_crash))
         .with_state(state);
+
+    // All browser APIs must be merged before nesting under the URL prefix.
+    // Package-host URLs stay at the root because the console fetches them directly.
+    let app = app
+        .merge(pkg_install::api_router(pkg_state.clone()))
+        .merge(remote_download::router(std::sync::Arc::new(
+            remote_download::DownloadRegistry::default(),
+        )));
 
     // SPA fallback: serve the embedded React bundle for every path that doesn't
     // match an explicit /api/* route above.  Only compiled when the `webui`
@@ -10306,17 +11030,7 @@ async fn run(cfg: EngineConfig) -> anyhow::Result<()> {
         .allow_headers(Any);
 
     let app = app
-        // .pkg install — sessions live in their own state because the
-        // HTTP-host serving handler needs Mutex-guarded session lookup
-        // independent of the main engine state. Merged at this point
-        // so the pkg routes share the same listener + CORS + body limit.
-        .merge(pkg_install::router(pkg_state))
-        // Downloading a link to disk before installing it. Separate state for
-        // the same reason as the install sessions: its progress is polled
-        // independently of everything else the engine is doing.
-        .merge(remote_download::router(std::sync::Arc::new(
-            remote_download::DownloadRegistry::default(),
-        )))
+        .merge(pkg_install::host_router(pkg_state))
         // Tauri's renderer performs a few direct fetches to the sidecar for
         // liveness, job polling and streamed resources. Emit CORS headers only
         // for origins accepted by the same narrow trust rule as the guard
@@ -10492,6 +11206,13 @@ pub fn healthcheck() -> i32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(19113);
+    let base = std::env::var("PS5UPLOAD_BASE_URL").unwrap_or_default();
+    let base = base.trim_matches('/');
+    let path = if base.is_empty() {
+        "/api/jobs".to_string()
+    } else {
+        format!("/{base}/api/jobs")
+    };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let timeout = std::time::Duration::from_secs(3);
     let ok = (|| -> std::io::Result<bool> {
@@ -10499,10 +11220,8 @@ pub fn healthcheck() -> i32 {
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         stream.write_all(
-            format!(
-                "GET /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-            )
-            .as_bytes(),
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
         )?;
         let mut head = [0u8; 16];
         let n = stream.read(&mut head)?;
@@ -12043,7 +12762,7 @@ mod job_stage_tests {
 
 #[cfg(test)]
 mod appdb_installed_additions_tests {
-    use super::appdb_installed_additions;
+    use super::{appdb_installed_additions, registered_only_additions};
     use std::collections::HashSet;
 
     fn set(v: &[&str]) -> HashSet<String> {
@@ -12072,6 +12791,86 @@ mod appdb_installed_additions_tests {
                 ("FAKE10101".to_string(), None),
             ]
         );
+    }
+
+    /// #473: a title past the first 256 app.db rows is still added once the
+    /// rows arrive — the window, not the filter, was what hid it.
+    #[test]
+    fn a_late_sorting_title_past_row_256_is_kept() {
+        let mut rows: Vec<(String, String)> = (0..1000)
+            .map(|i| (format!("CUSA{i:05}"), format!("Game {i}")))
+            .collect();
+        rows.insert(0, ("AAAA00001".to_string(), "Early".to_string()));
+        rows.push(("ZZZZ99999".to_string(), "Late Title".to_string()));
+        let got = appdb_installed_additions(&rows, &set(&["ZZZZ99999"]), &HashSet::new());
+        assert_eq!(
+            got,
+            vec![("ZZZZ99999".to_string(), Some("Late Title".to_string()))]
+        );
+    }
+
+    /// #473: when app.db could not be read in full, a registered title with its
+    /// app folder but no appmeta and no app.db row is a candidate.
+    #[test]
+    fn an_incomplete_appdb_read_reconciles_registered_titles_with_a_folder() {
+        let got = registered_only_additions(
+            [
+                "PPSA00002",
+                "ZZZZ99999",
+                "CUSA00001",
+                "PPSA00003",
+                "NPXS40056",
+                "not-an-id",
+            ],
+            &set(&[
+                "ZZZZ99999",
+                "CUSA00001",
+                "PPSA00002",
+                "NPXS40056",
+                "not-an-id",
+            ]),
+            // already listed by the appmeta scan or app.db
+            &set(&["CUSA00001"]),
+            false,
+        );
+        // PPSA00003 has no folder; NPXS is a system id, never added this way.
+        assert_eq!(got, vec!["PPSA00002".to_string(), "ZZZZ99999".to_string()]);
+    }
+
+    /// A complete app.db read that does not list a folder means the folder is not an
+    /// installed title (a failed install, a partial uninstall): it is not added.
+    #[test]
+    fn a_complete_appdb_read_adds_no_folder_it_does_not_list() {
+        let got =
+            registered_only_additions(["PPSA00002"], &set(&["PPSA00002"]), &HashSet::new(), true);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn drops_the_console_page_tile() {
+        let rows = vec![
+            ("PSUP00001".to_string(), "PS5Upload".to_string()),
+            ("PLDM00001".to_string(), "Payload Manager".to_string()),
+        ];
+        let got =
+            appdb_installed_additions(&rows, &set(&["PSUP00001", "PLDM00001"]), &HashSet::new());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "PLDM00001");
+    }
+
+    #[test]
+    fn the_tile_id_matches_the_payload_config() {
+        let cfg = include_str!("../../../../payload/include/config.h");
+        let line = cfg
+            .lines()
+            .find(|l| l.contains("#define WEBUI_TILE_TITLE_ID"))
+            .expect("config.h defines WEBUI_TILE_TITLE_ID");
+        assert!(
+            line.contains(&format!("\"{}\"", super::CONSOLE_WEBUI_TILE_TITLE_ID)),
+            "{line}"
+        );
+        assert!(super::is_console_webui_tile("PSUP00001"));
+        assert!(!super::is_console_webui_tile("PLDM00001"));
     }
 
     #[test]
@@ -12163,5 +12962,70 @@ mod speed_test_file_tests {
         assert_ne!(data[..1024 * 1024], data[1024 * 1024..]);
         assert!(data.iter().any(|b| *b != 0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod module_case_upload_tests {
+    use super::module_case_renames;
+
+    #[test]
+    fn a_game_folder_uploads_its_modules_under_the_eboot_spelling() {
+        let d = std::env::temp_dir().join(format!("ps5u-modcase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("Media/Modules")).unwrap();
+        let mut eboot = vec![0u8; 4096];
+        eboot.extend_from_slice(
+            b"\0%s/Modules/Il2CppUserAssemblies.prx\0Il2cppUserAssemblies.prx\0",
+        );
+        std::fs::write(d.join("eboot.bin"), &eboot).unwrap();
+        std::fs::write(d.join("Media/Modules/Il2cppUserAssemblies.prx"), b"m").unwrap();
+        let got = module_case_renames(None, &d, &d.to_string_lossy());
+        assert_eq!(
+            got,
+            vec![(
+                "Media/Modules/Il2cppUserAssemblies.prx".to_string(),
+                "Media/Modules/Il2CppUserAssemblies.prx".to_string()
+            )]
+        );
+        // Not a game folder: nothing is read, nothing renamed.
+        std::fs::remove_file(d.join("eboot.bin")).unwrap();
+        assert!(module_case_renames(None, &d, &d.to_string_lossy()).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod avatar_crop_position_tests {
+    use super::*;
+    #[tokio::test]
+    async fn preview_can_frame_the_top_of_a_portrait_instead_of_its_center() {
+        use base64::Engine as _;
+        // A tiny red/green/blue portrait PNG, supplied by the browser.
+        let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAADCAIAAADdv/LVAAAADklEQVR4nGP4zwAEEAIAEfoC/qsosSMAAAAASUVORK5CYII=").unwrap();
+        let source = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        );
+        let render = |y| {
+            serde_json::from_value::<ProfilePreviewReq>(
+                serde_json::json!({"image_path":source,"mode":"crop","crop":{"x":50,"y":y}}),
+            )
+            .unwrap()
+        };
+        let top = profile_avatar_preview_handler(Json(render(0)))
+            .await
+            .into_response();
+        let center = profile_avatar_preview_handler(Json(render(50)))
+            .await
+            .into_response();
+        assert_eq!(top.status(), StatusCode::OK);
+        let top = axum::body::to_bytes(top.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let center = axum::body::to_bytes(center.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_ne!(top, center, "crop position must change the preview");
     }
 }

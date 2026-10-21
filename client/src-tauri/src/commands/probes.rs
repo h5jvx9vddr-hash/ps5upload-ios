@@ -167,16 +167,7 @@ pub async fn payload_check(ip: String) -> serde_json::Value {
         Ok(r) => {
             let code = r.status();
             let body = r.text().await.unwrap_or_default();
-            serde_json::json!({
-                "ok": false,
-                "reachable": false,
-                "engine": true,
-                "error": if body.is_empty() {
-                    format!("engine returned HTTP {code}")
-                } else {
-                    body
-                },
-            })
+            status_failure(code.as_u16(), &body)
         }
         // Connection refused / timed out / reset: the engine side of the
         // proxy failed, so the console was never consulted.
@@ -186,6 +177,63 @@ pub async fn payload_check(ip: String) -> serde_json::Value {
             "engine": false,
             "error": crate::engine_http::error_chain(&e),
         }),
+    }
+}
+
+/// The reply for an engine that answered the status probe with a failure. `error` stays the
+/// raw body (the renderer matches tokens in it); `reason` (the engine's token, e.g.
+/// `console_rest_mode`) and `power` (`awake` / `rest` / `unreachable`) are passed through
+/// from a JSON body `{ error, reason, power }` when the engine sent them.
+fn status_failure(code: u16, body: &str) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "ok": false,
+        "reachable": false,
+        "engine": true,
+        "error": if body.is_empty() {
+            format!("engine returned HTTP {code}")
+        } else {
+            body.to_string()
+        },
+    });
+    if let Ok(serde_json::Value::Object(parsed)) = serde_json::from_str(body) {
+        for key in ["reason", "power"] {
+            if let Some(v @ serde_json::Value::String(_)) = parsed.get(key) {
+                out[key] = v.clone();
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod status_failure_tests {
+    use super::status_failure;
+
+    #[test]
+    fn reason_and_power_pass_through_from_the_engine_body() {
+        let body = r#"{"error":"payload rejected NODE_STATUS: console_rest_mode: The PS5 is in rest mode.","reason":"console_rest_mode","power":"rest"}"#;
+        let v = status_failure(502, body);
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["reachable"], false);
+        assert_eq!(v["engine"], true);
+        assert_eq!(v["reason"], "console_rest_mode");
+        assert_eq!(v["power"], "rest");
+        assert_eq!(v["error"], body, "error stays the raw body");
+    }
+
+    #[test]
+    fn an_older_engine_or_a_plain_body_has_no_reason_or_power() {
+        let v = status_failure(502, r#"{"error":"helper_not_ava1: gone"}"#);
+        assert!(v.get("reason").is_none() && v.get("power").is_none(), "{v}");
+        let v = status_failure(502, "not json");
+        assert_eq!(v["error"], "not json");
+        assert!(v.get("reason").is_none());
+        let v = status_failure(503, "");
+        assert_eq!(v["error"], "engine returned HTTP 503");
+        // A reason only, without power (the engine did not ask DDP).
+        let v = status_failure(502, r#"{"error":"x","reason":"helper_not_ava1"}"#);
+        assert_eq!(v["reason"], "helper_not_ava1");
+        assert!(v.get("power").is_none());
     }
 }
 

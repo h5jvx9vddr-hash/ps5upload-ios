@@ -10,6 +10,7 @@ import {
 import {
   portProbe,
   payloadCheck,
+  ddpStatus,
   bundledPayloadInfo,
   probeCompanions,
   discoverPs5,
@@ -23,6 +24,8 @@ import {
   useHelperSendStore,
 } from "../../state/helperSend";
 import { sendHelperTo } from "../../state/helperSendRuntime";
+import { clearHelperStopped, useHelperStopped } from "../../state/helperStopped";
+import { StopHelperButton } from "./StopHelper";
 import { looksLikeMacLocalNetworkBlock } from "../../lib/localNetworkHint";
 import { localNetworkBlocked, localNetworkText } from "../../lib/androidLocalNetwork";
 import { isIOS } from "../../lib/platform";
@@ -30,9 +33,10 @@ import { pairingAllow } from "../../api/ava1";
 import { parsePS5Firmware } from "../../lib/ps5Firmware";
 import { compareVersions } from "../../lib/semver";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
-import { AlertTriangle, CheckCircle2, CircleDashed, XCircle, Send, ArrowRight, Radar, Sparkles, Cable, ExternalLink } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleDashed, Moon, XCircle, Send, ArrowRight, Radar, Sparkles, Cable, ExternalLink } from "lucide-react";
 import { openExternalUrl } from "../../lib/openExternalUrl";
 import { hostOf as bareHostOf, typedHost } from "../../lib/addr";
+import { checkSaysRest } from "../../lib/consolePower";
 import { PageHeader, Button, Spinner, ErrorCard } from "../../components";
 import { selectConsoleByAddress } from "../../state/roster";
 import { useTr } from "../../state/lang";
@@ -42,7 +46,8 @@ import { formatBytes } from "../../lib/format";
 import { loaderPort } from "../../state/consolePorts";
 import { ConsolePortsFields } from "../../components/ConsolePortsFields";
 
-type StepState = "idle" | "busy" | "ok" | "fail";
+/** "rest": the console answered that it is in rest mode — not a failure, so it reads calm. */
+type StepState = "idle" | "busy" | "ok" | "fail" | "rest";
 
 /**
  * Three-step guided flow before first upload:
@@ -111,6 +116,8 @@ function StepIcon({ state }: { state: StepState }) {
     return (
       <Spinner size={size} tone="accent" />
     );
+  if (state === "rest")
+    return <Moon size={size} className="text-[var(--color-accent-bright)]" />;
   return <CircleDashed size={size} className="text-[var(--color-muted)]" />;
 }
 
@@ -129,6 +136,7 @@ function StepCard({
 }) {
   const tr = useTr();
   const failed = state === "fail" && !!stateText;
+  const resting = state === "rest" && !!stateText;
   const failedLabel = tr("connection_step_failed", undefined, "Didn't work");
   // The state shows in the step's icon and line; the edge only hints at it, so a
   // finished step reads as calm glass, not a green frame.
@@ -150,7 +158,13 @@ function StepCard({
           <div className="text-sm font-semibold">{title}</div>
           <div className="mt-0.5 flex items-center gap-1.5 text-xs text-[var(--color-muted)]">
             <StepIcon state={state} />
-            <span className="truncate">{failed ? failedLabel : stateText}</span>
+            <span className="truncate">
+              {failed
+                ? failedLabel
+                : resting
+                  ? tr("status_ps5_rest_mode", undefined, "In rest mode")
+                  : stateText}
+            </span>
           </div>
         </div>
       </header>
@@ -162,6 +176,16 @@ function StepCard({
           className="mb-4 flex items-start gap-2 rounded-[var(--radius-field)] border border-[color-mix(in_srgb,var(--color-bad)_40%,transparent)] bg-[var(--color-bad-soft)] p-3 text-sm"
         >
           <XCircle size={16} className="mt-0.5 shrink-0 text-[var(--color-bad)]" />
+          <p className="min-w-0 whitespace-pre-line break-words">{stateText}</p>
+        </div>
+      )}
+      {resting && (
+        <div
+          role="status"
+          data-testid="connection-rest-mode"
+          className="mb-4 flex items-start gap-2 rounded-[var(--radius-field)] border border-[color-mix(in_srgb,var(--color-accent)_35%,transparent)] bg-[var(--color-accent-soft)] p-3 text-sm"
+        >
+          <Moon size={16} className="mt-0.5 shrink-0 text-[var(--color-accent-bright)]" />
           <p className="min-w-0 whitespace-pre-line break-words">{stateText}</p>
         </div>
       )}
@@ -245,6 +269,10 @@ export default function ConnectionScreen() {
   const host = useConnectionStore((s) => s.host);
   const payloadStatus = useConnectionStore((s) => s.payloadStatus);
   const payloadStatusHost = useConnectionStore((s) => s.payloadStatusHost);
+  const consolePower = useConnectionStore((s) => s.power);
+  // The user turned this console's helper off (Stop helper, #471): shown as "Stopped", not as a
+  // missing helper, until they send it again.
+  const helperStopped = useHelperStopped(host);
   const setStatus = useConnectionStore((s) => s.setStatus);
   const storedStep1 = useConnectionStore((s) => s.step1);
   const storedStep1Msg = useConnectionStore((s) => s.step1Msg);
@@ -299,7 +327,16 @@ export default function ConnectionScreen() {
   const step1Msg = transientStep1Msg ?? storedStep1Msg;
   const step2: StepState =
     helperSend?.state ?? transientStep2 ?? storedStep2;
-  const step2Msg = helperSend?.msg ?? transientStep2Msg ?? storedStep2Msg;
+  const step2Msg =
+    helperSend?.msg ??
+    transientStep2Msg ??
+    (helperStopped && payloadStatus !== "up"
+      ? tr(
+          "helper_stopped_status",
+          undefined,
+          "Stopped. You turned the helper off; it stays off until you send it again.",
+        )
+      : storedStep2Msg);
   // Not "ready" while this app is not paired: the helper answers, but every upload would fail
   // with "not paired" (#415). The pairing banner above says what to do.
   const session = useConnectionStore((s) => s.session);
@@ -356,7 +393,16 @@ export default function ConnectionScreen() {
         settleStep2("ok", tr("connection_payload_running", { host }, `Helper is running on ${host}`));
       }
     } else if (payloadStatus === "down" && storedStep2 === "ok") {
-      setStoredStep2("idle", tr("connection_payload_not_loaded", undefined, "Helper not loaded yet"));
+      setStoredStep2(
+        "idle",
+        consolePower === "rest"
+          ? tr(
+              "connection_payload_rest_mode",
+              undefined,
+              "The PS5 went into rest mode. The helper comes back after a wake.",
+            )
+          : tr("connection_payload_not_loaded", undefined, "Helper not loaded yet"),
+      );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [payloadStatus, payloadStatusHost, host]);
@@ -413,7 +459,7 @@ export default function ConnectionScreen() {
   };
   // `target`: the console a check was started for. Its answer can arrive after a tab switch, and
   // then it must only reach this (now hidden) screen, never the selected console's.
-  const settleStep1 = (s: "ok" | "fail" | "idle", msg: string, target?: string) => {
+  const settleStep1 = (s: "ok" | "fail" | "idle" | "rest", msg: string, target?: string) => {
     const store = target ? (st: ConnStep, m: string) => setStep1For(target, st, m) : setStoredStep1;
     if (s === "ok") {
       store("ok", msg);
@@ -456,6 +502,8 @@ export default function ConnectionScreen() {
       );
       return;
     }
+    // Connecting again is the explicit "I want the helper": a "stopped by you" mark goes.
+    clearHelperStopped(target);
     flashStep1(
       "busy",
       tr(
@@ -489,6 +537,25 @@ export default function ConnectionScreen() {
         );
         settleStep1("ok", running, target);
         settleStep2("ok", running, target);
+        return;
+      }
+      // Asleep (DDP 620): nothing listens until it wakes, and the VPN / local-network hints
+      // below would send the user looking for a fault that is not there.
+      if (
+        await checkSaysRest(helper, () =>
+          ddpStatus(target).then((d) => d.code),
+        )
+      ) {
+        useConnectionStore.getState().setHostStatus(target, { power: "rest" });
+        settleStep1(
+          "rest",
+          tr(
+            "connection_rest_mode",
+            undefined,
+            "Your PS5 is in rest mode. Wake it, then check again.",
+          ),
+          target,
+        );
         return;
       }
       // Append the probe's own reason. Without it a name that simply didn't
@@ -600,6 +667,7 @@ export default function ConnectionScreen() {
             </Button>
           </div>
         )}
+        {host.trim() && isTauriEnv() && <BringUpPanel />}
         <StepCard
           index={1}
           title={tr("connection_step1_title", undefined, "Tell the app where your PS5 is")}
@@ -701,16 +769,22 @@ export default function ConnectionScreen() {
             <ElfldrFirstCallout />
             {/* The web UI sends it too: the engine sends its own bundled helper (#415). */}
             {isTauriEnv() && <BundledPayloadBanner />}
-            <Button
-              variant="primary"
-              size="md"
-              leftIcon={<Send size={14} />}
-              onClick={() => void handleSend()}
-              disabled={step2 === "busy"}
-              loading={step2 === "busy"}
-            >
-              {sendButtonLabel(step2, sendPhase, elapsedMs, tr)}
-            </Button>
+            <div className="flex flex-wrap items-start gap-2">
+              <Button
+                variant="primary"
+                size="md"
+                leftIcon={<Send size={14} />}
+                onClick={() => void handleSend()}
+                disabled={step2 === "busy"}
+                loading={step2 === "busy"}
+              >
+                {sendButtonLabel(step2, sendPhase, elapsedMs, tr)}
+              </Button>
+              {/* Turn it off when done (#471); sending it again is the button beside it. */}
+              {step2 === "ok" && payloadStatus === "up" && (
+                <StopHelperButton host={host.trim()} />
+              )}
+            </div>
             {step2 === "busy" && (
               <p className="mt-3 text-xs text-[var(--color-muted)]">
                 {tr(
@@ -757,7 +831,7 @@ export default function ConnectionScreen() {
             cold boot is one button instead of the manual step sequence above.
             Not in the browser: its playlists send ELFs from this machine, which
             the web UI cannot; step 2 sends the helper there. */}
-        {host.trim() && isTauriEnv() && <BringUpPanel />}
+
 
         {/* Power control whenever an address is set, as on Home: Wake is the
             action needed exactly when the console does not answer. */}

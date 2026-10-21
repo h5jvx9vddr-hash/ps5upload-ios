@@ -18,7 +18,7 @@ static struct {
     /* Ids that left the table but whose destroy may still be running (threads joined,
      * journal closed): a create of the same id must not touch the job's directory until
      * the destroy finished. Cleared when the job's last reference is dropped. */
-    uint8_t retiring[AVA1_MAX_JOBS][16];
+    uint8_t retiring[2 * AVA1_MAX_JOBS][16];
     unsigned retiring_n;
 } T = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
@@ -27,9 +27,10 @@ static void retiring_add(const uint8_t id[16]) {
     unsigned i;
     for (i = 0; i < T.retiring_n; i++)
         if (memcmp(T.retiring[i], id, 16) == 0) return;
-    /* Full: `create` refuses while the table is full (see there), so a new id cannot be
-     * unlisted here — this branch is unreachable by construction. */
-    if (T.retiring_n < AVA1_MAX_JOBS) memcpy(T.retiring[T.retiring_n++], id, 16);
+    /* Full: unreachable by construction. `create` lists a job only while fewer than
+     * AVA1_MAX_JOBS ids are retiring (an eviction included, see there), and at most
+     * AVA1_MAX_JOBS jobs are listed, so at most 2 * AVA1_MAX_JOBS - 1 ids ever retire at once. */
+    if (T.retiring_n < 2 * AVA1_MAX_JOBS) memcpy(T.retiring[T.retiring_n++], id, 16);
 }
 
 /* Caller holds T.mu. */
@@ -71,8 +72,39 @@ ava1_job_t *ava1_job_find(const uint8_t id[16]) {
     return j;
 }
 
+/* An upload or download that ended and has nothing left to settle: what it still holds (its threads, its
+ * slot) serves only a late Status or a reopen, and a reopen replays its journal (an upload) or starts over (a
+ * download). A copy, an operation and a send to another console keep their own rules: their status is read
+ * by job id after they end. `concluded_ms` (set after `finished`, once the job's JobDone is out: its last commit
+ * and journal append are behind it) and `unswept_n` are read without j->mu, as in the reaper. */
+static int transfer_ended(const ava1_job_t *j) {
+    return (j->kind == AVA1_JOB_UPLOAD || j->kind == AVA1_JOB_DOWNLOAD) && !j->c2c &&
+           __atomic_load_n(&j->concluded_ms, __ATOMIC_ACQUIRE) && !__atomic_load_n(&j->unswept_n, __ATOMIC_RELAXED) &&
+           /* durable-by-log: settled too, or its last Status{unswept=0} (which the sender waits for) and
+            * the pack segments' removal are still to come between unswept_n reaching 0 and `settled` */
+           (!__atomic_load_n(&j->npsegs, __ATOMIC_RELAXED) || __atomic_load_n(&j->settled, __ATOMIC_ACQUIRE));
+}
+
+/* Caller holds T.mu, and the table is full: the ended transfer nobody else holds (only the table's
+ * reference) that ended longest ago, or -1. A session runs job after job (the Files screen sends a pick of
+ * files one job each, #475), so its ended jobs must make room for the next one rather than answer BUSY. */
+static int evictable_locked(void) {
+    int i, best = -1;
+    for (i = 0; i < AVA1_MAX_JOBS; i++) {
+        ava1_job_t *j = T.jobs[i];
+        if (!j || j->refs != 1 || !transfer_ended(j)) continue;
+        if (best < 0 || __atomic_load_n(&j->concluded_ms, __ATOMIC_ACQUIRE) <
+                            __atomic_load_n(&T.jobs[best]->concluded_ms, __ATOMIC_ACQUIRE))
+            best = i;
+    }
+    return best;
+}
+
+static void unlist(ava1_job_t *j);
+
 static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const uint8_t *sid) {
     ava1_job_t *j = calloc(1, sizeof *j);
+    ava1_job_t *evicted = NULL;
     int i, slot = -1;
     if (!j) return NULL;
     memcpy(j->id, id, 16);
@@ -100,18 +132,27 @@ static ava1_job_t *create(const uint8_t id[16], const uint8_t owner[32], const u
         }
         if (!T.jobs[i] && slot == -1) slot = i;
     }
-    if (slot >= 0)
+    if (slot != -2)
         for (i = 0; i < (int)T.retiring_n; i++)
             if (memcmp(T.retiring[i], id, 16) == 0) {
                 slot = -2; /* the previous job of this id is still being destroyed */
                 break;
             }
-    /* The retiring table is full: this job's own unlist could not be recorded, and the
-     * reopen guard is only complete while every retiring id is listed — refuse rather
-     * than let a create whose destroy would silently lose the guard through. */
-    if (slot >= 0 && T.retiring_n >= AVA1_MAX_JOBS) slot = -2;
+    /* Too many ids retiring: refuse rather than let a create through whose own unlist the
+     * retiring list might not have room for (the reopen guard is only complete while every
+     * retiring id is listed). An eviction adds one, so it needs room for that one as well: a
+     * victim is only destroyed when the create it makes room for goes through. */
+    if (slot != -2 && T.retiring_n + (slot == -1) >= AVA1_MAX_JOBS) slot = -2;
+    if (slot == -1 && (i = evictable_locked()) >= 0) {
+        evicted = T.jobs[i];
+        unlist(evicted); /* its id stays retiring until its destroy below has run */
+        slot = i;
+    }
     if (slot >= 0) T.jobs[slot] = j;
     pthread_mutex_unlock(&T.mu);
+    /* The table's reference, the last one: destroyed (its idle threads joined) on a thread of its
+     * own, so the JobOpen waiting here is not held up by it. */
+    if (evicted) ava1_job_put_nowait(evicted);
     if (slot < 0) {
         pthread_mutex_destroy(&j->mu);
         pthread_mutex_destroy(&j->jnl_mu);
@@ -357,7 +398,18 @@ void ava1_job_reap(uint64_t now_ms) {
          * j->mu: that lock can be held across disk I/O, and waiting for it under T.mu would
          * stall every reader thread's job lookup. It only ever goes 0 -> 1, so a stale read
          * reaps later. */
-        if (!j || j->attached || j->parked_at_ms == 0) continue;
+        if (!j) continue;
+        if (j->attached) {
+            /* An upload or download ends on the session that ran it, and that session goes on to the
+             * next job: the ended one leaves the table 10 s after it ended, as if its session had let go
+             * of it (SPEC.md §11.7), not when the session ends (#475). */
+            if (transfer_ended(j) && now_ms > __atomic_load_n(&j->concluded_ms, __ATOMIC_ACQUIRE) + done_age) {
+                gone[n++] = j;
+                unlist(j);
+            }
+            continue;
+        }
+        if (j->parked_at_ms == 0) continue;
         fin = __atomic_load_n(&j->finished, __ATOMIC_ACQUIRE);
         /* Files still settling (durable-by-log) keep their job alive for the full park age: it owns the
          * sweep, and the engine polls its Status for `unswept`. */
@@ -377,7 +429,9 @@ void ava1_job_reap(uint64_t now_ms) {
         if (j->kind == AVA1_JOB_OPKIND
                 ? (fin && now_ms - j->parked_at_ms > ava1_op_keep_ms(__atomic_load_n(&j->op_delivered, __ATOMIC_ACQUIRE)))
                 : j->kind == AVA1_JOB_COPY || j->c2c
-                ? (fin && now_ms - j->parked_at_ms > age)
+                /* a copy the console page has seen finished (ava1_jobs_release_seen) keeps only the grace */
+                ? (fin && now_ms - j->parked_at_ms >
+                              (__atomic_load_n(&j->op_delivered, __ATOMIC_ACQUIRE) ? ava1_op_keep_ms(1) : age))
                 : (now_ms - j->parked_at_ms > age || (fin && now_ms - j->parked_at_ms > done_age))) {
             gone[n++] = j;
             unlist(j);
@@ -442,6 +496,23 @@ int ava1_job_retire(ava1_job_t *j) {
     }
     ava1_job_put(j); /* the last reference: stops and joins its threads now */
     return 0;
+}
+
+int ava1_job_retire_parked(ava1_job_t *j) {
+    int rc;
+    pthread_mutex_lock(&T.mu);
+    /* `attached` is written under this lock too, so no session can attach between the check
+     * and the unlist; a durable-by-log job still settling owns its sweep and is not cut short. */
+    if (j->attached && listed_locked(j)) rc = -1; /* a session drives it: it stays its owner's */
+    else if (!listed_locked(j) || j->refs != 2 || __atomic_load_n(&j->unswept_n, __ATOMIC_RELAXED)) rc = -2;
+    else {
+        unlist(j);
+        j->refs = 1;
+        rc = 0;
+    }
+    pthread_mutex_unlock(&T.mu);
+    ava1_job_put(j); /* retired: the last reference, so its threads are joined now */
+    return rc;
 }
 
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len) {

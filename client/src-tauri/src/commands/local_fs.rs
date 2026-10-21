@@ -212,61 +212,9 @@ mod tests {
 
 #[cfg(target_os = "android")]
 mod android {
+    use crate::android_jni::{app_context, vm};
     use jni::objects::{GlobalRef, JObject, JString, JValue};
-    use jni::{JNIEnv, JavaVM};
-    use std::ffi::c_void;
-    use std::sync::{Mutex, OnceLock};
-
-    /// JavaVM captured at native-library load.
-    ///
-    /// Tauri 2's Android backend (a Kotlin WryActivity that `loadLibrary`s
-    /// this `.so`) does NOT initialize the `ndk_context` crate's global —
-    /// tao carries its own internal glue and never calls
-    /// `ndk_context::initialize_android_context`. So the old
-    /// `ndk_context::android_context()` here always hit an uninitialized
-    /// global and aborted the whole app on first use ("android context was
-    /// not initialized"). We capture the VM ourselves in `JNI_OnLoad`
-    /// instead — the runtime calls it once when the library loads, before
-    /// any Tauri command can run, and neither wry nor tao defines it.
-    static JVM: OnceLock<JavaVM> = OnceLock::new();
-
-    /// Android runtime entry point, invoked on `System.loadLibrary`.
-    #[no_mangle]
-    pub extern "system" fn JNI_OnLoad(
-        vm: *mut jni::sys::JavaVM,
-        _reserved: *mut c_void,
-    ) -> jni::sys::jint {
-        if let Ok(vm) = unsafe { JavaVM::from_raw(vm) } {
-            let _ = JVM.set(vm);
-        }
-        jni::sys::JNI_VERSION_1_6
-    }
-
-    fn vm() -> Result<&'static JavaVM, String> {
-        JVM.get()
-            .ok_or_else(|| "Android JavaVM unavailable (JNI_OnLoad not run)".to_string())
-    }
-
-    /// The app's Application context — a `Context` we can use for
-    /// `getSystemService` and `startActivity(FLAG_ACTIVITY_NEW_TASK)`.
-    /// Fetched via `ActivityThread.currentApplication()` so we don't need a
-    /// captured Activity (or the unavailable `ndk_context`).
-    fn app_context<'local>(env: &mut JNIEnv<'local>) -> Result<JObject<'local>, String> {
-        let app = env
-            .call_static_method(
-                "android/app/ActivityThread",
-                "currentApplication",
-                "()Landroid/app/Application;",
-                &[],
-            )
-            .map_err(|e| format!("currentApplication: {e}"))?
-            .l()
-            .map_err(|e| format!("application obj: {e}"))?;
-        if app.is_null() {
-            return Err("currentApplication() returned null".into());
-        }
-        Ok(app)
-    }
+    use std::sync::Mutex;
 
     fn sdk_int(env: &mut jni::JNIEnv) -> Result<i32, String> {
         env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")

@@ -39,8 +39,8 @@ ones (`ava1-ctest/tests/mgmt*.rs`, `ps5upload-ava1/tests/mgmt*.rs`). Methods 119
 | AppLaunchBrowser 70 | 52 `app.launch_browser` | `MgmtText` | `src/runtime.c` `handle_app_launch_browser` | `ps5upload-core/src/hw.rs` |  |
 | HwSetFanThreshold 72 | 76 `hw.fan_threshold` | `MgmtText` | `src/runtime.c` `handle_hw_set_fan_threshold` | `ps5upload-core/src/hw.rs` |  |
 | ProcList 74 | 58 `proc.list` | `MgmtText` | `src/runtime.c` `handle_proc_list` | `ps5upload-core/src/hw.rs` |  |
-| FsOpStatus 76 | 17 `job.status` | `JobRef` -> `Status` | `ava1/ava1_data.c` (the data plane) | `ps5upload-core/src/fs_ops.rs` | `ava1-ctest/tests/job_run.rs` `delete_tree_returns_immediately_and_reports_progress`, `status_survives_a_reconnect`; engine `download_copy.rs` `a_console_copy_polls_status_until_done` |
-| FsOpCancel 78 | 18 `job.cancel` | `JobRef` -> empty | `ava1/ava1_data.c` (the data plane) | `ps5upload-core/src/fs_ops.rs` | `ava1-ctest/tests/job_run.rs` `cancel_stops_a_delete_midway_and_the_job_is_collected_after`, `another_device_cannot_see_cancel_or_reuse_an_operation`; engine `download_copy.rs` `a_console_copy_cancel_signals_the_job` |
+| FsOpStatus 76 | 17 `job.status` | `JobRef` -> `Status` | `ava1/ava1_data.c` (the data plane) | `ps5upload-core/src/fs_ops.rs` | `ava1-ctest/tests/job_run.rs` `delete_tree_returns_immediately_and_reports_progress`, `status_survives_a_reconnect`; `c2c.rs` `another_paired_device_reads_and_cancels_a_c2c_send` (a transfer answers any paired device with `CAP_SHARED_JOBS`, SPEC §18.5), `operation_jobs_stay_owner_only`; engine `download_copy.rs` `a_console_copy_polls_status_until_done` |
+| FsOpCancel 78 | 18 `job.cancel` | `JobRef` -> empty | `ava1/ava1_data.c` (the data plane) | `ps5upload-core/src/fs_ops.rs` | `ava1-ctest/tests/job_run.rs` `cancel_stops_a_delete_midway_and_the_job_is_collected_after`, `another_device_cannot_see_cancel_or_reuse_an_operation`; `c2c.rs` `another_paired_device_reads_and_cancels_a_c2c_send`, `operation_jobs_stay_owner_only`; engine `download_copy.rs` `a_console_copy_cancel_signals_the_job` |
 | HwStorage 80 | 75 `hw.storage` | `MgmtText` | `src/runtime.c` `handle_hw_storage` | `ps5upload-core/src/hw.rs` |  |
 | SystemControl 86 | 80 `power.control` | `MgmtText` | `src/runtime.c` `handle_system_control` | `ps5upload-core/src/system_control.rs` |  |
 | PowerTelemetry 88 | 81 `power.telemetry` | `MgmtText` | `src/runtime.c` `handle_power_telemetry` | `ps5upload-core/src/system_control.rs` |  |
@@ -59,7 +59,7 @@ ones (`ava1-ctest/tests/mgmt*.rs`, `ps5upload-ava1/tests/mgmt*.rs`). Methods 119
 | ProcModules 114 | 61 `proc.modules` | `MgmtText` | `src/runtime.c` `handle_proc_modules` | `ps5upload-core/src/diagnostics.rs` |  |
 | ShellExec 116 | 87 `shell.exec` | `MgmtText` | `src/runtime.c` `handle_shell_exec` | `ps5upload-core/src/diagnostics.rs` |  |
 | Crc32File 118 | 20 `job.run (op CRC32)` | `JobRun` -> `Status` (ext `state`, `result`, `code`) | `src/fs_jobs.c` `op_crc32` | `ps5upload-core/src/diagnostics.rs` | `ava1-ctest/tests/job_run.rs` `crc32_of_a_large_file_is_a_job_that_can_be_cancelled`; engine `mgmt_job.rs` `recursive_chmod_hash_crc32_fsck_and_backup_run_as_jobs_with_their_reply_shapes` |
-| AppDbQuery 120 | 56 `app.db_query` | `MgmtText` | `src/runtime.c` `handle_appdb_query` | `ps5upload-core/src/diagnostics.rs` |  |
+| AppDbQuery 120 | 56 `app.db_query` | `MgmtText`; request `{"offset":N,"limit":M}` (both optional, empty = page one), reply adds `offset`, `next`, `more`, `truncated` (#473) | `src/runtime.c` `handle_appdb_query` | `ps5upload-core/src/diagnostics.rs` (pages until `more` is false) |  |
 | NetSpeedTest 122 | 11 `net.speedtest` | `MgmtText` | `src/runtime.c` `handle_net_speed_test` | `ps5upload-core/src/diagnostics.rs` |  |
 | PkgDirectMount 124 | 42 `fs.mount_pkg` | `MgmtText` | `src/runtime.c` `handle_pkg_direct_mount` | `ps5upload-core/src/diagnostics.rs` | host-tested |
 | UfsFsck 126 | 20 `job.run (op FSCK)` | `JobRun` -> `Status` (ext `state`, `result`, `code`) | `src/runtime.c` `handle_ufs_fsck` | `ps5upload-core/src/diagnostics.rs` | `ava1-ctest/tests/job_run.rs` `fsck_keeps_its_ok_false_body_as_the_answer_and_a_frame_error_is_a_failure`; engine `mgmt_job.rs` (same shapes test) |
@@ -122,6 +122,12 @@ ones (`ava1-ctest/tests/mgmt*.rs`, `ps5upload-ava1/tests/mgmt*.rs`). Methods 119
 | AppHiddenList 257 | 143 `app.hidden_list` | `MgmtText` | `src/runtime.c` `handle_app_hidden_list` | `ps5upload-core/src/diagnostics.rs` |  |
 | SaveMount 261 | 145 `save.mount` | `MgmtText` {image} | `src/runtime.c` `handle_save_mount` | `ps5upload-core/src/saves.rs` | opens a save: copies its image under /data, unseals the key through /dev/pfsmgr, mounts it with sceFsMountSaveData at /data/ps5upload/save_mount; an empty image reports what is open |
 | SaveUnmount 263 | 146 `save.unmount` | `MgmtText` {} | `src/runtime.c` `handle_save_unmount` | `ps5upload-core/src/saves.rs` | closes the open save and copies the image back over the real one (`written_back`) |
+| NetPorts 265 | 147 `net.ports` | `MgmtText` {lan} | `src/runtime.c` `handle_net_ports` (`src/net_ports.c`) | `ps5upload-core/src/diagnostics.rs` | the ports held on the console, found by bind() and close (never a connection); `scope` all / console / lan says where each is reachable from |
+| FilesPrefsGet 267 | 148 `files.prefs_get` | `MgmtText` | `src/runtime.c` `handle_files_prefs_get` (`src/files_handoff.c`, `src/files_prefs.c`) | `ps5upload-core/src/console_files.rs` | the console file manager's pinned folders, recent folders and last folder (`/data/ps5upload/files-prefs.json`), as the console page's `/api/files/prefs` answers; `payload/tests/files_handoff_selftest.c` |
+| FilesPrefsSet 269 | 149 `files.prefs_set` | `MgmtText` {op: pin / unpin / visit, path} | `src/runtime.c` `handle_files_prefs_set` (`src/files_handoff.c`, `src/files_prefs.c`) | `ps5upload-core/src/console_files.rs` | one change under the prefs lock, answers the new prefs; a full list or a bad path is an error |
+| FilesHandoffPut 271 | 150 `files.handoff_put` | `MgmtText` {to: console / pc, path} | `src/runtime.c` `handle_files_handoff_put` (`src/files_handoff.c`) | `ps5upload-core/src/console_files.rs` | Show on TV / Show on PC: one slot per direction in helper memory, replaced by the next put, gone after two minutes |
+| FilesHandoffTake 273 | 151 `files.handoff_take` | `MgmtText` {for: console / pc} -> {path, age_ms} or {} | `src/runtime.c` `handle_files_handoff_take` (`src/files_handoff.c`) | `ps5upload-core/src/console_files.rs` | takes (and clears) that direction's handoff |
+| MinionTile 275 | 152 `minion.tile` | `MgmtText` {tile?: bool} -> {tile, tile_busy, tile_failed} | `src/runtime.c` `handle_minion_tile` (`src/webui_api.c`) | `ps5upload-core/src/console_files.rs` | paired tile visibility; preserves LAN access; older helpers return unknown method |
 | UsbEject 259 | 144 `usb.eject` | `MgmtText` | `src/runtime.c` `handle_usb_eject` | `ps5upload-core/src/fs_ops.rs` | unmounts `/mnt/usbN` so the drive can be pulled; plain unmount, or `force` (after a sync) since the shell's own services keep the drive open (EBUSY on FW 13.60) |
 | — | 21 `job.list` | empty -> `JobListResult` | `ava1/ava1_data.c` (the data plane) | none | `ava1-ctest/tests/job_run.rs` `repeat_job_run_is_idempotent`, `at_most_eight_operations_run_at_once_and_an_unknown_op_is_refused` (listing); no engine caller yet |
 | — | 34 `fs.stat` | `FsPath` -> `FsStat` | native `src/mgmt_fs.c` `mgmt_run_fs_stat` | none | host-tested |
@@ -155,6 +161,8 @@ detect truncation (SPEC §7.3): a buffer smaller than the answer is `ERR_INTERNA
 | app.icon_set | <= 1 KiB | fits |
 | app.hidden_list | 16 KiB | fits |
 | usb.eject | <= 0.3 KiB | fits |
+| files.prefs_get, files.prefs_set | 64 KiB (`FILES_PREFS_FILE_MAX`) | fits |
+| files.handoff_put, files.handoff_take | <= 6.2 KiB (`FILES_HANDOFF_OUT_MAX`) | fits |
 | app.db_query | 64 KiB | fits |
 | proc.focus | 8 KiB | fits |
 | proc.list | 64 KiB | fits |

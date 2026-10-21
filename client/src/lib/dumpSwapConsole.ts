@@ -48,7 +48,11 @@ export function consoleSwapDeps(host: string): SwapDeps {
     // A dump SMP or ps5upload registered has an app folder; appUnregister removes it (and
     // leaves the saves, measured on FW 5.10).
     isRegistered: (titleId) => fsPathExists(tx, `/user/app/${titleId}`),
-    unregister: (titleId) => appUnregister(tx, titleId),
+    // Installing over a title the PS5 still lists can wipe it; a swap undoes instead (#476).
+    unregister: async (titleId) => {
+      const { stillPresent } = await appUnregister(tx, titleId);
+      if (stillPresent) throw new Error(`${titleId} is still on the console`);
+    },
     // Through the console queue, like every install; Stream & install is the reliable route.
     install: (packagePath) => pkgLibraryStore(host).getState().installStream(packagePath, host),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),

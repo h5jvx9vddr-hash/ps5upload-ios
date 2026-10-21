@@ -247,12 +247,103 @@ pub struct AppDbList {
     /// a caller that sees a blank name knows whether to believe it.
     #[serde(default)]
     pub source: Option<String>,
+    /// One page's window (#473): the first row it holds, the row the next page starts at, and
+    /// whether one follows. Absent from an older helper, which answers one unpaged reply, and
+    /// from the list [`appdb_query`] returns, which is every page joined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub more: Option<bool>,
+    /// The table's row count when the page was read (SQL reader only). A change between pages
+    /// means rows moved under the walk, so one may have been skipped: the list is truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// True when app.db holds rows this list does not: the helper could not deliver them, a
+    /// page failed (`err` says why), the page bound was reached, or an older helper answered
+    /// a full 256 rows (its old cap, which it could not report). A truncated list is never
+    /// proof that a title is absent.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
-/// Query app.db for the title_id ↔ app_id ↔ name mapping.
+/// The most app.db pages [`appdb_query`] reads. A page holds up to 512 rows, so this is
+/// far past any real console; it bounds the loop against a helper that never says it is done.
+pub const APPDB_MAX_PAGES: usize = 32;
+
+/// The row count an older, unpaged helper stopped at without saying so.
+const APPDB_LEGACY_CAP: usize = 256;
+
+/// Query app.db for the title_id ↔ app_id ↔ name mapping: every page of it (#473).
+///
+/// The helper answers a window (`{"offset":N}` in; `next`, `more` and `truncated` out); this
+/// follows it until `more` is false, at most [`APPDB_MAX_PAGES`] calls. An older helper ignores
+/// the window and answers once, which is then the whole answer. Whatever stops the walk early
+/// sets `truncated` on the result, so callers can tell a partial list from a complete one:
+/// a failure after the first page keeps the rows read so far, with the reason in `err`.
 pub fn appdb_query(addr: &str) -> Result<AppDbList> {
-    let resp = mgmt::call(addr, m::APP_DB_QUERY, &[])?;
-    Ok(serde_json::from_slice(&resp)?)
+    let mut list: Option<AppDbList> = None;
+    let mut offset: u64 = 0;
+    for _ in 0..APPDB_MAX_PAGES {
+        let body = serde_json::json!({ "offset": offset }).to_string();
+        let page = mgmt::call(addr, m::APP_DB_QUERY, body.as_bytes())
+            .and_then(|resp| Ok(serde_json::from_slice::<AppDbList>(&resp)?));
+        let mut page = match (page, list.as_mut()) {
+            (Ok(p), _) => p,
+            // Page one failing is the call failing, as it always was.
+            (Err(e), None) => return Err(e),
+            (Err(e), Some(l)) => {
+                l.truncated = true;
+                l.err = Some(format!("app.db page at row {offset}: {e:#}"));
+                break;
+            }
+        };
+        let paged = page.more.is_some() || page.next.is_some();
+        let more = page.more.unwrap_or(false);
+        let next = page.next.unwrap_or(offset + page.apps.len() as u64);
+        let got = page.apps.len();
+        let total_moved = match (list.as_ref().and_then(|l| l.total), page.total) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        let page_truncated = page.truncated
+            || total_moved
+            || (!paged && got >= APPDB_LEGACY_CAP)
+            // A page that claims more but does not move forward would loop.
+            || (more && next <= offset);
+        match list.as_mut() {
+            None => {
+                page.truncated = page_truncated;
+                list = Some(page);
+            }
+            Some(l) => {
+                l.apps.append(&mut page.apps);
+                l.truncated |= page_truncated;
+                if page.err.is_some() {
+                    l.err = page.err.take();
+                    l.truncated = true;
+                }
+            }
+        }
+        let l = list.as_mut().expect("set above");
+        if !paged || !more || next <= offset || l.err.is_some() {
+            l.offset = None;
+            l.next = None;
+            l.more = None;
+            l.total = None;
+            return Ok(list.expect("set above"));
+        }
+        offset = next;
+    }
+    // Here only when a later page failed or the page bound ran out with pages still to read.
+    let mut l = list.expect("APPDB_MAX_PAGES > 0");
+    l.truncated = true;
+    l.offset = None;
+    l.next = None;
+    l.more = None;
+    l.total = None;
+    Ok(l)
 }
 
 /// One (key, value) row of appinfo.db for a title.
@@ -695,5 +786,109 @@ mod hidden_icons_tests {
         assert_eq!(list_err.error.as_deref(), Some("cannot read app.db"));
         let done: HiddenIcons = serde_json::from_str(r#"{"ok":true,"err":null}"#).unwrap();
         assert!(done.ok && done.error.is_none());
+    }
+}
+
+/// One port held on the console (`net.ports`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConsolePort {
+    pub port: u16,
+    /// `tcp` or `udp`.
+    pub proto: String,
+    /// `all` (reachable from the network), `console` (127.0.0.1 only), `lan` (the LAN address
+    /// only: most often an outgoing connection) or `busy` (held; where was not checked).
+    pub scope: String,
+    /// What usually listens there, when the port is a well-known one; a guess by number only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// For a well-known port, whether it serves a web page. `false` keeps the app from pointing
+    /// a browser at a loader or the helper (a stray HTTP request is not what they expect).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<bool>,
+}
+
+/// The helper's answer to `net.ports`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConsolePorts {
+    #[serde(default)]
+    pub ports: Vec<ConsolePort>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// Who usually listens on a port, by number alone (payload defaults and Sony's own services).
+pub fn known_port_name(port: u16, proto: &str) -> Option<&'static str> {
+    use crate::payload_lifecycle::{INSTALLER_PORT, PS5_LOADER_PORT};
+    let tcp = proto == "tcp";
+    Some(match port {
+        p if p == PS5_LOADER_PORT && tcp => "elfldr (payload loader)",
+        // The helper's AVA1 port (ava1::gen::DEFAULT_PORT; this crate does not link ava1).
+        9120 if tcp => "ps5upload helper",
+        p if p == INSTALLER_PORT && tcp => "ps5upload installer",
+        p if p == crate::payload_manager::PAYLOAD_MANAGER_PORT && tcp => "Payload Manager",
+        p if p == crate::rp_regist::REGIST_PORT => "Remote Play",
+        p if p == crate::ddp::DDP_PORT && !tcp => "PS5 discovery",
+        53 if !tcp => "nanodns (DNS)",
+        2121 if tcp => "ftpsrv (FTP)",
+        2159 if tcp => "gdbsrv (debugger)",
+        5353 if !tcp => "mDNS",
+        8080 if tcp => "websrv",
+        8090 if tcp => "HearBridge",
+        9180 if tcp => "PS5Upload Minion",
+        12800 if tcp => "DPI installer bridge",
+        _ => return None,
+    })
+}
+
+/// Whether a well-known port serves a web page (Payload Manager's UI, websrv, HearBridge,
+/// the helper's PS5Upload Minion page).
+pub fn known_port_is_web(port: u16) -> bool {
+    port == crate::payload_manager::PAYLOAD_MANAGER_PORT || matches!(port, 8080 | 8090 | 9180)
+}
+
+/// The ports held on the console. The helper finds them by binding each port and closing it
+/// at once, never by connecting, so no payload sees a client. `addr` is `host:port` of the
+/// helper; its IPv4 address is what the LAN check binds.
+pub fn console_ports(addr: &str) -> Result<ConsolePorts> {
+    // A bare host (no port) resolves with a placeholder one.
+    let lan = crate::net::resolve_connect_targets(addr)
+        .or_else(|_| crate::net::resolve_connect_targets(&format!("{addr}:0")))
+        .ok()
+        .and_then(|v| v.into_iter().find(|sa| sa.is_ipv4()))
+        .map(|sa| sa.ip().to_string())
+        .unwrap_or_default();
+    let body = serde_json::json!({ "lan": lan }).to_string();
+    let resp = mgmt::call(addr, m::NET_PORTS, body.as_bytes())?;
+    let mut out: ConsolePorts = serde_json::from_slice(&resp)?;
+    for p in &mut out.ports {
+        p.name = known_port_name(p.port, &p.proto).map(str::to_string);
+        p.web = p.name.as_ref().map(|_| known_port_is_web(p.port));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod console_ports_tests {
+    use super::*;
+
+    #[test]
+    fn helper_answer_parses_and_known_ports_are_named() {
+        let raw = br#"{"ok":true,"ports":[{"port":9021,"proto":"tcp","scope":"all"},{"port":53,"proto":"udp","scope":"all"},{"port":41800,"proto":"tcp","scope":"console"}],"elapsed_ms":885}"#;
+        let r: ConsolePorts = serde_json::from_slice(raw).unwrap();
+        assert_eq!(r.ports.len(), 3);
+        assert_eq!(r.elapsed_ms, 885);
+        assert!(!r.truncated);
+        assert_eq!(
+            known_port_name(9021, "tcp"),
+            Some("elfldr (payload loader)")
+        );
+        assert_eq!(known_port_name(53, "udp"), Some("nanodns (DNS)"));
+        // By number and protocol: DNS over TCP on 53 is not nanodns.
+        assert_eq!(known_port_name(53, "tcp"), None);
+        assert_eq!(known_port_name(41800, "tcp"), None);
+        assert!(known_port_is_web(8084));
+        assert!(!known_port_is_web(9021));
     }
 }

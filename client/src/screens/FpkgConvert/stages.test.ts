@@ -150,4 +150,18 @@ describe("stageRows", () => {
     );
     expect(plain.map((r) => r.stage)).not.toContain("pack");
   });
+
+  it("a folder build writes then reads back, reading a server image or package in place", () => {
+    for (const source of ["/g/Game.ffpfsc", "remote://nas-1/g/Game.pkg", "ps5://10.0.0.2/data/g.exfat"]) {
+      const rows = stageRows(
+        { phase: "running", ...base, source, mode: "folder", stage: "verify", stageDone: 3, stageTotal: 6, stageMs: { write: 7 } },
+        null,
+      );
+      expect(rows.map((r) => [r.stage, r.state])).toEqual([
+        ["write", "done"],
+        ["verify", "active"],
+      ]);
+      expect(rows[1]).toMatchObject({ done: 3, total: 6 });
+    }
+  });
 });

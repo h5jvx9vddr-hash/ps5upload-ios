@@ -1,4 +1,6 @@
+import { MinionSettings } from "./MinionSettings";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { writeClipboard } from "../../lib/clipboard";
 import { EMPTY_CORPUS, deleteFakelibSet, loadFakelibCorpus, type FakelibCorpus } from "../../state/fakelibCorpus";
 import { LibrarySourcePicker } from "../InstalledApps/LibrarySourcePicker";
 import {
@@ -507,6 +509,10 @@ export default function SettingsScreen() {
         <GroupHeading>
           {tr("settings_group_general", undefined, "General")}
         </GroupHeading>
+
+        <Section title={tr("cw_settings_app_name", undefined, "PS5Upload Minion")}>
+          <MinionSettings />
+        </Section>
 
         <Section title={tr("language", undefined, "Language")}>
           <Select
@@ -1801,7 +1807,25 @@ function UpdatesPanel() {
           </div>
           <ol className="list-inside list-decimal space-y-0.5 text-[var(--color-muted)]">
             <li>{tr("update_step_quit", undefined, "Quit PS5Upload.")}</li>
-            <li>{pickInstallHint(phase.download.path, tr)}</li>
+            {phase.download.install_command ? (
+              <li>
+                {tr("update_step_run_command", undefined, "Run this in a terminal:")}
+                <span className="mt-1 flex items-start gap-2">
+                  <code className="min-w-0 flex-1 break-all rounded bg-[var(--color-surface-3)] px-2 py-1 font-mono text-[var(--color-text)]">
+                    {phase.download.install_command}
+                  </code>
+                  <button
+                    type="button"
+                    className="shrink-0 underline-offset-2 hover:underline"
+                    onClick={() => void writeClipboard(phase.download.install_command ?? "")}
+                  >
+                    {tr("copy", undefined, "Copy")}
+                  </button>
+                </span>
+              </li>
+            ) : (
+              <li>{pickInstallHint(phase.download.path, tr)}</li>
+            )}
             <li>
               {tr("update_step_launch", undefined, "Launch the new version.")}
             </li>

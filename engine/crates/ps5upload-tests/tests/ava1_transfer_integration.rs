@@ -767,10 +767,14 @@ fn assert_throughput(label: &str, bytes: usize, elapsed: Duration) {
         bytes / (1024 * 1024),
         elapsed.as_secs_f64()
     );
-    assert!(
-        rate >= FLOOR_MIB_PER_SEC,
-        "{label}: {rate:.1} MiB/s < floor {FLOOR_MIB_PER_SEC} MiB/s"
-    );
+    // LLVM instrumentation changes transfer throughput. Keep exercising transfers and
+    // checking their byte counts under coverage; enforce speed on normal CI builds.
+    if std::env::var_os("CARGO_LLVM_COV").is_none() {
+        assert!(
+            rate >= FLOOR_MIB_PER_SEC,
+            "{label}: {rate:.1} MiB/s < floor {FLOOR_MIB_PER_SEC} MiB/s"
+        );
+    }
 }
 
 /// Ports `ci_throughput_gate_single_file_32mib`.

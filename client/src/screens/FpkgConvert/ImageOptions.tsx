@@ -1,4 +1,4 @@
-import { Button } from "../../components";
+import { Button, Toggle } from "../../components";
 import type { AmprPacksReadiness, ImageFormat } from "../../api/fpkg";
 import { DEFAULT_VERIFY_CHUNK_KIB, VERIFY_CHUNK_KIB, useConvertPrefs } from "../../state/convertPrefs";
 import { useTr } from "../../state/lang";
@@ -89,6 +89,15 @@ function Lz4Option({ lz4 }: { lz4: Lz4Choice }) {
             "fpkg.image.lz4_no_ampr",
             undefined,
             "This game does not read its files through AMPR, so nothing in it could serve asset packs. Compress it into a .ffpfsc instead: ShadowMount+ decompresses that for any game.",
+          )}
+        </div>
+      ) : refusal && kind === "runtime" ? (
+        // The checkbox above fixes this one: say so, rather than that packs are unavailable (#449).
+        <div className="text-xs text-[var(--color-warn)]">
+          {tr(
+            "fpkg.image.lz4_needs_runtime",
+            { reason: refusal },
+            "Tick “Put ampr_emu 0.4.2.1 into the image” above to use packs: {reason}",
           )}
         </div>
       ) : refusal ? (
@@ -231,6 +240,28 @@ export function ImageChoice({
   );
 }
 
+/** Fast (off, the default) or full verification of what Convert wrote: a package, an image or
+ *  a compressed image. Fast always checks structure and sizes, whole small files and a random
+ *  sample of the rest; full re-reads every byte. */
+export function FullVerifyOption({ disabled }: { disabled?: boolean }) {
+  const tr = useTr();
+  const full = useConvertPrefs((s) => s.fullVerify);
+  const set = useConvertPrefs((s) => s.setFullVerify);
+  return (
+    <Toggle
+      checked={full}
+      onChange={set}
+      disabled={disabled}
+      label={tr("fpkg.image.full_verify", undefined, "Full verification")}
+      hint={tr(
+        "fpkg.image.full_verify_body",
+        undefined,
+        "Re-reads every byte of the output to check it. Takes longer",
+      )}
+    />
+  );
+}
+
 /** How much the read-back check reads per call. Measured on a 10 GB image: 1–32 MiB are
  *  within 15% of each other once the reader fetches whole runs of clusters, and 8 MiB was
  *  fastest; the choice is here for anyone whose disk says otherwise. */
@@ -248,7 +279,7 @@ function VerifyChunkOption() {
           {tr(
             "fpkg.image.verify_chunk_body",
             undefined,
-            "After writing, the image is read back and every file hash-checked. 8 MiB was fastest in measurement; try another if your disk disagrees. The check itself is the same at any size.",
+            "After writing, the image is read back and checked. 8 MiB was fastest in measurement; try another if your disk disagrees. The check itself is the same at any size.",
           )}
         </span>
       </span>

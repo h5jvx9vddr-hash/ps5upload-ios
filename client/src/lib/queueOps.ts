@@ -144,6 +144,10 @@ export function resetRunningToPending<
         // persisted as a pending row with `recovering:true`.
         recovering: false,
         recoverAttempt: 0,
+        // It had started: the row says so and offers to resume, instead of
+        // looking like an item that never ran.
+        interrupted: true,
+        stalledForMs: null,
       };
     }
     return it;

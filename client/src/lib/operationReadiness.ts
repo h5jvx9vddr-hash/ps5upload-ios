@@ -22,6 +22,10 @@ export interface OperationReadiness {
  * Connectivity is not a single boolean: local work only needs the engine,
  * console reads/writes need the helper, and privileged system changes also
  * need verified kernel R/W. */
+/** The blocker for a console whose helper does not answer; callers that know why (rest mode)
+ * swap it for a better reason. */
+export const HELPER_NOT_CONNECTED = "The PS5 helper is not connected.";
+
 export function evaluateOperationReadiness(
   operation: Operation,
   context: ReadinessContext,
@@ -32,7 +36,7 @@ export function evaluateOperationReadiness(
   if (!context.engineUp) blockers.push("The ps5upload engine is offline.");
   if (operation !== "local-only") {
     if (!context.host.trim()) blockers.push("No PS5 is selected.");
-    if (!context.helperUp) blockers.push("The PS5 helper is not connected.");
+    if (!context.helperUp) blockers.push(HELPER_NOT_CONNECTED);
   }
   if (operation === "manage-system") {
     if (context.kernelRw === false) {

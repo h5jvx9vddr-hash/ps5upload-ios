@@ -11,7 +11,7 @@ import {
   type ActivityKind,
   type ActivityPhase,
 } from "./activityHistory";
-import { setTransferKeepAwake } from "../lib/keepAwakeHold";
+import { setBackgroundWorkHold, setTransferKeepAwake } from "../lib/keepAwakeHold";
 import { anyAwakeWork } from "../lib/awakeWork";
 import { useTaskStore } from "./tasks";
 
@@ -68,7 +68,15 @@ export function installActivityWiring() {
     if (anyAwakeWork(useTaskStore.getState().tasks)) return true;
     return false;
   };
-  const reconcileKeepAwake = () => setTransferKeepAwake(anyTransferActive());
+  // The host's background-work hold (#457) also covers a queue between items: its
+  // drain loop is running but no item is, for the settle delay before the next.
+  const queueDraining = (): boolean =>
+    Object.values(useUploadQueueStore.getState().runningHosts).some(Boolean);
+  const reconcileKeepAwake = () => {
+    const active = anyTransferActive();
+    setTransferKeepAwake(active);
+    setBackgroundWorkHold(active || queueDraining());
+  };
   useTaskStore.subscribe(reconcileKeepAwake);
   useTransferStore.subscribe(reconcileKeepAwake);
   useFsDownloadOpStore.subscribe(reconcileKeepAwake);

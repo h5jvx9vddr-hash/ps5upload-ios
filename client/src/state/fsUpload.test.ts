@@ -439,4 +439,209 @@ describe("runFsUpload", () => {
     await first;
     expect(e.started).toHaveLength(1);
   });
+
+  describe("a pick of several files as ONE file-list job", () => {
+    const TX = "ab".repeat(16);
+    const listStep = (names: string[]) => ({
+      kind: "list" as const,
+      txId: TX,
+      files: names.map((n) => ({ src: `/pc/${n}`, name: n })),
+    });
+    /** The fake engine plus a file-list route that records each start. */
+    function withList(e: ReturnType<typeof fakeEngine>) {
+      const lists: { destRoot: string; files: { src: string; dest: string }[]; txId: string }[] = [];
+      e.deps.startList = async (destRoot, files, _addr, txId) => {
+        lists.push({ destRoot, files, txId });
+        e.started.push({ kind: "file", src: `list:${files.length}`, dest: destRoot });
+        return `job-${e.started.length}`;
+      };
+      return lists;
+    }
+    const runSteps = (
+      e: ReturnType<typeof fakeEngine>,
+      steps: import("./fsUploadPlan").FsUploadStep[],
+    ) =>
+      runFsUpload(
+        { host: HOST, addr: HOST, destDir: "/data/x", srcPaths: [], steps },
+        e.deps,
+      );
+
+    it("starts one job for the whole list, each file at its (possibly renamed) name", async () => {
+      const e = fakeEngine();
+      const lists = withList(e);
+      const step = listStep(["a.bin", "b (2).bin"]);
+      const r = await runSteps(e, [step]);
+      expect(r.ok).toBe(true);
+      expect(lists).toEqual([
+        {
+          destRoot: "/data/x",
+          txId: TX,
+          files: [
+            { src: "/pc/a.bin", dest: "/data/x/a.bin" },
+            { src: "/pc/b (2).bin", dest: "/data/x/b (2).bin" },
+          ],
+        },
+      ]);
+      const tasks = useTaskStore.getState().tasks;
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0].status).toBe("done");
+      expect(tasks[0].label).toBe("a.bin +1");
+    });
+
+    it("shows overall bytes, the file the sender is on, and how many are finished", async () => {
+      const e = fakeEngine({
+        "job-1": [
+          {
+            status: "running",
+            bytes_sent: 30,
+            total_bytes: 90,
+            files_processing: 2,
+            files_finalized: 1,
+          } as Snap,
+        ],
+      });
+      withList(e);
+      const release = e.hold();
+      const p = runSteps(e, [listStep(["c", "a", "b"])]);
+      await new Promise((r) => setTimeout(r, 0));
+      release();
+      // One poll later the running snapshot has been applied.
+      let seen: unknown = null;
+      e.deps.sleep = async () => {
+        seen = fsUploadForHost(useFsUploadStore.getState(), HOST).active;
+      };
+      await p;
+      expect(seen).toMatchObject({ name: "b", index: 1, count: 3, sent: 30, total: 90 });
+    });
+
+    it("a failure keeps the list whole under its id, and says which files did not land", async () => {
+      const e = fakeEngine({
+        "job-1": [
+          { status: "running", bytes_sent: 1, total_bytes: 9, files_count: 3 } as Snap,
+          { status: "failed", error: "disk full", error_reason: "ava1_no_space" } as Snap,
+        ],
+      });
+      const lists = withList(e);
+      e.deps.jobFiles = async () => [
+        { rel_path: "a", size: 1 },
+        { rel_path: "b", size: 2 },
+        { rel_path: "c", size: 3 },
+      ];
+      e.deps.listDir = async () => [
+        { name: "a", kind: "file", size: 1 },
+        { name: "b", kind: "file", size: 0 },
+      ];
+      const step = listStep(["a", "b", "c"]);
+      const r = await runSteps(e, [step, { kind: "one", src: "/pc/after", name: "after" }]);
+      expect(r.ok).toBe(false);
+      const st = fsUploadForHost(useFsUploadStore.getState(), HOST).stopped;
+      expect(st).toMatchObject({
+        why: "failed",
+        doneCount: 1,
+        stepsDone: 0,
+        count: 4,
+        name: "b",
+        notLanded: ["b", "c"],
+      });
+      expect(st?.steps?.[0]).toEqual(step);
+      // Resume: the same list under the same id (the console's journal skips "a").
+      await resumeFsUpload(HOST, e.deps);
+      expect(lists.map((l) => l.txId)).toEqual([TX, TX]);
+      expect(lists[1].files).toEqual(lists[0].files);
+      expect(e.started.map((x) => x.src)).toEqual(["list:3", "list:3", "/pc/after"]);
+    });
+
+    it("a dropped connection retries the same list under the same id", async () => {
+      const e = fakeEngine({
+        "job-1": [{ status: "failed", error: "connection reset" } as Snap],
+      });
+      const lists = withList(e);
+      e.deps.shouldRetry = () => true;
+      const r = await runSteps(e, [listStep(["a", "b"])]);
+      expect(r.ok).toBe(true);
+      expect(lists.map((l) => l.txId)).toEqual([TX, TX]);
+    });
+
+    it("cancel ends the one job; the stop is resumable and names what is missing", async () => {
+      const e = fakeEngine({
+        "job-1": [{ status: "running", bytes_sent: 1, total_bytes: 9 } as Snap],
+      });
+      withList(e);
+      e.deps.listDir = async () => [{ name: "a", kind: "file", size: 4 }];
+      const release = e.hold();
+      const p = runSteps(e, [listStep(["a", "b"])]);
+      await new Promise((r) => setTimeout(r, 0));
+      cancelFsUpload(HOST, e.deps);
+      e.deps.jobStatus = async () => ({ status: "failed", error: "cancelled" }) as Snap;
+      release();
+      const r = await p;
+      expect(r.ok).toBe(false);
+      expect(e.cancelled).toEqual(["job-1"]);
+      expect(fsUploadForHost(useFsUploadStore.getState(), HOST).stopped).toMatchObject({
+        why: "user",
+        error: "",
+        doneCount: 1,
+        notLanded: ["b"],
+      });
+    });
+
+    it("an engine without the file-list route: the list goes file by file, names kept", async () => {
+      const e = fakeEngine();
+      e.deps.startList = async () => {
+        throw new Error("engine HTTP 404 Not Found: (empty body)");
+      };
+      const r = await runSteps(e, [listStep(["a.bin", "b (2).bin"])]);
+      expect(r.ok).toBe(true);
+      expect(e.started).toEqual([
+        { kind: "file", src: "/pc/a.bin", dest: "/data/x/a.bin" },
+        { kind: "file", src: "/pc/b (2).bin", dest: "/data/x/b (2).bin" },
+      ]);
+      // Never asked whether a list file is a folder: it is a file by construction.
+    });
+
+    it("no file-list support wired at all: file by file too", async () => {
+      const e = fakeEngine();
+      const r = await runSteps(e, [listStep(["a", "b"])]);
+      expect(r.ok).toBe(true);
+      expect(e.started.map((x) => x.dest)).toEqual(["/data/x/a", "/data/x/b"]);
+    });
+
+    it("tells a missing route from a real error", async () => {
+      const { listUnsupported } = await import("./fsUpload");
+      expect(listUnsupported(new Error("engine HTTP 404 Not Found: (empty body)"))).toBe(true);
+      expect(listUnsupported(new Error("engine HTTP 405"))).toBe(true);
+      expect(listUnsupported(new Error("engine HTTP 500: helper said 404"))).toBe(false);
+      expect(listUnsupported(new Error("command transfer_file_list not found"))).toBe(true);
+      expect(listUnsupported(new Error("engine returned invalid JSON: expected value"))).toBe(false);
+      expect(listUnsupported(new Error("source not found (404 on the server)"))).toBe(false);
+      expect(listUnsupported(new Error("engine HTTP 400: files list is empty"))).toBe(false);
+      expect(listUnsupported(new Error("console unreachable"))).toBe(false);
+    });
+
+    it("a real start error is not taken for a missing route", async () => {
+      const e = fakeEngine();
+      e.deps.startList = async () => {
+        throw new Error("source not found: /pc/a");
+      };
+      const r = await runSteps(e, [listStep(["a", "b"])]);
+      expect(r.ok).toBe(false);
+      expect(e.started).toEqual([]);
+    });
+
+    it("an interrupted list comes back whole after a restart, and resumes on its job", async () => {
+      const e = fakeEngine({
+        "job-1": [{ status: "running", bytes_sent: 1, total_bytes: 9 } as Snap],
+      });
+      withList(e);
+      const release = e.hold();
+      void runSteps(e, [listStep(["a", "b"])]);
+      await new Promise((r) => setTimeout(r, 0));
+      useFsUploadStore.setState({ byHost: {} });
+      restoreFsUploads();
+      const st = fsUploadForHost(useFsUploadStore.getState(), HOST).stopped;
+      expect(st).toMatchObject({ why: "interrupted", jobId: "job-1", count: 2 });
+      expect(st?.steps?.[0]).toMatchObject({ kind: "list", txId: TX });
+      release();
+    });
+  });
 });

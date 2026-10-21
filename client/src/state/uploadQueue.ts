@@ -60,6 +60,8 @@ import type { UploadStrategy } from "./transfer";
 import { useUploadSettingsStore } from "./uploadSettings";
 import { useRecentHostMetricsStore } from "./recentHostMetrics";
 import { pushNotification } from "./notifications";
+import { sleep } from "../lib/wakeableSleep";
+import { labelEngineJob } from "../lib/bgWork";
 import { withConsolePrefix } from "./roster";
 import { hostOf, mgmtAddr } from "../lib/addr";
 import { log } from "./logs";
@@ -108,7 +110,9 @@ import {
   MAX_AUTO_RECOVER_ATTEMPTS,
   PostUploadStepError,
   shouldAutoRecover,
+  shouldParkForWake,
 } from "../lib/uploadRecovery";
+import { useConnectionStore } from "./connection";
 import { startPs5ToPs5 } from "../api/ava1";
 import { isTauriEnv } from "../lib/tauriEnv";
 import { createQueueLeader } from "../lib/queueLeader";
@@ -197,6 +201,10 @@ export interface QueueItem {
   route?: "auto" | "direct" | "relay";
   /** `ps5` items only (#444): what the sending console dials, when not the receiver's address. */
   directAddr?: string | null;
+  /** `ps5` items only (#444): a send another device started, adopted under its id on the next
+   *  start: `take` ends it there and sends from here, `watch` follows it while it runs direct.
+   *  Cleared once the engine has it, so a later retry is an ordinary resume. */
+  adopt?: "take" | "watch" | null;
   strategy: UploadStrategy;
   reconcileMode: ReconcileMode;
   excludes: string[];
@@ -274,6 +282,16 @@ export interface QueueItem {
    *  this id, so Stop and Start continue from the console's journal. */
   txIdHex: string;
   status: QueueItemStatus;
+  /** It was running when it was stopped or the app closed: it is waiting with its console-side
+   *  progress kept, and starting it continues from there. Cleared when it runs again. */
+  interrupted?: boolean;
+  /** Parked because the console went into rest mode: the row waits (pending) for the PS5 to
+   *  wake and resumes by itself on the helper-up edge after it (resumeFailedRecoverable). Not
+   *  a failure and not a spent recovery attempt. Cleared when it runs again. */
+  waitingForWake?: boolean;
+  /** While running: how long nothing has moved, once that is STALL_AFTER_MS or more (the row then
+   *  offers to restart the transfer, which resumes). Null otherwise. */
+  stalledForMs?: number | null;
   /** Live progress while running, final count when done, 0 otherwise. */
   bytesSent: number;
   /** Total bytes the engine pre-stat'd for this source. 0 until first
@@ -376,7 +394,11 @@ export type AddQueueItem = Pick<
   | "deletePkgAfterInstall"
   | "install"
   | "deleteSourceAfterUpload"
->;
+  | "adopt"
+> & {
+  /** Keep this job id instead of minting one: a send another device started (#444). */
+  txIdHex?: string;
+};
 
 interface QueueState {
   items: QueueItem[];
@@ -427,6 +449,9 @@ interface QueueState {
   moveDown: (id: string) => void;
   clear: () => void;
   retryFailed: () => void;
+  /** Stops a running (stalled) upload and starts it again; it continues from what the console
+   *  already holds. Not for installs, which cannot be stopped. */
+  restartItem: (id: string) => void;
   /** Retry one failed row. Returns false when the row is missing/not failed. */
   retryItem: (id: string) => boolean;
   /** Retry one archive row that failed for a missing or wrong password, with the password
@@ -455,10 +480,12 @@ interface QueueState {
   stop: () => void;
   /** Start (or no-op if already running) just one console's drain loop. */
   /** `installsOnly` / `onlyIds` limit the run to what a click just added (installs, or
-   *  these items); uploads waiting for Start stay waiting. Start with neither runs everything. */
+   *  these items); uploads waiting for Start stay waiting. Start with neither runs everything.
+   *  `unattended`: nobody clicked for this run (wake resume, re-attaching after a restart), so it
+   *  never sends a helper the user stopped (#471). */
   startHost: (
     host: string,
-    opts?: { installsOnly?: boolean; onlyIds?: string[] },
+    opts?: { installsOnly?: boolean; onlyIds?: string[]; unattended?: boolean },
   ) => Promise<void>;
   /** Stop just one console; siblings keep running. */
   stopHost: (host: string) => void;
@@ -470,6 +497,8 @@ interface QueueDocument {
 }
 
 const POLL_INTERVAL_MS = 500;
+/** No new bytes for this long while sending (not while the console finalizes): say so on the row. */
+const STALL_AFTER_MS = 90_000;
 const SAVE_DEBOUNCE_MS = 300;
 
 function newId(): string {
@@ -481,11 +510,16 @@ function newId(): string {
 /** Distinct console hosts (bare IP, port-stripped) among the pending items,
  *  in first-seen order. The per-console parallel runner spawns one drain
  *  loop per host. Pure — exported for tests. */
-export function distinctPendingHosts(items: QueueItem[]): string[] {
+export function distinctPendingHosts(
+  items: QueueItem[],
+  opts: { includeWaitingForWake?: boolean } = {},
+): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const it of items) {
     if (it.status !== "pending") continue;
+    // A row parked for a sleeping console waits for the wake, not for the next Start-all pass.
+    if (it.waitingForWake && opts.includeWaitingForWake === false) continue;
     const h = hostOf(it.addr);
     if (!seen.has(h)) {
       seen.add(h);
@@ -714,7 +748,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         reattaching.delete(id);
       }
     }
-    for (const h of hosts) void get().startHost(h);
+    for (const h of hosts) void get().startHost(h, { unattended: true });
   };
 
   /** The next pending item on `h` that the runner may take: not one whose engine job is still
@@ -1052,6 +1086,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     } else if (item.sourceKind === "ps5") {
       // From another console: the engine copies console to console (directly, or through this
       // computer when they cannot reach each other). The persisted tx id resumes it.
+      const adopt = get().items.find((it) => it.id === item.id)?.adopt ?? null;
       jobId = await startPs5ToPs5(
         item.fromConsole ?? "",
         item.sourcePath,
@@ -1059,7 +1094,9 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         item.resolvedDest,
         item.txIdHex,
         { mode: item.route, directAddr: item.directAddr },
+        adopt,
       );
+      if (adopt) set((s) => ({ items: patchItem(s.items, item.id, { adopt: null }) }));
     } else if (isArchive) {
       // A .zip/.7z is decompressed host-side and streamed in (lands
       // extracted). Carry the persisted tx_id for cross-session shard resume,
@@ -1168,12 +1205,16 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     // staleness is harmless — cancelling a finished job is a server no-op).
     runningJobByHost.set(hostOf(item.addr), jobId);
     set((s) => ({ items: patchItem(s.items, item.id, { jobId }) }));
+    labelEngineJob(jobId, "upload", item.displayName);
 
     // Trailing-window samples for the live bytes/sec readout. Closure-
     // scoped so a Stop + restart of the same item resets cleanly: the
     // next runOne builds a fresh array.
     const startedAtMs = Date.now();
     const samples: RateSample[] = [{ ts: startedAtMs, bytes: 0 }];
+    // When bytes last moved, for the "nothing is moving" note on the row.
+    let lastBytes = -1;
+    let lastMoveAt = startedAtMs;
 
     while (isLive()) {
       const snap = await jobStatus(jobId, item.addr);
@@ -1564,11 +1605,20 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       const bytesSent = snap.bytes_sent ?? 0;
       pushRateSample(samples, now, bytesSent);
       const bytesPerSec = computeRate(samples, now);
+      if (bytesSent !== lastBytes) {
+        lastBytes = bytesSent;
+        lastMoveAt = now;
+      }
+      const totalNow = snap.total_bytes ?? 0;
+      // Everything sent and the console making it durable is not a stall.
+      const sending = !(totalNow > 0 && bytesSent >= totalNow);
+      const stalledForMs = sending && now - lastMoveAt >= STALL_AFTER_MS ? now - lastMoveAt : null;
       set((s) => ({
         items: patchItem(s.items, item.id, {
           bytesSent,
-          totalBytes: snap.total_bytes ?? 0,
+          totalBytes: totalNow,
           bytesPerSec,
+          stalledForMs,
           // P3 / v2.18.0 — forward apply-phase counters so the
           // QueueRow's finalize pill can show "Finalized N of M files"
           // (analogous to transfer.ts's single-shot path). Defaults to
@@ -1579,9 +1629,39 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           live: jobLiveFromSnapshot(snap),
         }),
       }));
-      await sleep(POLL_INTERVAL_MS);
+      await sleep(POLL_INTERVAL_MS, { poll: true });
     }
     throw new Error("queue stopped");
+  };
+
+  /** Whether the poller last saw this item's console in rest mode (lib/consolePower). */
+  const hostAsleep = (addr: string) =>
+    useConnectionStore.getState().runtimeByHost[hostOf(addr) || "_"]?.power === "rest";
+
+  /** Park an upload until its console wakes: pending, marked, nothing counted as a failure.
+   *  `why` (the failure that met the sleep, if any) is only logged. */
+  const parkForWake = (item: QueueItem, why?: string | null) => {
+    set((s) => ({
+      items: patchItem(s.items, item.id, {
+        status: "pending",
+        waitingForWake: true,
+        interrupted: true,
+        live: undefined,
+        bytesPerSec: 0,
+        stalledForMs: null,
+        recovering: false,
+        recoverAttempt: 0,
+        error: null,
+        errorReason: null,
+        errorDetail: null,
+      }),
+    }));
+    scheduleSave();
+    log.info(
+      "queue",
+      `${hostOf(item.addr)} is in rest mode — ${item.sourcePath || item.id} waits for the PS5 to wake` +
+        (why ? ` (${why})` : ""),
+    );
   };
 
   /** One console's drain loop: repeatedly pick the next item via
@@ -1594,6 +1674,9 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
   const runDrainLoop = async (
     pickNext: () => QueueItem | null,
     isLive: () => boolean,
+    // A run the user started may send the helper (and clears a "stopped by you" mark); one
+    // nobody clicked (wake resume) may not (#471).
+    sendMode: "auto" | "explicit" = "explicit",
   ) => {
     // Make sure the console is on the payload that matches this build
     // BEFORE running any jobs. Older payloads lack the mgmt-port
@@ -1602,9 +1685,10 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     // console's first item.
     const head = pickNext();
     // An item that adopts a running job needs no payload check: the console is mid-transfer.
-    if (head && !head.attachJobId) {
+    // Nor does a console in rest mode: nothing answers until it wakes (the item parks below).
+    if (head && !head.attachJobId && !hostAsleep(head.addr)) {
       try {
-        await ensurePayloadCurrent(hostOf(head.addr));
+        await ensurePayloadCurrent(hostOf(head.addr), undefined, false, sendMode);
       } catch (e) {
         console.warn("ensurePayloadCurrent threw:", e);
       }
@@ -1632,6 +1716,18 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         continue;
       }
 
+      // The console is in rest mode: this upload waits for the wake instead of failing on
+      // a console that cannot answer (it resumes on the helper-up edge after it).
+      if (
+        next.sourceKind !== "install" &&
+        !next.attachJobId &&
+        useUploadSettingsStore.getState().autoResume &&
+        hostAsleep(next.addr)
+      ) {
+        parkForWake(next);
+        break drain;
+      }
+
       // Let the payload settle between jobs (see INTER_JOB_SETTLE_MS).
       // Per-loop counter ⇒ the settle is per-console, not global.
       if (jobsRun > 0) {
@@ -1644,6 +1740,9 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       set((s) => ({
         items: patchItem(s.items, next.id, {
           status: "running",
+          interrupted: false,
+          waitingForWake: false,
+          stalledForMs: null,
           startedAt,
           // Reset live counters so a previously-failed-then-retried
           // item starts the bar + speed readout from zero instead
@@ -1740,6 +1839,16 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           // An install is never re-run by itself: a repeated patch install
           // can wipe the base game. Only uploads auto-recover.
           const isInstall = next.sourceKind === "install";
+          // The console went into rest mode: wait for the wake rather than fail or spend a
+          // recovery attempt on a console that cannot answer (lib/uploadRecovery).
+          if (
+            !isInstall &&
+            autoResume &&
+            shouldParkForWake(e, reason, message, hostAsleep(next.addr))
+          ) {
+            parkForWake(next, detail ?? message);
+            break drain;
+          }
           const canRecover =
             !isInstall &&
             autoResume &&
@@ -1812,6 +1921,11 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
             await sleep(Math.min(250, backoffMs - waited));
             if (!isLive()) return;
           }
+          // It fell asleep while we waited: no attempt can land until it wakes.
+          if (hostAsleep(next.addr)) {
+            parkForWake(next, message);
+            break drain;
+          }
           // Re-deploy the payload, then poll until it answers. force=true:
           // we got here from a connection-class transfer failure, so the
           // payload is suspect — its transfer listener may be dead even
@@ -1825,10 +1939,12 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
           // `() => !isLive()` lets a Stop bail out of the ~30 s boot-wait
           // promptly instead of leaving a ghost push running.
           try {
+            // Unattended: a console whose helper the user stopped is left alone (#471).
             await ensurePayloadCurrent(
               hostOf(next.addr),
               () => !isLive(),
               true,
+              "auto",
             );
           } catch (healErr) {
             console.warn("auto-resume: ensurePayloadCurrent threw:", healErr);
@@ -1924,6 +2040,8 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
               if (!isTauriEnv()) reattaching.add(next.id);
             }
             next.status = "pending";
+            next.interrupted = true;
+            next.stalledForMs = null;
           }
           if (!next.txIdHex) next.txIdHex = generateTxIdHex();
           // Back-fill the bytes/sec field added in 2.2.22 — older
@@ -2108,7 +2226,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         // ran partway, app crashed, app reopens → next start of the
         // queue passes this same tx_id with TX_FLAG_RESUME and the
         // payload picks up from last_acked_shard.
-        txIdHex: generateTxIdHex(),
+        txIdHex: input.txIdHex || generateTxIdHex(),
         status: "pending",
         bytesSent: 0,
         totalBytes: 0,
@@ -2264,6 +2382,17 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
         ),
       }));
       scheduleSave();
+      // The button says Retry: run them, don't just put them back in the list.
+      void get().start();
+    },
+
+    restartItem(id) {
+      const item = get().items.find((candidate) => candidate.id === id);
+      if (!item || item.status !== "running" || item.sourceKind === "install") return;
+      const host = hostOf(item.addr);
+      get().stopHost(host);
+      // Let the engine let go of the job; the next run resumes it from the console's journal.
+      setTimeout(() => void get().startHost(host, { onlyIds: [id] }), 1500);
     },
 
     retryItem(id) {
@@ -2333,10 +2462,14 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       for (const it of candidates) {
         if (get().retryItem(it.id)) resumed += 1;
       }
+      // Rows parked while the console slept (waitingForWake): startHost below takes them.
+      resumed += get().items.filter(
+        (it) => hostOf(it.addr) === h && it.status === "pending" && it.waitingForWake,
+      ).length;
       // Only spin up the drain loop when we actually reset a row — never
       // start uploads a user merely queued but hasn't launched. startHost is
       // guarded by its own generation counter, so a redundant call is a no-op.
-      if (resumed > 0) await get().startHost(host);
+      if (resumed > 0) await get().startHost(host, { unattended: true });
       return resumed;
     },
 
@@ -2374,10 +2507,24 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       const isLive = () => hostGen.get(h) === myGen;
       set((s) => {
         const rh = { ...s.runningHosts, [h]: true };
-        return { runningHosts: rh, running: true };
+        return {
+          runningHosts: rh,
+          running: true,
+          // A start (the user's, or the wake resume's) is the moment to try parked rows again;
+          // a console still asleep parks them again at once.
+          items: s.items.some((it) => it.waitingForWake && hostOf(it.addr) === h)
+            ? s.items.map((it) =>
+                it.waitingForWake && hostOf(it.addr) === h ? { ...it, waitingForWake: false } : it,
+              )
+            : s.items,
+        };
       });
       try {
-        await runDrainLoop(() => pickPending(h), isLive);
+        await runDrainLoop(
+          () => pickPending(h),
+          isLive,
+          opts?.unattended ? "auto" : "explicit",
+        );
       } finally {
         // Only clear our own flag if we're still the live generation — a
         // stopHost() or a superseding startHost() already owns it otherwise.
@@ -2484,10 +2631,12 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
       // client, so per-console work stays serial while DIFFERENT consoles
       // overlap; each item belongs to exactly one console ⇒ exactly one
       // loop ever claims it (no cross-loop claim race).
-      for (;;) {
-        const hosts = distinctPendingHosts(get().items).filter(
-          (h) => !get().runningHosts[h],
-        );
+      for (let pass = 0; ; pass++) {
+        // The first pass is the user's Start and takes rows parked for a sleeping console too;
+        // later passes leave them to the wake, or a console still asleep would loop here.
+        const hosts = distinctPendingHosts(get().items, {
+          includeWaitingForWake: pass === 0,
+        }).filter((h) => !get().runningHosts[h]);
         if (hosts.length === 0) break;
         await Promise.all(hosts.map((h) => get().startHost(h)));
         if (!get().continueOnFailure) break;
@@ -2524,6 +2673,7 @@ export const useUploadQueueStore = create<QueueState>((set, get) => {
     moveDown: () => undefined,
     clear: () => undefined,
     retryFailed: () => undefined,
+    restartItem: () => undefined,
     retryItem: () => false,
     retryWithPassword: () => false,
     discardPartial: () => Promise.resolve(),
@@ -2592,6 +2742,3 @@ async function fw12InstallSettle(host: string): Promise<void> {
   if (!ready) await sleep(3000);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}

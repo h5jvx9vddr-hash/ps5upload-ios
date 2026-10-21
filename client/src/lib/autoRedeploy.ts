@@ -7,6 +7,8 @@
  * an upload; see `autoRedeployGuard.test.ts` for the ones already paid for.
  */
 
+import type { HostPower } from "./consolePower";
+
 /** A console's probed state, as far as the redeploy loop cares. */
 export type RedeployStatus = "unknown" | "up" | "down" | undefined;
 
@@ -32,7 +34,7 @@ export type RedeployDecision = "redeploy" | "hold" | "rearm";
  * What the loop should do for one console right now.
  *
  * - `rearm`  — the console is up: clear its delivered-send count.
- * - `hold`   — do nothing this tick.
+ * - `hold`   — do nothing this tick (also: the user stopped this console's helper).
  * - `redeploy` — push the bundled ELF.
  */
 export function autoRedeployDecision(input: {
@@ -41,6 +43,13 @@ export function autoRedeployDecision(input: {
   busy: boolean;
   /** Helpers already delivered to this console since it last read up. */
   delivered: number;
+  /** The user stopped this console's helper (state/helperStopped): it stays off until they
+   *  send it again (#471). */
+  stopped?: boolean;
+  /** The console's power state (lib/consolePower). In rest mode nothing listens and the
+   *  helper cannot start until someone wakes it: probing it every 15 s all night only
+   *  costs the console connects. The normal flow resumes once it reads awake again. */
+  power?: HostPower;
 }): RedeployDecision {
   if (input.status === "up") return "rearm";
   // "unknown" is a console the user typed in but never deliberately
@@ -51,6 +60,10 @@ export function autoRedeployDecision(input: {
   // Never over a live transfer: the new instance takes over and the old one
   // shuts down, killing the upload mid-flight.
   if (input.busy) return "hold";
+  // A helper the user turned off is not a helper that went missing.
+  if (input.stopped) return "hold";
+  // Asleep: the wake is the user's to make, and the helper is sent after it.
+  if (input.power === "rest") return "hold";
   if (input.delivered >= MAX_REDEPLOYS_WITHOUT_RECOVERY) return "hold";
   return "redeploy";
 }

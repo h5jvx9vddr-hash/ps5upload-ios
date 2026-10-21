@@ -95,6 +95,8 @@ export interface CollectionSummary {
 
 export interface CollectionLibrary {
   roots?: string[];
+  /** Roots the last scan could not open (deleted, unplugged, server down); skipped. */
+  missing_roots?: string[];
   generated_at?: string;
   summary: CollectionSummary;
   games: Record<string, CollectionGame>;
@@ -205,6 +207,8 @@ export interface OrganizeSkipped {
 export interface OrganizePlan {
   token: string;
   containers: string[];
+  /** How to show each container: its path, or "Server: /path" on a saved server. */
+  labels?: Record<string, string>;
   moves: OrganizeMove[];
   skipped: OrganizeSkipped[];
   unsure_count: number;
@@ -222,6 +226,8 @@ export interface OrganizeResult {
 export interface OrganizeRun {
   id: string;
   container_root: string;
+  /** The folder as shown: its path, or "Server: /path" on a saved server. */
+  label?: string;
   created_at: string;
   moved: number;
   failed: number;
@@ -330,7 +336,7 @@ export const collection = {
     }),
   organizeRuns: () => call<OrganizeRun[]>("/organize/runs"),
   organizeRevert: (id: string) =>
-    call<{ reverted: OrganizeMove[]; problems: unknown[] }>(
+    call<{ reverted: OrganizeMove[]; problems: unknown[]; note?: string }>(
       "/organize/revert",
       { method: "POST", body: JSON.stringify({ id }) },
     ),

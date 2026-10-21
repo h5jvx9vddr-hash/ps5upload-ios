@@ -2203,12 +2203,19 @@ int ava1_test_apply_reserve(size_t n, int take) {
 
 /* ---- P3 Task 5: job.run operations wrapped around stub legacy handlers -------------------- */
 
+/* Hold operations until their initial running reply has been read by a test. */
+static int g_stub_op_hold;
+
 /* A slow stub: `loops` rounds of 20 ms, each reporting one unit of progress and honouring
  * job.cancel the way backup.c does (mgmt_op_cancelled / mgmt_op_progress). */
 static int stub_slow(const char *b, const char *cancel_token, int cancel_frame_type) {
     uint32_t i, loops = 0;
     const char *p = strstr(b, "\"loops\":");
     if (p) loops = (uint32_t)strtoul(p + 8, NULL, 10);
+    while (__atomic_load_n(&g_stub_op_hold, __ATOMIC_SEQ_CST)) {
+        if (mgmt_op_cancelled()) return stub_send_frame((uint16_t)cancel_frame_type, cancel_token, strlen(cancel_token));
+        usleep(1000);
+    }
     mgmt_op_total(loops, (uint64_t)loops * 100u);
     for (i = 0; i < loops; i++) {
         if (mgmt_op_cancelled()) return stub_send_frame((uint16_t)cancel_frame_type, cancel_token, strlen(cancel_token));
@@ -2356,6 +2363,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     __atomic_store_n(&ava1_copy_test_delete_delay_ms, 0, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ava1_copy_test_delete_active, 0, __ATOMIC_SEQ_CST);
     if (ava1_data_start(&dc) != 0) return -100;
+    __atomic_store_n(&g_stub_op_hold, 0, __ATOMIC_SEQ_CST);
     install_ops();
     ava1_apply_fault = t_fault;
     memset(&cfg, 0, sizeof cfg);
@@ -2369,7 +2377,7 @@ int ava1_test_server_start_data(const uint8_t secret[32], const char *peers_path
     cfg.handshake_ms = handshake_ms;
     cfg.rpc = data_rpc; /* the data plane's methods, then node.info */
     cfg.data = ava1_data_hooks();
-    cfg.caps = AVA1_CAP_DATA_PLANE;
+    cfg.caps = AVA1_CAP_DATA_PLANE | AVA1_CAP_SHARED_JOBS; /* what ava1_glue.c does */
     rc = ava1_server_start(&cfg);
     if (rc != 0) {
         ava1_data_stop();
@@ -2469,6 +2477,118 @@ int ava1_test_reap_rules(const char *jobs_dir) {
     return rc;
 }
 
+/* #475: an upload that ended on a session still running leaves the table on its own. Marks a listed
+ * job as a concluded upload (what ava1_apply_fail does once its JobDone is out), ended `ago_ms` ago. */
+static void conclude(uint8_t tag, uint64_t ago_ms) {
+    uint8_t id[16];
+    ava1_job_t *j;
+    memset(id, tag, 16);
+    if (!(j = ava1_job_find(id))) return;
+    j->kind = AVA1_JOB_UPLOAD;
+    __atomic_store_n(&j->finished, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&j->concluded_ms, (ava1_mono_ms() - ago_ms) | 1u, __ATOMIC_RELEASE);
+    ava1_job_put(j);
+}
+
+/* 0, or the step that failed. A full table of uploads attached to one live session: the ended ones
+ * make room for the next JobOpen (the one that ended longest ago and nobody holds goes first), the
+ * ones still running or still settling never do, and the reaper lets an ended one go 10 s after its
+ * end although its session never let go of it. */
+int ava1_test_ended_transfers(const char *jobs_dir) {
+    static const uint8_t SID[16] = { 0xe1 };
+    ava1_data_cfg_t dc;
+    ava1_job_t *j, *held = NULL;
+    uint8_t id[16];
+    int rc = 0, t;
+    memset(&dc, 0, sizeof dc);
+    snprintf(dc.jobs_dir, sizeof dc.jobs_dir, "%s", jobs_dir);
+    if (ava1_data_start(&dc) != 0) return -100;
+    /* 32 running uploads on one session: the table is full and nothing may be evicted */
+    for (t = 0; t < AVA1_MAX_JOBS && !rc; t++) {
+        if (!(j = mk((uint8_t)(0x40 + t), SID))) rc = -1;
+        else {
+            j->kind = AVA1_JOB_UPLOAD;
+            ava1_job_put(j);
+        }
+    }
+    if (!rc && (j = mk(0x70, SID)) != NULL) {
+        ava1_job_put(j);
+        rc = -2; /* a full table of running jobs took another */
+    }
+    if (!rc) {
+        /* 0x40 ended longest ago but a reader holds it; 0x41 ended next; 0x42 ended but still settles */
+        conclude(0x40, 5000);
+        conclude(0x41, 4000);
+        conclude(0x42, 6000);
+        memset(id, 0x42, 16);
+        if ((j = ava1_job_find(id)) != NULL) {
+            __atomic_store_n(&j->unswept_n, 1, __ATOMIC_RELAXED);
+            ava1_job_put(j);
+        }
+        memset(id, 0x40, 16);
+        held = ava1_job_find(id);
+        if (!(j = mk(0x71, SID))) rc = -3; /* 0x41 makes room */
+        else ava1_job_put(j);
+        if (!rc && listed(0x41)) rc = -4;
+        if (!rc && (!listed(0x40) || !listed(0x42))) rc = -5;
+        if (held) ava1_job_put(held);
+        if (!rc && !(j = mk(0x72, SID))) rc = -6; /* now 0x40 makes room */
+        else if (!rc) ava1_job_put(j);
+        if (!rc && listed(0x40)) rc = -7;
+        if (!rc && (j = mk(0x73, SID)) != NULL) { /* only the settling 0x42 has ended: still full */
+            ava1_job_put(j);
+            rc = -8;
+        }
+    }
+    if (!rc) {
+        /* durable-by-log: every file swept (unswept_n 0) but not yet settled (its last Status{unswept=0}
+         * and the segments' removal still to come): not evictable; once settled, it is */
+        memset(id, 0x46, 16);
+        if (!(j = ava1_job_find(id))) rc = -13;
+        else {
+            j->psegs = calloc(1, sizeof *j->psegs);
+            if (j->psegs) j->psegs[0].fd = -1;
+            j->npsegs = 1;
+            ava1_job_put(j);
+            conclude(0x46, 9000);
+            if ((j = mk(0x74, SID)) != NULL) {
+                ava1_job_put(j);
+                rc = -14;
+            } else if (!listed(0x46)) rc = -15;
+            ava1_job_reap(ava1_mono_ms() + 11000u);
+            if (!rc && !listed(0x46)) rc = -16; /* nor reaped */
+            if (!rc && (j = ava1_job_find(id)) != NULL) {
+                __atomic_store_n(&j->settled, 1, __ATOMIC_RELEASE);
+                ava1_job_put(j);
+                if (!(j = mk(0x74, SID))) rc = -17;
+                else ava1_job_put(j);
+                if (!rc && listed(0x46)) rc = -18;
+            }
+        }
+    }
+    if (!rc) {
+        /* the reaper: an ended upload still attached goes 10 s after its end, not before; a running one stays */
+        conclude(0x43, 0);
+        ava1_job_reap(ava1_mono_ms() + 5000u);
+        if (!listed(0x43)) rc = -9;
+        ava1_job_reap(ava1_mono_ms() + 11000u);
+        if (!rc && listed(0x43)) rc = -10;
+        if (!rc && (!listed(0x44) || !listed(0x42))) rc = -11;
+        /* a copy is read by job id after it ends: never taken this way */
+        memset(id, 0x45, 16);
+        if (!rc && (j = ava1_job_find(id)) != NULL) {
+            j->kind = AVA1_JOB_COPY;
+            __atomic_store_n(&j->concluded_ms, ava1_mono_ms() | 1u, __ATOMIC_RELEASE);
+            ava1_job_put(j);
+            ava1_job_reap(ava1_mono_ms() + 11000u);
+            if (!listed(0x45)) rc = -12;
+        }
+    }
+    ava1_job_free_all();
+    ava1_data_stop();
+    return rc;
+}
+
 /* N3: a job a cancel unlisted, still referenced by the caller and one other holder. */
 int ava1_test_retire_unlisted(void) {
     ava1_data_cfg_t dc;
@@ -2520,6 +2640,7 @@ int ava1_test_data_knob(const char *name, uint32_t v) {
     else if (!strcmp(name, "reserve_fail")) ava1_data_test_reserve_fail = (int)v;
     else if (!strcmp(name, "lane_alloc_fail")) ava1_data_test_lane_alloc_fail = (int)v;
     else if (!strcmp(name, "fb_force")) ava1_data_test_fb_force = (int)v;
+    else if (!strcmp(name, "op_hold")) __atomic_store_n(&g_stub_op_hold, (int)v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "park_ms")) __atomic_store_n(&c->park_ms, v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "deny_write")) __atomic_store_n(&g_deny_write, (int)v, __ATOMIC_SEQ_CST);
     else if (!strcmp(name, "budget_free")) {

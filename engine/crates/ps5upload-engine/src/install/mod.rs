@@ -83,20 +83,31 @@ impl JobStore {
         // Taken before the jobs lock: `begin` locks the slots first, then the jobs.
         let holding: std::collections::HashSet<String> =
             lock(&self.active).values().cloned().collect();
-        let cid = {
+        // Read before the prune, which may drop this very status.
+        let ended = {
             let mut jobs = lock(&self.jobs);
-            let cid = jobs.get(job).map(|st| slot_key(&st.ps5_addr));
+            let ended = jobs.get(job).cloned();
             prune_finished(&mut jobs, KEEP_FINISHED, &holding);
-            cid
+            ended
         };
         lock(&self.cancelled).remove(job);
-        if let Some(cid) = cid {
+        if let Some(st) = ended {
+            let cid = slot_key(&st.ps5_addr);
             let mut active = lock(&self.active);
             // only clear if this job still owns the slot
             if active.get(&cid).map(|j| j.as_str()) == Some(job) {
                 active.remove(&cid);
+                // Once per job: a second finish finds the slot already released.
+                crate::activity::install_ended(&st);
             }
         }
+    }
+
+    /// Statuses of the installs still holding a console's slot.
+    pub fn running(&self) -> Vec<InstallStatus> {
+        let ids: Vec<String> = lock(&self.active).values().cloned().collect();
+        let jobs = lock(&self.jobs);
+        ids.iter().filter_map(|j| jobs.get(j).cloned()).collect()
     }
 
     /// The install task ended without finishing the job (it panicked): a job still
@@ -115,6 +126,11 @@ impl JobStore {
             }
         });
         self.finish(job);
+    }
+
+    /// Whether `ps5_addr` has an install running.
+    pub fn active_for(&self, ps5_addr: &str) -> bool {
+        lock(&self.active).contains_key(&slot_key(ps5_addr))
     }
 
     /// Whether any console has an install running.
@@ -901,16 +917,20 @@ async fn run_install(state: PkgInstallStateHandle, job: String, mut req: Install
     // the helper and never displaces it.
     let elf = crate::bundled_payload::image_bytes(crate::bundled_payload::Image::Installer).ok();
     let ip_for_ensure = ip.clone();
-    let ens =
-        tokio::task::spawn_blocking(move || ic::ensure(&ip_for_ensure, elf.as_deref(), false))
-            .await
-            .unwrap_or(ic::Ensure {
-                listening: false,
-                sent: false,
-                state: None,
-                reason: Some(DPI_REASON_NO_BRINGUP),
-                error: Some("ensure task failed".into()),
-            });
+    let ens = tokio::task::spawn_blocking(move || {
+        // Wait out an elfldr swap in progress rather than send into its gap.
+        let lock = crate::elfldr_guard::loader_lock(&ip_for_ensure);
+        let _loader = lock.lock().unwrap_or_else(|e| e.into_inner());
+        ic::ensure(&ip_for_ensure, elf.as_deref(), false)
+    })
+    .await
+    .unwrap_or(ic::Ensure {
+        listening: false,
+        sent: false,
+        state: None,
+        reason: Some(DPI_REASON_NO_BRINGUP),
+        error: Some("ensure task failed".into()),
+    });
     if !ens.listening {
         let mapped = status_from_ensure(&ens);
         state.jobs.update(&job, |s| {
@@ -1219,29 +1239,36 @@ async fn run_install(state: PkgInstallStateHandle, job: String, mut req: Install
         DeliveryProgress::Complete
     } else {
         loop {
-            // (served, total, daemon job phase)
-            let obs: Option<(u64, u64, Option<String>)> = if let Some(sid) = &session_id {
+            // (served, covered, total, daemon job phase). A stream session's
+            // completion is judged on distinct bytes received, never the raw
+            // sum: Sony re-reads the header, and on a 37.6 MB package ten
+            // re-reads made the sum hit the package size with 640 KiB never
+            // fetched. Releasing the session then answered the console's
+            // request for it with 410 and the PS5 download failed. Any served
+            // request, re-read or not, still counts as movement.
+            let obs: Option<(u64, u64, u64, Option<String>)> = if let Some(sid) = &session_id {
                 let s = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
-                s.get(sid).map(|x| (x.bytes_served, x.total_size, None))
+                s.get(sid)
+                    .map(|x| (x.bytes_served, x.transfer.bytes(), x.total_size, None))
             } else if let Some(jid) = &install_job_id {
                 let (i, j) = (ip.clone(), jid.clone());
                 tokio::task::spawn_blocking(move || ic::job(&i, &j))
                     .await
                     .ok()
                     .and_then(|r| r.ok())
-                    .map(|j| (j.bytes_served, j.total, Some(j.phase)))
+                    .map(|j| (j.bytes_served, j.bytes_served, j.total, Some(j.phase)))
             } else {
                 None
             };
             // An unreadable observation counts as "no movement": it can only
             // run the stall clock, never declare success.
-            let (served, total, dphase) = obs.unwrap_or((last_served, 0, None));
+            let (served, covered, total, dphase) = obs.unwrap_or((last_served, 0, 0, None));
             if served > last_served {
                 last_served = served;
                 last_move = std::time::Instant::now();
             }
             state.jobs.update(&job, |s| {
-                s.metrics.served_bytes = served;
+                s.metrics.served_bytes = covered;
                 if total > 0 {
                     s.metrics.total_bytes = total;
                 }
@@ -1250,7 +1277,7 @@ async fn run_install(state: PkgInstallStateHandle, job: String, mut req: Install
                 p
             } else {
                 delivery_progress(
-                    served,
+                    covered,
                     total,
                     last_move.elapsed().as_millis() as u64,
                     DELIVERY_STALL_MS,
@@ -1925,6 +1952,17 @@ mod tests {
     }
 
     /// Finishing forgets the stop request and keeps only the newest finished statuses.
+    #[test]
+    fn running_lists_only_installs_holding_a_slot() {
+        let jobs = JobStore::new();
+        let a = jobs.begin("10.1.0.1").unwrap();
+        let b = jobs.begin("10.1.0.2").unwrap();
+        jobs.update(&b, |s| s.phase = Phase::Done);
+        jobs.finish(&b);
+        let running: Vec<String> = jobs.running().into_iter().map(|s| s.job).collect();
+        assert_eq!(running, vec![a]);
+    }
+
     #[test]
     fn finish_prunes_old_statuses_and_stop_requests() {
         let jobs = JobStore::new();

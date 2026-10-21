@@ -37,10 +37,19 @@
  *   src/takeover_flag.c   1  dir    takeover flag: tmp -> final
  *   src/runtime.c         3  dir    mount tracker, ownership record, online.json (all tmp -> final)
  *   src/fs_jobs.c         1  dir    chmod/copy tmp inside the destination folder
+ *   src/icon_keeper.c     1  dir    hidden_icons.txt: tmp -> final
  *   src/register.c        1  dir    param.json: tmp -> final
+ *   src/ffpfsc_unpack.c   1  dir    decompressed image: <name>.part -> <name>, beside the .ffpfsc
  *   src/shell_builtin.c   1  guard  `mv` (mv_same_dev, lstat of the source)
+ *   src/webui_settings.c  1  dir    webui.json: tmp -> final
+ *   src/webui_inputlog.c  1  dir    webui-input.log ring rewrite: tmp -> final
+ *   src/webui_tile.c      1  dir    tile folder files: tmp -> final
+ *   src/files_prefs.c     1  dir    files-prefs.json: tmp -> final
+ *   src/webui_files.c     2  dir    text save and upload: .ps5u-<hex>.part beside the target -> target
+ *                                   (the device is compared too, same_device_as, failing closed)
  *   ava1/ava1_events.c    1  dir    events.log -> events.log.old
- *   ava1/ava1_apply.c     2  guard  file and folder commit (same_device hook, only a definite 1 renames)
+ *   ava1/ava1_apply.c     3  guard  file and folder commit (same_device hook, only a definite 1 renames);
+ *                                   held param.json/param.sfo: name.ava-hold -> name, same dir
  *   ava1/ava1_journal.c   1  dir    journal: tmp -> final
  *   ava1/ava1_store.c     1  dir    key and trust stores: tmp -> final
  *   ava1/ava1_recv.c      2  dir    outboard renames inside the job folder

@@ -90,6 +90,22 @@ export function humanizePs5Error(
     return te("err_unmount_permission");
   }
 
+  // ─── Uninstall the PS5 refused (#476) ──────────────────────────────
+  {
+    const m = raw.match(/uninstall_refused:(0x[0-9a-f]{8}|unknown)/i);
+    if (m) return te("err_uninstall_refused", { code: m[1] });
+  }
+  if (/uninstall_unavailable/i.test(raw)) return te("err_uninstall_unavailable");
+
+  // ─── Decompressing a .ffpfsc on the console (#453) ───────────────────
+  if (/fs_unpack_no_space/i.test(raw)) return te("err_unpack_no_space");
+  if (/fs_unpack_destination_exists/i.test(raw)) return te("err_unpack_exists");
+  if (/fs_unpack_busy/i.test(raw)) return te("err_unpack_busy");
+  if (/fs_unpack_mount_failed/i.test(raw)) return te("err_unpack_mount");
+  if (/fs_unpack_(not_pfs|not_pfsc|bad_\w+|corrupt_block|truncated|size_mismatch|not_exfat|inner_missing)/i.test(raw)) {
+    return te("err_unpack_bad");
+  }
+
   // ─── NPXS system-pkg + mgmt disconnect mid-install ─────────────────
   // Sony accepts the register call (we see `register_path=shellui-rpc
   // accepted`) but `sceAppInstUtilInstallByPackage` isn't designed

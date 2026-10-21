@@ -48,6 +48,8 @@ int ava1_apply_root(ava1_job_t *j, uint32_t file_id, const uint8_t root[32]);
 /* Runs fn(j, arg, 0..n-1) on the workers and waits for all of them. */
 int ava1_apply_parallel(ava1_job_t *j, void (*fn)(ava1_job_t *, void *, uint32_t), void *arg, uint32_t n);
 void ava1_apply_path(const ava1_job_t *j, uint32_t id, int part, char *out, size_t cap);
+/* sce_sys/param.json or sce_sys/param.sfo at any depth: written as .ava-hold, placed at the end. */
+int ava1_apply_held_rel(const char *rel);
 /* Ends the job once (also the success path, status AVA1_STATUS_OK): journal Done when
  * asked, then JobDone. */
 /* The only way to append to a job's journal once workers run (they append commits): the

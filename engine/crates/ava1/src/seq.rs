@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -80,6 +80,14 @@ pub trait SeqSource: Send + Sync {
     /// Called once when the upload ends, before the decode thread is joined; wakes a
     /// decoder parked on something other than the sink. Must not block.
     fn close(&self) {}
+    /// Bytes this source has decoded only to discard them (entries a pass skips but
+    /// cannot seek past, such as a solid archive's prefix on resume), over its
+    /// lifetime; never decreases. The sender turns its growth into `SkipProgress`
+    /// (SPEC.md §12.8) so the receiver does not take a long skip for a stalled sender.
+    /// A source that never discards keeps the default.
+    fn bytes_skipped(&self) -> u64 {
+        0
+    }
 }
 
 /// A job gets at most this many passes (the first plus retries); a further `FileRetry`
@@ -144,6 +152,10 @@ pub(crate) struct DecodeCtx {
     pub cancel: Arc<AtomicBool>,
     pub retries: Arc<Retries>,
     pub rt: tokio::runtime::Handle,
+    /// Bytes the decode thread received and did not send: the durable (or CV-known)
+    /// stretches of a partly held large file (SPEC.md §17.2). Read with
+    /// `SeqSource::bytes_skipped` for `SkipProgress`.
+    pub skipped: Arc<AtomicU64>,
 }
 
 /// Per-file plan for a pass.
@@ -520,15 +532,19 @@ impl EntrySink for Feeder<'_> {
             return Ok(());
         }
         let mut b = bytes;
+        // What the receiver already holds passes through here unsent (SPEC.md §12.8).
+        let mut unsent = 0u64;
         while !b.is_empty() {
             let cur = self.cur.as_mut().expect("an entry is open");
             let Some(p) = cur.plan.get(cur.pi).copied() else {
                 cur.pos += b.len() as u64;
+                unsent += b.len() as u64;
                 break;
             };
             if cur.pos < p.offset {
                 let n = ((p.offset - cur.pos) as usize).min(b.len());
                 cur.pos += n as u64;
+                unsent += n as u64;
                 b = &b[n..];
                 continue;
             }
@@ -543,10 +559,16 @@ impl EntrySink for Feeder<'_> {
             let n = ((p.len as usize) - cur.buf.len()).min(b.len());
             cur.buf.extend_from_slice(&b[..n]);
             cur.pos += n as u64;
+            if !p.send {
+                unsent += n as u64;
+            }
             b = &b[n..];
             if cur.buf.len() as u64 == p.len {
                 self.finish_piece()?;
             }
+        }
+        if unsent > 0 {
+            self.c.skipped.fetch_add(unsent, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -686,6 +708,7 @@ mod tests {
     }
 
     struct Run {
+        skipped: Arc<AtomicU64>,
         budget: Arc<Semaphore>,
         bw: Arc<BudgetWait>,
         rx: mpsc::UnboundedReceiver<Read>,
@@ -711,7 +734,9 @@ mod tests {
         );
         let bw = Arc::new(BudgetWait::default());
         let budget = Arc::new(Semaphore::new(budget_kib));
+        let skipped = Arc::new(AtomicU64::new(0));
         let ctx = DecodeCtx {
+            skipped: skipped.clone(),
             seq: s.clone(),
             manifest: m.clone(),
             need,
@@ -728,6 +753,7 @@ mod tests {
         };
         let h = std::thread::spawn(move || run(ctx));
         Run {
+            skipped,
             budget,
             bw,
             rx,
@@ -921,6 +947,8 @@ mod tests {
         }
         // Only group 2 is sent; group 1 was decoded and hashed (no CV), group 0 was not hashed.
         assert_eq!(sent, [(2 * GROUP, 5000)]);
+        // Both held groups passed through unsent: that is what SkipProgress reports.
+        assert_eq!(r.skipped.load(Ordering::Relaxed), 2 * GROUP);
         assert_eq!(root, root_of(&big));
         let wants = s.wants.lock().unwrap();
         assert!(
@@ -1124,6 +1152,7 @@ mod tests {
             cancel: Arc::default(),
             retries: Arc::default(),
             rt: tokio::runtime::Handle::current(),
+            skipped: Arc::default(),
         };
         let h = std::thread::spawn(move || run(ctx));
         tokio::time::sleep(Duration::from_millis(100)).await;

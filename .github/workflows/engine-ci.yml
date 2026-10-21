@@ -163,6 +163,61 @@ jobs:
       # of these sit in network sleeps); doctests, which nextest does not run, follow separately.
       # Timing-sensitive binaries are serialized by engine/.config/nextest.toml.
       # Bounded per step: a hung test fails here in minutes instead of holding the job.
+      - name: Check SMB moves against a writable Samba share
+        if: matrix.part == 'engine'
+        working-directory: engine
+        env:
+          PS5UPLOAD_SAMBA_TEST: 127.0.0.1:1445
+          PS5UPLOAD_SAMBA_USER: runner
+          PS5UPLOAD_SAMBA_PASS: ci-smb-fixture-only
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends samba samba-vfs-modules attr
+          printf 'ci-smb-fixture-only\nci-smb-fixture-only\n' | sudo smbpasswd -a -s runner
+          share=$(mktemp -d /tmp/ps5upload-smb-XXXXXX)
+          chmod 777 "$share"
+          mkdir -p "$share/data/w/game/sce_sys" "$share/data/w/PS5" "$share/run"
+          printf 'a' > "$share/data/w/a"
+          printf 'bb' > "$share/data/w/b"
+          printf '{"titleId":"PPSA12385"}' > "$share/data/w/game/sce_sys/param.json"
+          printf 'SMB contract fixture\n' > "$share/data/readme.txt"
+          chmod -R a+rwX "$share/data"
+          setfattr -n 'user.DosStream.apple.provenance:$DATA' -v 'fixture' "$share/data/w/game"
+          cat > "$share/smb.conf" <<EOF
+          [global]
+          server role = standalone server
+          pid directory = $share/run
+          smb ports = 1445
+          interfaces = 127.0.0.1
+          bind interfaces only = yes
+          log file = $share/samba.log
+          log level = 3
+          vfs objects = catia fruit streams_xattr
+          fruit:metadata = stream
+          fruit:posix_rename = yes
+          [games]
+          path = $share/data
+          valid users = runner
+          guest ok = no
+          read only = no
+          force user = runner
+          EOF
+          sudo smbd -D -s "$share/smb.conf"
+          trap 'sudo pkill -F "$share/run/smbd.pid" || true; sudo rm -rf "$share"' EXIT
+          for attempt in $(seq 1 20); do
+            if (echo > /dev/tcp/127.0.0.1/1445) 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if ! (echo > /dev/tcp/127.0.0.1/1445) 2>/dev/null; then
+            sudo cat "$share/samba.log" || true
+            exit 1
+          fi
+          if ! cargo test -p ps5upload-engine smb_meets_the_remote_contract -- --ignored --nocapture; then
+            sudo find "$share/data" -maxdepth 3 -printf '%M %u %g %p\n'
+            sudo tail -n 250 "$share/samba.log"
+            exit 1
+          fi
+
       - name: cargo nextest
         working-directory: engine
         timeout-minutes: 25
@@ -695,6 +750,18 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      # make payload embeds the console web page (payload/Makefile: build/webui_page.c runs
+      # `npm run build:console` in client/), so the client's dependencies must be installed.
+      - name: Install client deps (console web page)
+        working-directory: client
+        run: npm ci --no-audit --no-fund
 
       - name: Install payload toolchain
         timeout-minutes: 12

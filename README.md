@@ -42,7 +42,8 @@
 - **Power.** Rest mode, reboot, shut down, and wake over the network (optionally straight
   into your signed-in user).
 - **Runs everywhere:** macOS, Windows, Linux, Android, or any browser through the self-hosted
-  Docker web UI. 21 languages.
+  Docker web UI ([compose file](engine/compose.yaml), see
+  [Self-hosted engine and web UI](#self-hosted-engine-and-web-ui)). 21 languages.
 
 ## What it doesn't do
 
@@ -64,7 +65,7 @@ Pre-built downloads land on the
 | macOS (Apple Silicon / Intel) | `PS5Upload-<ver>-mac-{arm64,x64}.dmg` | Open the `.dmg`, drag PS5Upload into Applications. See **First launch on macOS** below — Gatekeeper blocks downloaded apps the first time. |
 | Windows (x64 / ARM64) | `PS5Upload-<ver>-win-{x64,arm64}.zip` | Unzip, double-click `PS5Upload.exe` — portable, no installer. See **First launch on Windows** — SmartScreen warns on first run. |
 | Linux — Debian / Ubuntu (x64 / ARM64) | `PS5Upload-<ver>-linux-{x64,arm64}.deb` | `sudo apt install ./PS5Upload-<ver>-linux-<arch>.deb` — installs a normal app with a menu entry; pulls in the WebKitGTK deps automatically. |
-| Linux — Fedora / RHEL / Bazzite (x64 / ARM64) | `PS5Upload-<ver>-linux-{x64,arm64}.rpm` | `sudo dnf install ./PS5Upload-<ver>-linux-<arch>.rpm` (Bazzite/Silverblue: `rpm-ostree install`) — menu entry + auto deps. |
+| Linux — Fedora / RHEL / Bazzite (x64 / ARM64) | `PS5Upload-<ver>-linux-{x64,arm64}.rpm` | `sudo dnf install ./PS5Upload-<ver>-linux-<arch>.rpm` (Bazzite/Silverblue: `rpm-ostree install`; to update, `rpm-ostree uninstall ps5-upload --install ./<new>.rpm` and reboot, which Settings → Updates shows ready to copy) — menu entry + auto deps. |
 | Linux — any distro (x64 / ARM64) | `PS5Upload-<ver>-linux-{x64,arm64}.zip` | Universal fallback (no install). Unzip, then `chmod +x PS5Upload.sh PS5Upload.AppImage` and run **`./PS5Upload.sh`** (the wrapper — handles the FUSE-less and WebKit white-screen cases for you). Running `./PS5Upload.AppImage` directly also works if your system has libfuse2 and a happy WebKitGTK. |
 | Linux — NixOS (x64 / ARM64) | no release artifact | Packaged in [NUR](https://github.com/GriefNorth/nur-packages) as `ps5upload` — see **NixOS** below. |
 | Android | `PS5Upload-<ver>-android.apk` | Enable "install unknown apps" for your browser/file manager, then open the `.apk`. Same interface, mobile-friendly; connects to and manages your PS5 over Wi-Fi. On Android 17, allow local network access ("nearby devices") when asked. |
@@ -300,8 +301,9 @@ with **Settings → Engine URL**.
 - An upload keeps running when you close the tab.
 - **No password.** Anyone allowed can read, write and delete on your PS5. Keep it on a trusted
   LAN, never on the internet.
-- You may build the docker container with the `PS5UPLOAD_BASE_URL` to host the webui through a
-  reverse proxy. This cannot be changed on runtime.
+- For a dedicated reverse-proxy hostname, leave `PS5UPLOAD_BASE_URL` unset. It is a build-time
+  **path prefix**, not a full URL. See [reverse-proxy setup](REVERSE_PROXY.md) for nginx,
+  proxy authentication, Docker bridge networking, and sub-path hosting.
 - **Scripting it:** [ps5upctl](https://github.com/yuanzhengze/ps5upctl) is a community
   command-line client for the engine API (unofficial; the API can change between versions).
 

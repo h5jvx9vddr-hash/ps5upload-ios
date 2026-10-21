@@ -31,11 +31,13 @@
 #include <fnmatch.h>
 #include <regex.h>
 #include "config.h"
+#include "webui_api.h"
 #include "runtime.h"
 #include "sandbox_unmount.h"
 #include "instance_verdict.h"
 
 #include "content_db.h"
+#include "icon_keeper.h"
 #include "register.h"
 #include "indicator.h"
 #include "hw_info.h"
@@ -56,11 +58,14 @@
 #include "profile.h"
 #include "sony_api_lock.h"
 #include "net_probe.h"
+#include "net_ports.h"
+#include "files_handoff.h"
 #include "focus_probe.h"
 #include "proc_list.h"
 #include "proc_identity.h"
 #include "smp_meta.h"
 #include "blake3.h"
+#include "index_glob.h"
 #include "mgmt_rpc.h"
 #include "mgmt_fs.h"
 #include "path_policy.h"
@@ -265,6 +270,18 @@
 #define MGMT_FRAME_SAVE_MOUNT_ACK 262u
 #define MGMT_FRAME_SAVE_UNMOUNT 263u
 #define MGMT_FRAME_SAVE_UNMOUNT_ACK 264u
+#define MGMT_FRAME_NET_PORTS 265u
+#define MGMT_FRAME_NET_PORTS_ACK 266u
+#define MGMT_FRAME_FILES_PREFS_GET 267u
+#define MGMT_FRAME_FILES_PREFS_GET_ACK 268u
+#define MGMT_FRAME_FILES_PREFS_SET 269u
+#define MGMT_FRAME_FILES_PREFS_SET_ACK 270u
+#define MGMT_FRAME_FILES_HANDOFF_PUT 271u
+#define MGMT_FRAME_FILES_HANDOFF_PUT_ACK 272u
+#define MGMT_FRAME_FILES_HANDOFF_TAKE 273u
+#define MGMT_FRAME_FILES_HANDOFF_TAKE_ACK 274u
+#define MGMT_FRAME_MINION_TILE 275u
+#define MGMT_FRAME_MINION_TILE_ACK 276u
 #define MGMT_FRAME_SDK_SCAN 214u
 #define MGMT_FRAME_SDK_SCAN_ACK 215u
 #define MGMT_FRAME_SDK_PATCH 216u
@@ -1088,8 +1105,15 @@ void runtime_classify_prior_instance(runtime_state_t *state) {
  * Must be called AFTER runtime_try_takeover and BEFORE runtime_write_ownership
  * (which overwrites the prior record with our own pid).
  */
-/* How long the prior instance gets to exit by itself before it is killed. */
+/* How long the prior instance gets to exit by itself before it is killed: a helper that was
+ * serving AVA1 and got the takeover request is finishing its Sony calls and closing journals. */
 #define REAP_GRACE_MS 15000
+/* A prior that served nothing when this instance started was never asked to exit and will not
+ * go by itself: one wedged before it bound its port, or still starting. Waiting the full grace
+ * for it only made every send of the helper look stuck for 15 s (seen on a FW 13.60 Phat: a
+ * ps5upload.elf alive for hours with no startup trace and no port). A starting helper is in its
+ * own setup, not in a Sony call, until it serves. */
+#define REAP_GRACE_UNASKED_MS 3000
 
 void runtime_reap_prior_instance(runtime_state_t *state) {
     if (!state) return;
@@ -1152,6 +1176,7 @@ void runtime_reap_prior_instance(runtime_state_t *state) {
     {
         struct timespec t0, now;
         int gone = 0;
+        const int grace_ms = state->prior_asked ? REAP_GRACE_MS : REAP_GRACE_UNASKED_MS;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         for (;;) {
             if (kill((pid_t)prior, 0) != 0) {
@@ -1159,14 +1184,15 @@ void runtime_reap_prior_instance(runtime_state_t *state) {
                 break;
             }
             clock_gettime(CLOCK_MONOTONIC, &now);
-            if ((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000 >= REAP_GRACE_MS) break;
+            if ((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000 >= grace_ms) break;
             usleep(100000);
         }
         if (gone) {
             fprintf(stderr, "[payload2] prior instance pid=%d exited by itself\n", prior);
             return;
         }
-        fprintf(stderr, "[payload2] prior instance pid=%d is still alive after %d ms of grace\n", prior, REAP_GRACE_MS);
+        fprintf(stderr, "[payload2] prior instance pid=%d is still alive after %d ms of grace%s\n", prior,
+                grace_ms, state->prior_asked ? "" : " (it was serving nothing, so nothing asked it to exit)");
     }
 
     fprintf(stderr, "[payload2] reaping crashed prior instance pid=%d (name=%s)\n",
@@ -2303,6 +2329,171 @@ static int fs_mount_detach_lvd(int unit_id) {
     return 0;
 }
 
+/* ── Read-only PFSC mount for decompressing a .ffpfsc (#453) ───────────────
+ *
+ * The kernel decodes PFSC itself (it is how ShadowMount+ plays every .ffpfsc), so the helper
+ * mounts the container and reads the file inside: no decoder of our own. Linking zlib into the
+ * helper made it die with SIGBUS within minutes, and once froze the console.
+ *
+ * The profile is ShadowMount+'s for the outer .ffpfsc (sm_image.c, "nested outer"): LVD
+ * image_type 9 (selector 0x02 through its {1,2,3,4,8,9,10,11} table), single-save read-only
+ * flags 0x1C, 4096-byte sectors and secondary unit, then pfs with mkeymode=AC. Our own .ffpfs
+ * mounts use type 5 and SD, which the kernel does not take for a compressed container. */
+#define FS_UNPACK_BASE FS_MOUNT_BASE "/.unpack"
+#define FS_MOUNT_LVD_IMAGE_PFSC_OUTER 9u
+
+/* Where a live mount is recorded: on the /mnt tmpfs, so a reboot (which drops every LVD unit)
+ * also drops the record, and a unit number from an earlier boot is never detached. */
+static void fs_pfsc_record_path(const char *tag, char *out, size_t cap) {
+    snprintf(out, cap, "%s/%s.rec", FS_UNPACK_BASE, tag);
+}
+
+int fs_pfsc_mount_ro(const char *image, const char *tag, const char *note, char *mp, size_t mp_cap, int *unit_out,
+                     char *err, size_t err_cap) {
+    struct stat st;
+    *unit_out = -1;
+    mp[0] = 0;
+    if (stat(image, &st) != 0 || !S_ISREG(st.st_mode)) {
+        snprintf(err, err_cap, "fs_unpack_open_failed: %s", strerror(errno));
+        return -1;
+    }
+    (void)mkdir(FS_MOUNT_BASE, 0777);
+    (void)mkdir(FS_UNPACK_BASE, 0777);
+    snprintf(mp, mp_cap, "%s/%s", FS_UNPACK_BASE, tag);
+    if (mkdir(mp, 0777) != 0 && errno != EEXIST) {
+        snprintf(err, err_cap, "fs_unpack_mount_failed: mkdir %s", strerror(errno));
+        mp[0] = 0;
+        return -1;
+    }
+
+    int fd = open(FS_MOUNT_LVD_CTL, O_RDWR);
+    if (fd < 0) {
+        snprintf(err, err_cap, "fs_unpack_mount_failed: lvdctl %s", strerror(errno));
+        rmdir(mp);
+        mp[0] = 0;
+        return -1;
+    }
+    fs_mount_lvd_layer_t layer;
+    memset(&layer, 0, sizeof(layer));
+    layer.source_type = 1; /* file */
+    layer.flags = 0x1;     /* no bitmap */
+    layer.path = image;
+    layer.size = (uint64_t)st.st_size;
+    fs_mount_lvd_attach_t req;
+    memset(&req, 0, sizeof(req));
+    req.device_id = -1;
+    req.sector_size = 4096u;
+    req.secondary_unit = 4096u;
+    req.flags = FS_MOUNT_LVD_FLAGS_PFS_RO;
+    req.image_type = FS_MOUNT_LVD_IMAGE_PFSC_OUTER;
+    req.layer_count = 1;
+    req.device_size = (uint64_t)st.st_size;
+    req.layers_ptr = &layer;
+    int rc = ioctl(fd, FS_MOUNT_LVD_IOC_ATTACH_V0, &req);
+    int saved = errno;
+    close(fd);
+    if (rc != 0 || req.device_id < 0) {
+        snprintf(err, err_cap, "fs_unpack_mount_failed: lvd attach %s", rc != 0 ? strerror(saved) : "no unit");
+        rmdir(mp);
+        mp[0] = 0;
+        return -1;
+    }
+    char devname[32];
+    snprintf(devname, sizeof(devname), "/dev/lvd%d", req.device_id);
+    if (fs_mount_wait_node(devname, 1) != 0) {
+        snprintf(err, err_cap, "fs_unpack_mount_failed: %s did not appear", devname);
+        (void)fs_mount_detach_lvd(req.device_id);
+        rmdir(mp);
+        mp[0] = 0;
+        return -1;
+    }
+
+    char errmsg[256] = {0};
+    struct iovec iov[32];
+    int n = 0;
+#define PFSC_PUSH(k, v)                  \
+    do {                                 \
+        fs_mount_iov(&iov[n++], (k));    \
+        fs_mount_iov(&iov[n++], (v));    \
+    } while (0)
+    PFSC_PUSH("from", devname);
+    PFSC_PUSH("fspath", mp);
+    PFSC_PUSH("fstype", "pfs");
+    PFSC_PUSH("sigverify", "0");
+    PFSC_PUSH("mkeymode", "AC");
+    PFSC_PUSH("budgetid", "game");
+    PFSC_PUSH("playgo", "0");
+    PFSC_PUSH("disc", "0");
+    PFSC_PUSH("ekpfs", FS_MOUNT_PFS_EKPFS_HEX);
+    PFSC_PUSH("async", NULL);
+    PFSC_PUSH("noatime", NULL);
+    PFSC_PUSH("automounted", NULL);
+#undef PFSC_PUSH
+    fs_mount_iov(&iov[n++], "errmsg");
+    iov[n].iov_base = errmsg;
+    iov[n].iov_len = sizeof(errmsg);
+    n++;
+    if (nmount(iov, (unsigned)n, MNT_RDONLY) != 0) {
+        snprintf(err, err_cap, "fs_unpack_mount_failed: %s", errmsg[0] ? errmsg : strerror(errno));
+        (void)fs_mount_detach_lvd(req.device_id);
+        rmdir(mp);
+        mp[0] = 0;
+        return -1;
+    }
+    *unit_out = req.device_id;
+    char rec[300];
+    fs_pfsc_record_path(tag, rec, sizeof(rec));
+    FILE *f = fopen(rec, "w");
+    if (f) {
+        fprintf(f, "%d %d\n%s\n%s\n", (int)getpid(), req.device_id, mp, note ? note : "");
+        fclose(f);
+    }
+    return 0;
+}
+
+void fs_pfsc_release(const char *mp, int unit) {
+    if (mp && mp[0]) (void)fs_mount_try_unmount(mp);
+    if (unit >= 0) (void)fs_mount_detach_lvd(unit);
+    if (mp && mp[0]) {
+        (void)rmdir(mp);
+        const char *leaf = strrchr(mp, '/');
+        char rec[300];
+        fs_pfsc_record_path(leaf ? leaf + 1 : mp, rec, sizeof(rec));
+        (void)unlink(rec);
+    }
+}
+
+/* A helper that died mid-unpack leaves its mount, LVD unit and .part behind; the next start clears
+ * them from the record it wrote. The mount itself is not in the mount table this process sees, so
+ * the record is the only trace. An instance that is still running (a takeover lets the old one
+ * finish its job) is left alone: it releases its own. */
+void fs_pfsc_sweep(void) {
+    char rec[300], mp[256], note[1024];
+    fs_pfsc_record_path("job", rec, sizeof(rec));
+    FILE *f = fopen(rec, "r");
+    if (!f) return;
+    int pid = -1, unit = -1;
+    mp[0] = note[0] = 0;
+    int ok = fscanf(f, "%d %d\n", &pid, &unit) == 2 && fgets(mp, sizeof(mp), f) != NULL;
+    if (ok && fgets(note, sizeof(note), f) == NULL) note[0] = 0;
+    fclose(f);
+    mp[strcspn(mp, "\n")] = 0;
+    note[strcspn(note, "\n")] = 0;
+    if (!ok || pid <= 0) {
+        (void)unlink(rec);
+        return;
+    }
+    if (pid != (int)getpid() && (kill(pid, 0) == 0 || errno == EPERM)) return; /* still running */
+    /* Only our own mount point; the unit came from the same boot (the record is on tmpfs). */
+    if (strncmp(mp, FS_UNPACK_BASE "/", strlen(FS_UNPACK_BASE) + 1) != 0) {
+        (void)unlink(rec);
+        return;
+    }
+    fs_pfsc_release(mp, unit);
+    size_t n = strlen(note);
+    if (n > 5 && strcmp(note + n - 5, ".part") == 0 && is_path_allowed(note)) (void)unlink(note);
+}
+
 /* fs_mount_kind_t — local enum capturing which (fstype, secondary_unit,
  * image_type) triple we want for an attach. Cheap to pass around and
  * makes the call sites readable without hauling around bare strings. */
@@ -3284,9 +3475,8 @@ static int handle_app_unregister(runtime_state_t *state, const char *request_bod
     /* Same gate-lifted rationale as APP_REGISTER above — relies on the
      * compile-time Sony-sprx linkage in the Makefile for proper sprx
      * init before main(). The underlying register.c::unregister_title
-     * runs under g_register_lock and degrades cleanly when Sony's
-     * sceAppInstUtilAppUnInstall is missing on a firmware (the nullfs
-     * teardown alone is enough to remove the XMB tile). */
+     * runs under g_register_lock; the reply below reports what Sony's
+     * sceAppInstUtilAppUnInstall and the console's folders say. */
     if (request_body) {
         extract_json_string_field(request_body, "title_id",
                                   title_id, sizeof(title_id));
@@ -3294,8 +3484,20 @@ static int handle_app_unregister(runtime_state_t *state, const char *request_bod
     if (title_id[0] == '\0') {
         return mgmt_reply(MGMT_FRAME_ERROR, "unregister_title_id_missing", 27);
     }
-    unsigned sony_rc = 0u;
-    if (unregister_title(title_id, &err, &sony_rc) != 0) {
+    if (strcmp(title_id, WEBUI_TILE_TITLE_ID) == 0) {
+        /* The helper's own home-screen tile: a PC removing it means "tile off", as in the page's
+         * Settings. Saved, so the next helper start does not register it again; the tile thread
+         * unregisters it and deletes its folders (webui_tile_remove). */
+        static const char ack[] = "{\"sony_uninstall_rc\":0,\"tile_off\":true}";
+        if (webui_api_tile_off() != 0) {
+            static const char reason[] = "tile_removal_failed: removal or saving tile:false failed; recovery files kept when possible";
+            return mgmt_reply(MGMT_FRAME_ERROR, reason, sizeof reason - 1);
+        }
+        pop_notification("PS5Upload tile removed");
+        return mgmt_reply(MGMT_FRAME_APP_UNREGISTER_ACK, ack, (uint64_t)(sizeof ack - 1));
+    }
+    unregister_outcome_t outcome;
+    if (unregister_title(title_id, &err, &outcome) != 0) {
         const char *reason = err ? err : "unregister_failed";
         return mgmt_reply(MGMT_FRAME_ERROR, reason, (uint64_t)strlen(reason));
     }
@@ -3303,22 +3505,24 @@ static int handle_app_unregister(runtime_state_t *state, const char *request_bod
     state->command_count += 1;
     pthread_mutex_unlock(&state->state_mtx);
 
+    /* #476: the toast used to say "Unregistered" whatever Sony answered, and the app then
+     * listed the game again. It now says what happened, and a refusal is an ERROR frame so
+     * every engine version reports it instead of removing the game from its list. */
     {
         char toast[160];
-        snprintf(toast, sizeof(toast), "Unregistered %s", title_id);
+        unregister_toast(&outcome, title_id, toast, sizeof(toast));
         pop_notification(toast);
     }
-
-    /* Carry Sony's uninstall result back. An empty ACK used to mean
-     * "unregistered" unconditionally, so a refusal by
-     * sceAppInstUtilAppUninstall (e.g. 0x80B21B02 on a title whose
-     * content records are inconsistent) was invisible to the client. */
     {
-        char ack[96];
-        int alen = snprintf(ack, sizeof(ack),
-                            "{\"sony_uninstall_rc\":%u}", sony_rc);
-        if (alen < 0) alen = 0;
-        return mgmt_reply(MGMT_FRAME_APP_UNREGISTER_ACK, ack, (uint64_t)alen);
+        char reply[96];
+        size_t rlen = 0;
+        int ack = unregister_reply(&outcome, reply, sizeof(reply), &rlen);
+        if (ack < 0) {
+            static const char reason[] = "unregister_reply_failed";
+            return mgmt_reply(MGMT_FRAME_ERROR, reason, sizeof(reason) - 1);
+        }
+        return mgmt_reply(ack ? MGMT_FRAME_APP_UNREGISTER_ACK : MGMT_FRAME_ERROR, reply,
+                          (uint64_t)rlen);
     }
 }
 
@@ -4111,7 +4315,6 @@ extern int sceUserServiceGetLoginUserIdList(int *id_list);
 extern int sceUserServiceGetUserName(int user_id, char *name, size_t size);
 extern int sceUserServiceSetUserName(int user_id, const char *name);
 extern int sceUserServiceDestroyUser(int user_id);
-extern int sceUserServiceGetInitialUser(int *user_id);
 #define USER_SERVICE_MAX_USERS 16
 
 /* App lifecycle — libSceSysCore exports. ApplicationGetProcs returns
@@ -4657,46 +4860,28 @@ static int handle_user_list(runtime_state_t *state) {
 }
 
 /* ── User create / delete ──────────────────────────────────────────────
- * sceUserServiceCreateUser allocates a new local user account and
- * returns its user_id. The initial name is set via SetUserName after
- * creation. sceUserServiceDeleteUser removes the account; Sony cleans
- * up home dir content but we offer an optional pre-wipe of savedata. */
+ * There is no way to create a user from here. libSceUserService on 13.60
+ * exports no create call (probed by name: CreateUser and every variant
+ * resolve to NULL), and the old path -- GetInitialUser + SetUserName --
+ * never created anything: it renamed the initial user, and in a payload
+ * GetInitialUser fails with 0x80940004 anyway (#460). So create answers
+ * with a plain "add the user on the console" error and touches nothing.
+ * sceUserServiceDestroyUser does exist, so delete stays. */
 
 static int handle_user_create(runtime_state_t *state, const char *body) {
     if (!state) return -1;
     char name[64] = {0};
     extract_json_string_field(body, "name", name, sizeof(name));
-    int rc = -1;
-    int new_uid = -1;
-    const char *err_msg = "";
-    if (name[0]) {
-        pthread_mutex_lock(&sony_api_lock);
-        sceUserServiceInitialize(NULL); /* a Sony call: inside the lock (final review: console) */
-        int raw_uid = -1;
-        int init_rc = sceUserServiceGetInitialUser(&raw_uid);
-        if (init_rc == 0 && raw_uid >= 0) {
-            int name_rc = sceUserServiceSetUserName(raw_uid, name);
-            if (name_rc != 0) {
-                err_msg = "user found but SetUserName failed";
-            }
-            new_uid = raw_uid;
-            rc = 0;
-        } else {
-            err_msg = "sceUserServiceGetInitialUser failed";
-        }
-        usleep(SONY_API_POST_SLEEP_US);
-        pthread_mutex_unlock(&sony_api_lock);
-    } else {
-        err_msg = "empty name";
-    }
+    const char *err_msg = name[0]
+        ? "creating users is not supported: add the user on the PS5 (Switch User, then Add User)"
+        : "empty name";
     char nesc[128];
     json_escape_into(name, nesc, sizeof(nesc));
     char eesc[256];
     json_escape_into(err_msg, eesc, sizeof(eesc));
-    char resp[384];
+    char resp[512];
     int len = snprintf(resp, sizeof(resp),
-        "{\"ok\":%s,\"uid\":%d,\"name\":\"%s\",\"err\":\"%s\"}",
-        rc == 0 ? "true" : "false", new_uid, nesc, eesc);
+        "{\"ok\":false,\"uid\":-1,\"name\":\"%s\",\"err\":\"%s\"}", nesc, eesc);
     pthread_mutex_lock(&state->state_mtx);
     state->command_count += 1;
     pthread_mutex_unlock(&state->state_mtx);
@@ -5866,39 +6051,6 @@ static void *index_thread_fn(void *arg) {
     return NULL;
 }
 
-/* Tiny glob match: `*` matches any sequence, `?` matches one char.
- * Both are case-insensitive. Recursive — fine for typical patterns
- * with one or two wildcards; bounded by call depth (max 16).
- * Returns 1 on match, 0 on miss. */
-static int glob_match(const char *pat, const char *str, int depth) {
-    if (depth > 16) return 0;
-    while (*pat) {
-        if (*pat == '*') {
-            pat++;
-            if (!*pat) return 1;
-            while (*str) {
-                if (glob_match(pat, str, depth + 1)) return 1;
-                str++;
-            }
-            return 0;
-        }
-        if (*pat == '?') {
-            if (!*str) return 0;
-            pat++;
-            str++;
-            continue;
-        }
-        char a = *pat;
-        char b = *str;
-        if (a >= 'A' && a <= 'Z') a += 32;
-        if (b >= 'A' && b <= 'Z') b += 32;
-        if (a != b) return 0;
-        pat++;
-        str++;
-    }
-    return *str == '\0';
-}
-
 static int handle_index_start(runtime_state_t *state, const char *body, uint64_t body_len) {
     if (!state) return -1;
     pthread_mutex_lock(&g_index_lock);
@@ -5985,8 +6137,10 @@ static int handle_index_status(runtime_state_t *state) {
 
 static int handle_search_index(runtime_state_t *state, const char *body, uint64_t body_len) {
     if (!state) return -1;
-    /* Parse `{"query":"...","size_min":N,"size_max":N,"limit":N}`. */
+    /* Parse `{"query":"...","under":"/dir","size_min":N,"size_max":N,"limit":N}` (under optional). */
     char qbuf[256] = {0};
+    char ubuf[1024] = {0};
+    size_t ulen;
     long long size_min = 0;
     long long size_max = 0;
     int limit = 200;
@@ -6004,6 +6158,21 @@ static int handle_search_index(runtime_state_t *state, const char *body, uint64_
                 if (e && (size_t)(e - p) < sizeof(qbuf)) {
                     memcpy(qbuf, p, (size_t)(e - p));
                     qbuf[e - p] = '\0';
+                }
+            }
+        }
+        /* Optional "under":"/folder" (the console page's This folder; the engine never sends it):
+         * only paths below it count, so the limit applies after the filter. */
+        p = strstr(tmp, "\"under\"");
+        if (p) {
+            p = strchr(p, ':');
+            if (p) p = strchr(p, '"');
+            if (p) {
+                p++;
+                const char *e = strchr(p, '"');
+                if (e && (size_t)(e - p) < sizeof(ubuf)) {
+                    memcpy(ubuf, p, (size_t)(e - p));
+                    ubuf[e - p] = '\0';
                 }
             }
         }
@@ -6025,6 +6194,9 @@ static int handle_search_index(runtime_state_t *state, const char *body, uint64_
     }
     if (limit <= 0 || limit > 5000) limit = 200;
     if (!qbuf[0]) strcpy(qbuf, "*");
+    ulen = strlen(ubuf);
+    while (ulen > 1 && ubuf[ulen - 1] == '/') ubuf[--ulen] = '\0';
+    if (ulen == 1) ulen = 0; /* "/" is everything */
 
     char *resp = malloc(256 * 1024);
     if (!resp) {
@@ -6043,7 +6215,8 @@ static int handle_search_index(runtime_state_t *state, const char *body, uint64_
         if (!path) continue;
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
-        if (!glob_match(qbuf, base, 0)) continue;
+        if (ulen && (strncmp(path, ubuf, ulen) != 0 || (path[ulen] != '/' && path[ulen] != '\0'))) continue;
+        if (!index_glob_match(qbuf, base)) continue;
         long long sz = g_index_entries[i].size;
         if (size_min > 0 && sz < size_min) continue;
         if (size_max > 0 && sz > size_max) continue;
@@ -6832,9 +7005,31 @@ static int handle_shell_exec(runtime_state_t *state, const char *body,
  * The scan survives inside content_db_apps_json as the fallback for a
  * database that will not open at all (locked by the shell, or damaged),
  * which is a genuine runtime condition rather than a permanent one.
+ *
+ * Paged (#473): the request may carry {"offset":N,"limit":M}; the reply
+ * says where the next page starts ("next") and whether one follows
+ * ("more"), see content_db_apps_page_json. An empty request -- what an
+ * older engine sends -- is page one.
  */
-static int handle_appdb_query(runtime_state_t *state) {
+static int handle_appdb_query(runtime_state_t *state, const char *body,
+                              uint64_t body_len) {
     if (!state) return -1;
+
+    uint64_t offset = 0, limit = 0;
+    if (body && body_len > 0) {
+        /* mgmt_json_u64 reads a C string; the body is not terminated. */
+        char req[256];
+        size_t n = body_len < sizeof(req) - 1 ? (size_t)body_len
+                                              : sizeof(req) - 1;
+        memcpy(req, body, n);
+        req[n] = '\0';
+        if (mgmt_json_u64(req, "offset", &offset) < 0 ||
+            mgmt_json_u64(req, "limit", &limit) < 0 || offset > UINT32_MAX ||
+            limit > UINT32_MAX) {
+            const char *err = "{\"err\":\"bad_window\",\"apps\":[]}";
+            return mgmt_reply(MGMT_FRAME_APPDB_QUERY_ACK, err, strlen(err));
+        }
+    }
 
     const size_t cap = 64 * 1024;
     char *resp = (char *)malloc(cap);
@@ -6845,7 +7040,9 @@ static int handle_appdb_query(runtime_state_t *state) {
 
     size_t written = 0;
     int rc;
-    if (content_db_apps_json(resp, cap, &written) != 0 || written == 0) {
+    if (content_db_apps_page_json((unsigned)offset, (unsigned)limit, resp, cap,
+                                  &written) != 0 ||
+        written == 0) {
         const char *err = "{\"err\":\"appdb_unreadable\",\"apps\":[]}";
         rc = mgmt_reply(MGMT_FRAME_APPDB_QUERY_ACK, err, strlen(err));
     } else {
@@ -6973,6 +7170,7 @@ static int handle_app_icon_set(runtime_state_t *state, const char *body,
         int hide = hidden[0] == '1';
         char err[256] = {0};
         if (content_db_icon_set_visible(title_id, !hide, err, sizeof(err)) == 0) {
+            icon_keeper_note(title_id, hide);
             n = snprintf(resp, sizeof(resp), "{\"ok\":true,\"err\":null}");
             /* The home screen redraws its tiles when an app opens or closes, not on its own. */
             char toast[256];
@@ -7627,6 +7825,83 @@ static int handle_net_reach(runtime_state_t *state, const char *body,
     /* The probe itself lives in net_probe.c so the host tests run the real code. */
     size_t n = net_probe_reach(body, (size_t)body_len, resp, sizeof(resp));
     return mgmt_reply(MGMT_FRAME_NET_REACH_ACK, resp, (uint64_t)n);
+}
+
+/* NET_PORTS: the ports in use on the console (Discord ask). Body: {"lan":"a.b.c.d"}, the address
+ * the engine reached the console at. The scan binds and closes each port, never connects; see
+ * net_ports.h. About a second for all 65535 ports on FW 13.60. */
+static int handle_net_ports(runtime_state_t *state, const char *body, uint64_t body_len) {
+    if (!state) return -1;
+    const size_t cap = 32 * 1024;
+    char *resp = malloc(cap);
+    if (!resp) {
+        const char *err = "{\"ok\":false,\"err\":\"oom\"}";
+        return mgmt_reply(MGMT_FRAME_NET_PORTS_ACK, err, strlen(err));
+    }
+    pthread_mutex_lock(&state->state_mtx);
+    state->command_count += 1;
+    pthread_mutex_unlock(&state->state_mtx);
+    size_t n = net_ports_scan(body, (size_t)body_len, 1, 65535, resp, cap);
+    int rc = mgmt_reply(MGMT_FRAME_NET_PORTS_ACK, resp, (uint64_t)n);
+    free(resp);
+    return rc;
+}
+
+/* files.*: the console file manager's pinned/recent folders and the "Show on TV" / "Show on PC"
+ * handoffs, for the PC app (the console page reaches the same code through its web routes). The
+ * bodies live in files_handoff.c (host-tested); the answer buffer is on the heap. */
+static int files_method_reply(runtime_state_t *state, uint16_t ack, int which, const char *body, uint64_t body_len) {
+    const size_t cap = FILES_PREFS_FILE_MAX + 1;
+    char *resp;
+    int n, rc;
+    if (!state) return -1;
+    resp = malloc(cap);
+    if (!resp) {
+        const char *err = "{\"ok\":false,\"err\":\"out_of_memory\"}";
+        return mgmt_reply(ack, err, strlen(err));
+    }
+    pthread_mutex_lock(&state->state_mtx);
+    state->command_count += 1;
+    pthread_mutex_unlock(&state->state_mtx);
+    switch (which) {
+    case 0: n = files_mgmt_prefs_get(FILES_PREFS_PATH, resp, cap); break;
+    case 1: n = files_mgmt_prefs_set(FILES_PREFS_PATH, body, (size_t)body_len, resp, cap); break;
+    case 2: n = files_mgmt_handoff_put(body, (size_t)body_len, files_handoff_now_ms(), resp, cap); break;
+    default: n = files_mgmt_handoff_take(body, (size_t)body_len, files_handoff_now_ms(), resp, cap); break;
+    }
+    if (n < 0) {
+        const char *err = "{\"ok\":false,\"err\":\"internal\"}";
+        rc = mgmt_reply(ack, err, strlen(err));
+    } else {
+        rc = mgmt_reply(ack, resp, (uint64_t)n);
+    }
+    free(resp);
+    return rc;
+}
+
+static int handle_files_prefs_get(runtime_state_t *state) {
+    return files_method_reply(state, MGMT_FRAME_FILES_PREFS_GET_ACK, 0, "", 0);
+}
+
+static int handle_files_prefs_set(runtime_state_t *state, const char *body, uint64_t body_len) {
+    return files_method_reply(state, MGMT_FRAME_FILES_PREFS_SET_ACK, 1, body, body_len);
+}
+
+static int handle_files_handoff_put(runtime_state_t *state, const char *body, uint64_t body_len) {
+    return files_method_reply(state, MGMT_FRAME_FILES_HANDOFF_PUT_ACK, 2, body, body_len);
+}
+
+static int handle_files_handoff_take(runtime_state_t *state, const char *body, uint64_t body_len) {
+    return files_method_reply(state, MGMT_FRAME_FILES_HANDOFF_TAKE_ACK, 3, body, body_len);
+}
+
+static int handle_minion_tile(runtime_state_t *state, const char *body, uint64_t body_len) {
+    char reply[256];
+    int n;
+    if (!state || body_len > 128) return -1;
+    n = webui_api_tile(body, (size_t)body_len, reply, sizeof reply);
+    if (n < 0) return -1;
+    return mgmt_reply(MGMT_FRAME_MINION_TILE_ACK, reply, (uint64_t)n);
 }
 
 /* ── Network round-trip ack ──────────────────────────────────────────── */

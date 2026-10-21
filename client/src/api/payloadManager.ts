@@ -7,6 +7,8 @@ import { hostOf } from "../lib/addr";
 
 export interface PmStoredPayload {
   path: string;
+  /** Payload Manager 0.6's slot (`local/<stem>`, `repo/<id>@<source>`); "" on 0.5. */
+  slot: string;
   filename: string;
   folder: string;
   name: string;
@@ -18,7 +20,8 @@ export interface PmStoredPayload {
 export interface PmAutoload {
   enabled: boolean;
   delay_s: number;
-  /** File names Payload Manager resolves through its folders, or `!<ms>` pauses, in order. */
+  /** What Payload Manager loads at boot, in order: file names (0.5) or slots (0.6), with
+   *  `!<ms>` pauses. `autoloadKey` gives a payload's entry. */
   list: string[];
 }
 
@@ -119,4 +122,9 @@ export async function pmStore(
     return { stored: false, needsConfirm: true, folder: w.folder ?? "", fileExists: !!w.file_exists };
   }
   throw new Error(w.error || "store failed");
+}
+
+/** The autoload-list entry that names `p`: its slot on Payload Manager 0.6, else its file name. */
+export function autoloadKey(p: Pick<PmStoredPayload, "slot" | "filename">): string {
+  return p.slot || p.filename;
 }

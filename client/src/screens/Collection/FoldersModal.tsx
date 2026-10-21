@@ -94,12 +94,20 @@ export function FoldersModal({
                 className="shrink-0 text-[var(--color-muted)]"
               />
             )}
-            <span
-              className="min-w-0 flex-1 break-all font-mono text-xs"
-              title={r}
-            >
-              {shown(r)}
-            </span>
+            <div className="min-w-0 flex-1">
+              <span className="block break-all font-mono text-xs" title={r}>
+                {shown(r)}
+              </span>
+              {library?.missing_roots?.includes(r) && (
+                <span className="mt-1 inline-block rounded-full bg-[var(--color-bad)]/15 px-2 py-0.5 text-[11px] text-[var(--color-bad)]">
+                  {tr(
+                    "collection.folder_missing",
+                    undefined,
+                    "Not found, skipped",
+                  )}
+                </span>
+              )}
+            </div>
             <button
               type="button"
               onClick={() => void removeCollectionRoot(r)}
@@ -150,7 +158,7 @@ export function FoldersModal({
           ? tr(
               "collection.server_folders_hint",
               undefined,
-              "A folder on a saved server (SMB, FTP, SFTP) is read in place: nothing is copied to this computer, and its games install straight from the server. Move to Trash and Organize work on this computer's folders only.",
+              "A folder on a saved server (SMB, FTP, SFTP/WebDAV) is read in place: nothing is copied to this computer, and its games install straight from the server. Organize works there too, renaming on the server itself; Move to Trash works on this computer's folders only.",
             )
           : tr(
               "collection.no_servers_hint",

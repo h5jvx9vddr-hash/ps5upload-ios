@@ -180,11 +180,26 @@ function loadEnKeys() {
   return new Set(Object.keys(dict));
 }
 
+/** The console web page (client/src/console/) passes its `cw_*` keys around in
+ *  tables (`labelKey: "cw_nav_home"`, hint labels) and resolves them with
+ *  `t(labelKey)`, so in that tree any quoted `cw_*` literal counts as a use. Its
+ *  generated locales/<code>.json files are not scanned (only .ts/.tsx are). */
+const CONSOLE_ROOT = path.join(SRC_ROOT, "console") + path.sep;
+function extractConsoleKeys(file, content) {
+  const keys = new Set();
+  if (!file.startsWith(CONSOLE_ROOT)) return keys;
+  const re = /["'`](cw_[A-Za-z0-9_]+)["'`]/g;
+  let m;
+  while ((m = re.exec(content)) !== null) keys.add(m[1]);
+  return keys;
+}
+
 const usedKeys = new Set();
 const identifierCalls = []; // [{file, line, snippet}] of tr(IDENT, …) sites
 for (const f of walkSrc(SRC_ROOT)) {
   const content = fs.readFileSync(f, "utf8");
   for (const k of extractKeysFrom(content)) usedKeys.add(k);
+  for (const k of extractConsoleKeys(f, content)) usedKeys.add(k);
   for (const site of extractIdentifierCalls(content)) {
     identifierCalls.push({ file: path.relative(repoRoot, f), ...site });
   }

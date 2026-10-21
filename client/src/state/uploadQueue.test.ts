@@ -462,6 +462,7 @@ describe("an item from another console", () => {
       "/data/homebrew/PPSA11386-app",
       item.txIdHex,
       { mode: undefined, directAddr: undefined },
+      null,
     );
     expect(item.status).toBe("done");
     expect(mockedStartFile).not.toHaveBeenCalledWith(
@@ -470,6 +471,52 @@ describe("an item from another console", () => {
       expect.anything(),
       expect.anything(),
     );
+  });
+
+  it("adopts a send another device started under that send's job id, once (#444)", async () => {
+    const { startPs5ToPs5 } = await import("../api/ava1");
+    vi.mocked(startPs5ToPs5).mockClear();
+    const tx = "0123456789abcdef0123456789abcdef";
+    const id = useUploadQueueStore.getState().add({
+      sourceKind: "ps5",
+      fromConsole: "192.168.1.100",
+      route: "direct",
+      directAddr: "127.0.0.1:19120",
+      sourcePath: "/data/homebrew/PPSA11386-app",
+      displayName: "PPSA11386-app",
+      resolvedDest: "/data/homebrew/PPSA11386-app",
+      addr: "192.168.1.99",
+      strategy: "overwrite",
+      reconcileMode: "fast",
+      excludes: [],
+      mountAfterUpload: false,
+      mountReadOnly: true,
+      registerAfterUpload: false,
+      txIdHex: tx,
+      adopt: "take",
+    });
+    expect(useUploadQueueStore.getState().items.find((i) => i.id === id)?.txIdHex).toBe(tx);
+    mockedJobStatus.mockResolvedValue({
+      status: "done",
+      bytes_sent: 100,
+      elapsed_ms: 10,
+    } as Awaited<ReturnType<typeof jobStatus>>);
+    const p = useUploadQueueStore.getState().start();
+    await vi.advanceTimersByTimeAsync(5000);
+    await p;
+    expect(vi.mocked(startPs5ToPs5)).toHaveBeenCalledWith(
+      "192.168.1.100",
+      "/data/homebrew/PPSA11386-app",
+      "192.168.1.99",
+      "/data/homebrew/PPSA11386-app",
+      tx,
+      { mode: "direct", directAddr: "127.0.0.1:19120" },
+      "take",
+    );
+    // A later retry is an ordinary resume of the same job, not another take-over.
+    const item = useUploadQueueStore.getState().items.find((i) => i.id === id);
+    expect(item?.adopt).toBeNull();
+    expect(item?.status).toBe("done");
   });
 });
 
@@ -1213,7 +1260,8 @@ describe("resumeFailedRecoverable", () => {
     expect(byId(fatalA).status).toBe("failed"); // fatal → left alone
     expect(byId(recoverB).status).toBe("failed"); // other host → untouched
     expect(startHost).toHaveBeenCalledTimes(1);
-    expect(startHost).toHaveBeenCalledWith("192.168.1.10:9113");
+    // Nobody clicked for this run: it must not send a helper the user stopped (#471).
+    expect(startHost).toHaveBeenCalledWith("192.168.1.10:9113", { unattended: true });
   });
 
   it("no-ops and never starts the queue when autoResume is off", async () => {

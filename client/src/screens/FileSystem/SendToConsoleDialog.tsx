@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowUp, Folder, HardDrive, Monitor, Send, Usb } from "lucide-react";
+import { Activity, ArrowUp, Folder, HardDrive, Monitor, Send, Usb } from "lucide-react";
 
 import { fetchVolumes, fsListDir, type Volume } from "../../api/ps5";
 import { Button, Modal, SegmentedControl } from "../../components";
@@ -9,7 +9,9 @@ import { formatBytes } from "../../lib/format";
 import { quickDestinations } from "../../lib/moveTo";
 import { useTr } from "../../state/lang";
 import { useRosterStore } from "../../state/roster";
-import { useC2cRoutes, type C2cRouteMode } from "../../state/c2cRoutes";
+import { useC2cRoutes, type C2cRoute, type C2cRouteMode } from "../../state/c2cRoutes";
+import { testPs5Connection } from "../../api/ava1";
+import { testLines, type TestLine } from "../../lib/c2cTest";
 
 function parentDir(p: string): string {
   if (p === "/" || p === "") return "/";
@@ -366,7 +368,111 @@ export function SendToConsoleDialog({
             )}
           </div>
         )}
+
+        {target && (
+          <ConnectionTestBlock
+            from={hostOf(fromHost)}
+            to={target}
+            fromName={profiles.find((p) => hostOf(p.host) === hostOf(fromHost))?.name || hostOf(fromHost)}
+            toName={targetName}
+            route={route}
+            disabled={!addrOk}
+          />
+        )}
       </div>
     </Modal>
+  );
+}
+
+/** "Test connection" (#444): asks the sending console to connect to the receiving one the way
+ *  a send would dial it (and, unless direct only, whether this device reaches both). */
+function ConnectionTestBlock({
+  from,
+  to,
+  fromName,
+  toName,
+  route,
+  disabled,
+}: {
+  from: string;
+  to: string;
+  fromName: string;
+  toName: string;
+  route: C2cRoute;
+  disabled: boolean;
+}) {
+  const tr = useTr();
+  const [deep, setDeep] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<{ lines: TestLine[]; error: string | null } | null>(null);
+  // Another console or route makes an earlier answer stale.
+  useEffect(() => setResult(null), [to, route.mode, route.directAddr]);
+  const run = async () => {
+    setBusy(true);
+    setResult(null);
+    try {
+      const t = await testPs5Connection(from, to, route, deep && route.mode !== "relay");
+      setResult({ lines: testLines(t, fromName, toName), error: null });
+    } catch (e) {
+      setResult({ lines: [], error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="grid gap-1.5 text-xs" data-testid="send-console-test">
+      <div className="flex flex-wrap items-center gap-3">
+        <Button
+          variant="secondary"
+          size="sm"
+          leftIcon={<Activity size={14} />}
+          loading={busy}
+          disabled={disabled}
+          onClick={() => void run()}
+          data-testid="send-console-test-run"
+        >
+          {busy
+            ? tr("c2c_test_running", undefined, "Testing…")
+            : tr("c2c_test_button", undefined, "Test connection")}
+        </Button>
+        {route.mode !== "relay" && (
+          <label className="flex items-center gap-1.5 text-[var(--color-muted)]">
+            <input type="checkbox" checked={deep} onChange={(e) => setDeep(e.target.checked)} />
+            {tr("c2c_test_deep", undefined, "Also send 4 KiB straight across")}
+          </label>
+        )}
+      </div>
+      {result && <TestResultLines lines={result.lines} error={result.error} />}
+    </div>
+  );
+}
+
+/** The test's verdicts, one line each. */
+export function TestResultLines({ lines, error }: { lines: TestLine[]; error: string | null }) {
+  const tr = useTr();
+  if (error) {
+    return (
+      <p className="text-[var(--color-bad)]" role="alert">
+        {tr("c2c_test_failed", { error }, `The test did not run: ${error}`)}
+      </p>
+    );
+  }
+  return (
+    <ul className="grid gap-0.5" data-testid="send-console-test-result">
+      {lines.map((l) => (
+        <li
+          key={l.key + JSON.stringify(l.vars)}
+          className={
+            l.tone === "good"
+              ? "text-[var(--color-good)]"
+              : l.tone === "bad"
+                ? "text-[var(--color-bad)]"
+                : "text-[var(--color-warn)]"
+          }
+        >
+          {tr(l.key, l.vars, l.fallback)}
+        </li>
+      ))}
+    </ul>
   );
 }

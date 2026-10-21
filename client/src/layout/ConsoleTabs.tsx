@@ -9,6 +9,8 @@ import { pkgLibraryStore } from "../state/pkgLibrary";
 import { hostOf, typedHost } from "../lib/addr";
 import { useEdgeFade } from "../lib/edgeFade";
 import { useTr } from "../state/lang";
+import { consoleLight, consoleLightColor } from "../lib/consolePower";
+import { consoleLightLabel } from "../lib/consoleLightLabel";
 
 /**
  * Console tab strip — one tab per PS5, always visible above the content.
@@ -23,16 +25,16 @@ import { useTr } from "../state/lang";
 
 function StatusDot({ host }: { host: string }) {
   const rt = useHostRuntime(host);
-  const color =
-    rt.payloadStatus === "up"
-      ? "var(--color-good)"
-      : rt.payloadStatus === "down"
-        ? "var(--color-bad)"
-        : "var(--color-muted)";
+  const tr = useTr();
+  // Rest mode is a calm accent with its own tooltip, not the red of a fault.
+  const light = consoleLight(rt);
+  const quiet = light === "rest" || light === "unreachable";
   return (
     <span
       className="inline-block h-2 w-2 shrink-0 rounded-full"
-      style={{ background: color }}
+      style={{ background: consoleLightColor(light) }}
+      data-light={light}
+      title={quiet ? consoleLightLabel(light, tr) : undefined}
       aria-hidden
     />
   );

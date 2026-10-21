@@ -28,7 +28,8 @@ describe("wakeUi", () => {
     expect(wakeUi("standby", false).showWakeButton).toBe(false);
     // Credential ready but the console is already awake.
     expect(wakeUi("awake", true).showWakeButton).toBe(false);
-    expect(wakeUi("offline", true).showWakeButton).toBe(false);
+    expect(wakeUi("offline", true).showWakeButton).toBe(true);
+    expect(wakeUi("offline", false).showWakeButton).toBe(false);
   });
 
   it("offers setup exactly while there is no credential", () => {

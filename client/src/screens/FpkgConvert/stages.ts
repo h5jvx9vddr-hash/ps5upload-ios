@@ -21,6 +21,8 @@ export interface StageRow {
 const BUILD: readonly PipelineStage[] = ["check", "plan", "compress", "write", "verify"];
 /** An image whose files are packed into AMPR LZ4 asset packs first. */
 const PACKED_BUILD: readonly PipelineStage[] = ["check", "pack", "plan", "compress", "write", "verify"];
+/** A plain folder from an image or package: written, then read back. */
+const FOLDER: readonly PipelineStage[] = ["write", "verify"];
 const INSTALL: readonly PipelineStage[] = ["send", "install"];
 /** A console dump is set aside, then its package installs (see lib/dumpSwap.ts). */
 const SWAP: readonly PipelineStage[] = ["park", "install"];
@@ -41,6 +43,8 @@ const WEIGHT: Record<PipelineStage, number> = {
 };
 
 function stagesFor(mode: PipelineMode, source: string, packs: boolean): readonly PipelineStage[] {
+  // The engine reads the image or package in place, wherever it is.
+  if (mode === "folder") return FOLDER;
   const copy: PipelineStage[] = [];
   // A build reads a server folder or image in place; a server archive, or an image being
   // compressed (which reads local disk), is copied first.

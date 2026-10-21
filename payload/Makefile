@@ -157,15 +157,45 @@ CFLAGS := -Wall -Wextra -Werror -g $(INCLUDES)
 LIBS := -lSceSystemService -lSceUserService -lSceIpmi -lSceAppInstUtil \
         -lSceNotification -lSceRegMgr -lSceFsInternalForVsh -lkernel_sys
 
+# The home-screen tile's icon0.png (512x512, the app icon client/src-tauri/icons/icon.png),
+# embedded as a C array by xxd: webui_tile_icon0_png[] + webui_tile_icon0_png_len, which
+# webui_tile.c writes into /data/ps5upload/tile/PSUP00001/sce_sys/. Generated under build/
+# (git-ignored); `cd assets` keeps xxd's symbol names independent of the path.
+WEBUI_TILE_ICON_PNG := assets/webui_tile_icon0.png
+WEBUI_TILE_ICON_C := build/webui_tile_icon.c
+
+# The console web page, built from the client (`npm run build:console`: one self-contained
+# client/dist-console/index.html), gzip'd and embedded by xxd as webui_page_gz[] +
+# webui_page_gz_len (include/webui_page.h), which the helper serves at GET /. Needs the client's
+# node_modules (`npm ci` in client/). Rebuilt when the page's sources, the locale files (its
+# strings), the PC app's tokens (src/index.css) or the build config change.
+WEBUI_PAGE_C := build/webui_page.c
+# The same build writes client/dist-console/strings/<lang>.json (every language but English, which
+# is inside the page); scripts/embed-console-strings.mjs gzips each into build/webui_strings.c
+# (include/webui_strings.h), served at GET /strings/<lang>.json.
+WEBUI_STRINGS_C := build/webui_strings.c
+# And its offline copy (client/src/console/offline/offlineCopy.ts): dist-console/sw.js and
+# dist-console/cache.appcache, embedded by xxd as webui_sw_js[] and webui_cache_appcache[]
+# (include/webui_offline.h), served at GET /sw.js and GET /cache.appcache.
+WEBUI_OFFLINE_C := build/webui_offline.c
+CLIENT_DIR := ../client
+WEBUI_PAGE_DEPS := $(shell find $(CLIENT_DIR)/src/console -type f ! -name '*.test.ts' 2>/dev/null) \
+        $(wildcard $(CLIENT_DIR)/src/i18n/locales/*.ts) $(CLIENT_DIR)/src/index.css \
+        $(CLIENT_DIR)/public/logo-square.png $(CLIENT_DIR)/vite.console.config.ts \
+        $(CLIENT_DIR)/package.json $(CLIENT_DIR)/package-lock.json ../scripts/build-console-strings.mjs
+
 SRCS := src/main.c src/runtime.c src/shell_builtin.c src/takeover.c src/takeover_flag.c src/ownership_record.c src/ava1_stop.c src/register.c src/hw_info.c \
         src/drive_sensors.c \
         src/proc_list.c src/ptrace_remote.c src/shellui_rpc.c \
         src/sony_api_lock.c src/kernel_rw_lock.c src/sys_time.c \
         src/sys_registry.c src/smp_meta.c src/profile.c \
         src/backup.c src/remoteplay.c src/rp_pair.c src/fan_curve.c src/fan_map.c src/indicator.c src/notif.c \
-        src/wake_watchdog.c src/cheats.c src/cheats_list.c src/xml_encoding.c src/activity.c src/sdk_changer.c src/fakelib_overlay.c \
+        src/wake_watchdog.c src/icon_keeper.c src/ffpfsc_unpack.c src/cheats.c src/cheats_plan.c src/cheats_list.c src/xml_encoding.c src/activity.c src/sdk_changer.c src/fakelib_overlay.c \
         src/tmdb.c src/fw_spoof.c src/focus_probe.c \
-        src/content_db.c src/mgmt_rpc.c src/fs_jobs.c src/net_probe.c src/mgmt_fs.c src/path_policy.c \
+        src/content_db.c src/mgmt_rpc.c src/fs_jobs.c src/net_probe.c src/net_ports.c src/mgmt_fs.c src/path_policy.c \
+        src/webui_http.c src/webui_auth.c src/webui_server.c src/webui_codec.c src/webui_api.c \
+        src/webui_settings.c src/webui_inputlog.c src/webui_files.c src/webui_cheats_store.c src/webui_tile.c src/webui_strings.c src/webui_offline.c src/files_prefs.c src/files_handoff.c $(WEBUI_TILE_ICON_C) \
+        $(WEBUI_PAGE_C) $(WEBUI_STRINGS_C) $(WEBUI_OFFLINE_C) \
         third_party/tiny_aes/aes.c \
         $(BLAKE3_SRCS)
 
@@ -211,6 +241,30 @@ build/ava1/ava1/ava1_chacha_avx2.o: ava1/ava1_chacha_avx2.c $(HEADERS) Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(AVA1_CFLAGS) -mavx2 -c -o $@ $<
 
+$(WEBUI_TILE_ICON_C): $(WEBUI_TILE_ICON_PNG) Makefile
+	@mkdir -p $(dir $@)
+	(cd assets && xxd -i webui_tile_icon0.png) > $@.tmp && mv $@.tmp $@
+
+# `cd build` keeps xxd's symbol names webui_page_gz / webui_page_gz_len.
+$(WEBUI_PAGE_C): $(WEBUI_PAGE_DEPS) Makefile
+	@mkdir -p $(dir $@)
+	npm --prefix $(CLIENT_DIR) run build:console
+	gzip -9n -c $(CLIENT_DIR)/dist-console/index.html > build/webui_page.gz.tmp
+	mv build/webui_page.gz.tmp build/webui_page.gz
+	(cd build && xxd -i webui_page.gz) > $@.tmp && mv $@.tmp $@
+
+# Written from the dist-console/strings the page rule's build just produced.
+$(WEBUI_STRINGS_C): $(WEBUI_PAGE_C) ../scripts/embed-console-strings.mjs Makefile
+	@mkdir -p $(dir $@)
+	node ../scripts/embed-console-strings.mjs $(CLIENT_DIR)/dist-console/strings $@
+
+# Copied under build/ first so xxd names the arrays webui_sw_js / webui_cache_appcache.
+$(WEBUI_OFFLINE_C): $(WEBUI_PAGE_C) Makefile
+	@mkdir -p $(dir $@)
+	cp $(CLIENT_DIR)/dist-console/sw.js build/webui_sw.js
+	cp $(CLIENT_DIR)/dist-console/cache.appcache build/webui_cache.appcache
+	(cd build && xxd -i webui_sw.js && xxd -i webui_cache.appcache) > $@.tmp && mv $@.tmp $@
+
 # Gzipped copy for the Tauri bundle resource. linuxdeploy (Linux
 # AppImage bundler) walks every ELF in the AppDir and tries to
 # resolve its .so deps via `patchelf --print-needed`. The PS5
@@ -225,6 +279,8 @@ $(ELF).gz: $(ELF)
 clean:
 	rm -f $(ELF) $(ELF).gz $(SQLITE_OBJ) $(MONO_OBJ)
 	rm -rf build/ava1 $(SDK_CRT_BUILD)
+	rm -f $(WEBUI_TILE_ICON_C) $(WEBUI_PAGE_C) $(WEBUI_STRINGS_C) $(WEBUI_OFFLINE_C) build/webui_page.gz \
+		build/webui_sw.js build/webui_cache.appcache
 
 send: $(ELF)
 	@echo "Sending $(ELF) to $(PS5_HOST):$(PS5_PORT) ..."

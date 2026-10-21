@@ -220,6 +220,42 @@ pub fn fs_hash_with_timeout(
     Ok(parsed)
 }
 
+/// What [`ffpfsc_unpack`] wrote: the image beside the `.ffpfsc`, and its size.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnpackResult {
+    pub path: String,
+    pub size: u64,
+}
+
+/// Decompress a `.ffpfsc` on the console (#453): the helper writes the image it holds beside it
+/// under the image's own name (a `.part` first, renamed once its size and exFAT boot sector
+/// check out) and keeps the source. `op_id` keys `/api/ps5/fs/op-status` and `op-cancel`.
+/// Refused: a destination that exists, a drive without room for the image plus 1 GiB.
+pub fn ffpfsc_unpack(
+    addr: &str,
+    path: &str,
+    op_id: u64,
+    io_timeout: std::time::Duration,
+) -> Result<UnpackResult> {
+    let body = serde_json::to_vec(&serde_json::json!({ "path": path }))
+        .context("serialize ffpfsc_unpack")?;
+    match mgmt::run_op(
+        addr,
+        mgmt::ops::FFPFSC_UNPACK,
+        &format!("FFPFSC_UNPACK({path})"),
+        &body,
+        &mgmt::JobCall {
+            op_id,
+            subject: path,
+            deadline: io_timeout,
+        },
+    ) {
+        Ok(resp) => serde_json::from_slice(&resp).context("decode FFPFSC_UNPACK result"),
+        Err(e) if is_cancel(&e, "fs_unpack_cancelled") => bail!("cancelled"),
+        Err(e) => Err(e),
+    }
+}
+
 // ─── FS_READ ────────────────────────────────────────────────────────────────
 
 /// Ask the payload for up to `limit` bytes of a file on the PS5 starting at
@@ -643,28 +679,27 @@ pub fn app_register(addr: &str, src_path: &str, patch_drm_type: bool) -> Result<
 /// The deadline of the Sony-lock calls that can queue behind one another or run long.
 const SONY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Reverse of `app_register`. Unmounts the nullfs at
-/// `/system_ex/app/<title_id>/`, removes tracking link files, and
-/// (where available) calls Sony's AppUninstall to clear the XMB tile.
-/// Best-effort: returns Ok even when the Sony API is missing, as long
-/// as the unmount succeeded.
-/// Outcome of an unregister. Our own teardown (nullfs unmount + tracker
-/// removal) succeeding is what makes this `Ok`; `sony_uninstall_rc` reports
-/// separately whether Sony's `sceAppInstUtilAppUninstall` accepted the
-/// uninstall.
+/// Outcome of an unregister (a folder registration's teardown, or a package's
+/// uninstall).
 ///
-/// The split matters: the payload deliberately treats a Sony refusal as
-/// non-fatal, because our nullfs teardown alone already removes the tile.
-/// But the refusal used to go to the payload's stderr and NOWHERE else, so
-/// this function returned a clean `Ok(())` while the console kept the title
-/// in Settings → Storage. A user hit exactly that with a title Sony rejected
-/// with `0x80B21B02`, and the tool insisted the uninstall had worked.
+/// A helper from 7.1.6 on answers a Sony refusal with an ERROR frame
+/// (`uninstall_refused:0x…`), so that arrives here as `Err`. Older helpers
+/// acknowledged the refusal and carried Sony's code in the body, and put an
+/// "Unregistered" toast on the console either way: the app then dropped the
+/// game from its list and the next refresh brought it back (#476).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnregisterOutcome {
-    /// `sceAppInstUtilAppUninstall`'s return code. 0 = accepted (or never
-    /// called, on firmware where the symbol is unavailable). Non-zero =
-    /// Sony refused; the title can survive in Settings → Storage.
+    /// `sceAppInstUtilAppUninstall`'s return code from an older helper's ACK.
+    /// 0 = accepted, or not reported. Non-zero = Sony refused.
     pub sony_uninstall_rc: u32,
+    /// The helper found the title's folders still on the console after Sony
+    /// accepted the uninstall (it may still be removing a large game).
+    /// `None` from a helper older than 7.1.6, which did not check.
+    ///
+    /// `Some(false)` with a non-zero `sony_uninstall_rc` is our own folder
+    /// registration torn down although Sony refused: the title is no longer
+    /// listed, so it is not a failure ([`Self::refusal_stands`] is false).
+    pub still_present: Option<bool>,
 }
 
 impl UnregisterOutcome {
@@ -673,12 +708,40 @@ impl UnregisterOutcome {
     pub fn sony_refused(&self) -> bool {
         self.sony_uninstall_rc != 0
     }
+
+    /// A refusal the caller must report: Sony refused and the helper did not
+    /// confirm the title is gone.
+    pub fn refusal_stands(&self) -> bool {
+        self.sony_refused() && self.still_present != Some(false)
+    }
+
+    /// Parse the APP_UNREGISTER ACK body. An empty or unparsable body (the
+    /// oldest helpers) means "no result reported".
+    pub fn from_ack(body: &[u8]) -> Self {
+        let v = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let rc = v
+            .as_ref()
+            .and_then(|v| v.get("sony_uninstall_rc"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32;
+        let still_present = v
+            .as_ref()
+            .and_then(|v| v.get("still_present"))
+            .and_then(|x| x.as_bool());
+        Self {
+            sony_uninstall_rc: rc,
+            still_present,
+        }
+    }
 }
 
+/// Unmount our registration (when there is one) and ask Sony to uninstall the
+/// title. See [`UnregisterOutcome`] for what the reply means.
 pub fn app_unregister(addr: &str, title_id: &str) -> Result<UnregisterOutcome> {
     let body = serde_json::to_vec(&serde_json::json!({ "title_id": title_id }))
         .context("serialize app_unregister body")?;
-    // On FW 13.60 the unregister repeats for two records and can run 10 s or more: 60 s deadline.
+    // On FW 13.60 the unregister repeats for two records and can run 10 s or more, and the
+    // helper then waits up to 10 s for the title's folders to go: 60 s deadline.
     let resp = mgmt::call_with(
         addr,
         m::APP_UNREGISTER,
@@ -686,15 +749,7 @@ pub fn app_unregister(addr: &str, title_id: &str) -> Result<UnregisterOutcome> {
         &body,
         Some(SONY_CALL_TIMEOUT),
     )?;
-    // Older payloads answer with an empty body — treat that as "Sony's
-    // result unknown", i.e. 0, rather than failing the call.
-    let rc = serde_json::from_slice::<serde_json::Value>(&resp)
-        .ok()
-        .and_then(|v| v.get("sony_uninstall_rc").and_then(|x| x.as_u64()))
-        .unwrap_or(0) as u32;
-    Ok(UnregisterOutcome {
-        sony_uninstall_rc: rc,
-    })
+    Ok(UnregisterOutcome::from_ack(&resp))
 }
 
 /// Launch an already-registered title via `sceLncUtilLaunchApp`. The
@@ -1320,14 +1375,12 @@ mod tests {
     /// in Settings → Storage.
     #[test]
     fn a_nonzero_sony_rc_is_reported_as_refused() {
-        let ok = UnregisterOutcome {
-            sony_uninstall_rc: 0,
-        };
+        let ok = UnregisterOutcome::from_ack(br#"{"sony_uninstall_rc":0}"#);
         assert!(!ok.sony_refused(), "rc 0 means Sony accepted");
+        assert_eq!(ok.still_present, None, "an older helper did not check");
 
-        let refused = UnregisterOutcome {
-            sony_uninstall_rc: 0x80B2_1B02,
-        };
+        // 7.1.5 and older helpers ACK a refusal with the code in the body.
+        let refused = UnregisterOutcome::from_ack(br#"{"sony_uninstall_rc":2159155970}"#);
         assert!(refused.sony_refused());
         assert_eq!(format!("0x{:08X}", refused.sony_uninstall_rc), "0x80B21B02");
     }
@@ -1337,15 +1390,33 @@ mod tests {
     /// call, so a new engine keeps working against an old payload.
     #[test]
     fn an_empty_ack_body_degrades_to_rc_zero() {
-        let parsed = serde_json::from_slice::<serde_json::Value>(b"")
-            .ok()
-            .and_then(|v| v.get("sony_uninstall_rc").and_then(|x| x.as_u64()))
-            .unwrap_or(0) as u32;
-        assert_eq!(parsed, 0);
-        assert!(!UnregisterOutcome {
-            sony_uninstall_rc: parsed
-        }
-        .sony_refused());
+        let parsed = UnregisterOutcome::from_ack(b"");
+        assert_eq!(parsed.sony_uninstall_rc, 0);
+        assert!(!parsed.sony_refused());
+        assert_eq!(parsed.still_present, None);
+    }
+
+    /// #476: a 7.1.6 helper says whether the title's folders were still there
+    /// after Sony accepted the uninstall.
+    #[test]
+    fn still_present_is_read_from_the_ack() {
+        let gone = UnregisterOutcome::from_ack(br#"{"sony_uninstall_rc":0,"still_present":false}"#);
+        assert_eq!(gone.still_present, Some(false));
+        let left = UnregisterOutcome::from_ack(br#"{"sony_uninstall_rc":0,"still_present":true}"#);
+        assert_eq!(left.still_present, Some(true));
+        assert!(!left.sony_refused());
+    }
+
+    /// #476 review: our folder registration was removed although Sony refused.
+    #[test]
+    fn a_refusal_for_a_title_that_is_gone_does_not_stand() {
+        let gone = UnregisterOutcome::from_ack(
+            br#"{"sony_uninstall_rc":2159155970,"still_present":false}"#,
+        );
+        assert!(gone.sony_refused());
+        assert!(!gone.refusal_stands());
+        let legacy = UnregisterOutcome::from_ack(br#"{"sony_uninstall_rc":2159155970}"#);
+        assert!(legacy.refusal_stands(), "an older helper did not check");
     }
 
     use super::*;

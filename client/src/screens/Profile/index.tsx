@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CircleUserRound,
   ImageIcon,
@@ -40,7 +40,6 @@ import {
   profileSetUsername,
   profileRenameUser,
   profileActivate,
-  userCreate,
   userDelete,
   type ProfileInfo,
   type SquareMode,
@@ -130,7 +129,11 @@ function AvatarSection({
   const tr = useTr();
   const { confirm, dialog: confirmDialog } = useConfirm();
   const [imagePath, setImagePath] = useState<string | null>(null);
+  const [browserFileName, setBrowserFileName] = useState<string | null>(null);
+  const [readingImage, setReadingImage] = useState(false);
+  const imageInput = useRef<HTMLInputElement>(null);
   const [mode, setMode] = useState<SquareMode>("crop");
+  const [crop, setCrop] = useState({ x: 50, y: 50 });
   const [preview, setPreview] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [targetUid, setTargetUid] = useState<number | null>(null);
@@ -183,9 +186,10 @@ function AvatarSection({
     }
     let cancelled = false;
     setPreviewError(null);
+    setPreview(null);
     void (async () => {
       try {
-        const url = await profileAvatarPreview(imagePath, mode);
+        const url = await profileAvatarPreview(imagePath, mode, crop);
         if (!cancelled) setPreview(url);
       } catch (e) {
         if (!cancelled) {
@@ -197,9 +201,43 @@ function AvatarSection({
     return () => {
       cancelled = true;
     };
-  }, [imagePath, mode]);
+  }, [imagePath, mode, crop]);
+
+  async function readBrowserImage(file?: File) {
+    if (!file) return; // Cancelling the picker keeps the current selection.
+    setImagePath(null);
+    setCrop({ x: 50, y: 50 });
+    setBrowserFileName(null);
+    setApplyOk(null);
+    setApplyError(null);
+    if (!file.size || file.size > 8 * 1024 * 1024) {
+      setApplyError(tr("profile.avatar.imageSize", "Choose an image of 8 MiB or smaller."));
+      return;
+    }
+    setReadingImage(true);
+    try {
+      const data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => typeof reader.result === "string"
+          ? resolve(reader.result) : reject(new Error("Could not read image"));
+        reader.onerror = () => reject(reader.error ?? new Error("Could not read image"));
+        reader.onabort = () => reject(new Error("Image selection cancelled"));
+        reader.readAsDataURL(file);
+      });
+      setImagePath(data);
+      setBrowserFileName(file.name);
+    } catch (e) {
+      setApplyError(`${e}`);
+    } finally {
+      setReadingImage(false);
+    }
+  }
 
   async function pickImage() {
+    if (!isTauriEnv()) {
+      imageInput.current?.click();
+      return;
+    }
     setApplyOk(null);
     setApplyError(null);
     // `pickPath`, not plugin-dialog's `open` directly (#278). On Android the
@@ -218,7 +256,11 @@ function AvatarSection({
         },
       ],
     });
-    if (typeof sel === "string") setImagePath(sel);
+    if (typeof sel === "string") {
+      setBrowserFileName(null);
+      setCrop({ x: 50, y: 50 });
+      setImagePath(sel);
+    }
   }
 
   async function applyAvatar() {
@@ -246,6 +288,7 @@ function AvatarSection({
         targetUid,
         u?.username || null,
         addr,
+        crop,
       );
       setApplyOk(
         tr(
@@ -265,7 +308,7 @@ function AvatarSection({
     }
   }
 
-  const fileName = imagePath ? imagePath.split(/[\\/]/).pop() : null;
+  const fileName = browserFileName ?? (imagePath ? imagePath.split(/[\\/]/).pop() : null);
   const noTarget = !loadingInfo && users.length === 0 && foreground == null;
 
   return (
@@ -316,11 +359,20 @@ function AvatarSection({
         {/* Controls */}
         <div className="flex min-w-0 flex-1 flex-col gap-3">
           <div className="flex flex-wrap items-center gap-2">
-            {isTauriEnv() && (
-              <Button variant="secondary" size="sm" onClick={pickImage}>
-                {tr("profile.avatar.pick", "Choose image…")}
-              </Button>
-            )}
+            <input
+              ref={imageInput}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/bmp,image/gif"
+              hidden
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                event.currentTarget.value = "";
+                void readBrowserImage(file);
+              }}
+            />
+            <Button variant="secondary" size="sm" onClick={pickImage} disabled={applying || readingImage}>
+              {tr("profile.avatar.pick", "Choose image…")}
+            </Button>
             {fileName && (
               <span className="truncate text-xs text-[var(--color-muted)]">
                 {fileName}
@@ -334,13 +386,13 @@ function AvatarSection({
               active={mode === "crop"}
               icon={<Crop size={13} />}
               label={tr("profile.avatar.crop", "Crop")}
-              onClick={() => setMode("crop")}
+              onClick={() => { if (!applying) setMode("crop"); }}
             />
             <ModeButton
               active={mode === "fit"}
               icon={<Maximize2 size={13} />}
               label={tr("profile.avatar.fit", "Fit")}
-              onClick={() => setMode("fit")}
+              onClick={() => { if (!applying) setMode("fit"); }}
             />
           </div>
           <p className="text-xs text-[var(--color-muted)]">
@@ -354,6 +406,17 @@ function AvatarSection({
                   "Fit the whole image into a square (adds transparent bars).",
                 )}
           </p>
+
+          {imagePath && mode === "crop" && <div className="space-y-2">
+            {(["x", "y"] as const).map((axis) => <label key={axis} className="block text-xs">
+              {axis === "x" ? tr("profile.avatar.horizontal", "Horizontal position") : tr("profile.avatar.vertical", "Vertical position")}
+              <input type="range" min={0} max={100} value={crop[axis]} disabled={applying}
+                className="block w-full" onChange={(event) => setCrop((position) => ({ ...position, [axis]: Number(event.target.value) }))} />
+            </label>)}
+            <Button variant="secondary" disabled={applying} onClick={() => setCrop({ x: 50, y: 50 })}>
+              {tr("profile.avatar.center", "Center image")}
+            </Button>
+          </div>}
 
           {/* Target user */}
           <Select
@@ -383,7 +446,7 @@ function AvatarSection({
             <Button
               variant="primary"
               size="sm"
-              disabled={!imagePath || targetUid == null || applying}
+              disabled={!imagePath || !preview || !!previewError || targetUid == null || applying || readingImage}
               loading={applying}
               onClick={applyAvatar}
             >
@@ -447,8 +510,6 @@ function UsernameSection({
   const users = info?.users ?? [];
   const slots = info?.slots ?? [];
 
-  const [showCreate, setShowCreate] = useState(false);
-
   return (
     <Card>
       <div className="mb-1 flex items-center gap-2">
@@ -495,29 +556,16 @@ function UsernameSection({
         </div>
       )}
 
-      {/* Create user */}
+      {/* The console has no create-user call a payload can reach (#460):
+          say where to do it instead of offering a button that can't work. */}
       {info !== null && (
-        <div className="mt-4">
-          {showCreate ? (
-            <CreateUserRow
-              addr={addr}
-              onDone={() => {
-                setShowCreate(false);
-                onChanged();
-              }}
-              onCancel={() => setShowCreate(false)}
-            />
-          ) : (
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setShowCreate(true)}
-            >
-              <UserPlus size={14} className="mr-1" />
-              {tr("profile.username.createUser", "Create User")}
-            </Button>
+        <p className="mt-4 flex items-start gap-1.5 text-xs text-[var(--color-muted)]">
+          <UserPlus size={14} className="mt-px shrink-0" />
+          {tr(
+            "profile.username.addOnConsole",
+            "To add a user, do it on the PS5: Switch User, then Add User.",
           )}
-        </div>
+        </p>
       )}
 
       {/* These rows ARE the account on a normal console — a PSN-linked
@@ -672,74 +720,6 @@ function UserRow({
           )}
         </p>
       )}
-    </div>
-  );
-}
-
-function CreateUserRow({
-  addr,
-  onDone,
-  onCancel,
-}: {
-  addr: string;
-  onDone: () => void;
-  onCancel: () => void;
-}) {
-  const tr = useTr();
-  const [name, setName] = useState("");
-  const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function create() {
-    const trimmed = name.trim();
-    if (!trimmed) return;
-    setCreating(true);
-    setError(null);
-    try {
-      await userCreate(trimmed, addr);
-      onDone();
-    } catch (e) {
-      setError(`${e}`);
-    } finally {
-      setCreating(false);
-    }
-  }
-
-  return (
-    <div className="rounded-[var(--radius-card)] border border-[var(--color-accent)]/40 bg-[var(--color-surface)] p-3">
-      <div className="flex items-center gap-2">
-        <UserPlus size={14} className="shrink-0 text-[var(--color-accent)]" />
-        <input
-          autoFocus
-          className="min-w-0 flex-1 rounded-full border border-[var(--glass-edge)] bg-[var(--color-surface-raised)] px-2 py-1 text-sm"
-          value={name}
-          maxLength={16}
-          placeholder={tr("profile.username.newPlaceholder", "New user name")}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void create();
-            if (e.key === "Escape") onCancel();
-          }}
-        />
-        <Button
-          variant="primary"
-          size="sm"
-          disabled={!name.trim() || creating}
-          loading={creating}
-          onClick={create}
-        >
-          {tr("profile.username.createBtn", "Create")}
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          disabled={creating}
-          onClick={onCancel}
-        >
-          {tr("profile.username.cancel", "Cancel")}
-        </Button>
-      </div>
-      {error && <p className="mt-1 text-xs text-[var(--color-bad)]">{error}</p>}
     </div>
   );
 }

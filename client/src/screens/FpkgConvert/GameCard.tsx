@@ -22,10 +22,16 @@ function shortFw(v: string): string {
  *  than the game declares, else the declared one; null when the game names none. */
 export function firmwareLine(inspection: FpkgInspection, tr: Tr): string | null {
   if (inspection.min_firmware) {
+    const fw = shortFw(inspection.min_firmware);
+    // Backports stamp their modules with the FW 4.00 pair. Modules a little below the
+    // declared firmware are just an older SDK than the game asks for, not a backport.
+    if (Number.parseInt(fw, 10) <= 4) {
+      return tr("fpkg.runsOnBackport", { fw }, "Runs on FW {fw} and later (backported)");
+    }
     return tr(
-      "fpkg.runsOnBackport",
-      { fw: shortFw(inspection.min_firmware) },
-      "Runs on FW {fw} and later (backported)",
+      "fpkg.runsOnModules",
+      { fw, declared: shortFw(inspection.required_firmware ?? inspection.min_firmware) },
+      "Runs on FW {fw} and later (its modules allow it; it declares {declared})",
     );
   }
   if (inspection.required_firmware) {
@@ -99,7 +105,7 @@ export function GameCard(props: GameCardProps) {
                 remote
                 label={tr("fpkg.browseImage", undefined, "Image or archive…")}
                 title={tr("fpkg.pickImage", undefined, "Choose a game image or archive")}
-                filters={[{ name: "Game image or archive", extensions: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "zip", "7z", "rar"] }]}
+                filters={[{ name: "Game image, package or archive", extensions: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg", "zip", "7z", "rar"] }]}
                 disabled={props.locked || props.checking}
                 onMainClick={props.onBrowseImage}
                 onPick={props.onRemotePick}

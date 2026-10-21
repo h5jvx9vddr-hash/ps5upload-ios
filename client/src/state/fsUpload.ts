@@ -5,6 +5,14 @@ import { hostOf } from "../lib/addr";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { jobLiveFromSnapshot, type JobLive } from "../lib/jobLive";
 import { beginTask } from "./trackTask";
+import {
+  baseNameOf,
+  landedOfList,
+  sendOrder,
+  stepCount,
+  type FsExistingEntry,
+  type FsUploadStep,
+} from "./fsUploadPlan";
 
 /**
  * An "Add files" / drag-in upload on the Files screen, kept outside the screen.
@@ -41,6 +49,8 @@ export interface FsUploadActive {
  *  The console keeps what already landed (and the partial file), so a resume sends only
  *  the rest. Saved to disk, so it is still offered after the app restarts. */
 export interface FsUploadStopped {
+  /** Owning queued pick, so a restart resumes it only once. */
+  queueId?: string;
   /** What ended it: a failure, the user's Stop, or the app closing or crashing mid-run. */
   why: "failed" | "user" | "interrupted";
   /** The engine's error, raw; "" when nothing failed. */
@@ -49,14 +59,25 @@ export interface FsUploadStopped {
   reason: string | null;
   addr: string;
   destDir: string;
-  /** The items not finished, the failed one first. */
+  /** The sources of the steps not finished, the failed one first (a list contributes each of
+   *  its files). What a run saved before steps existed carries only this. */
   srcPaths: string[];
   replaceRemoteName?: string;
-  /** How many of the pick had finished, and how many it was. */
+  /** The steps not finished, the failed one first. A list step is kept whole, with its job id:
+   *  a resume sends the same list under the same id, and the console's journal skips the files
+   *  it already has. */
+  steps?: FsUploadStep[];
+  /** How many of the pick had finished, and how many it was. Counts the files of a stopped list
+   *  that are known to be in place (`notLanded` names the rest). */
   doneCount: number;
   count: number;
+  /** How many of the pick were in finished steps: where a resume's count starts. Absent: the
+   *  same as `doneCount`. */
+  stepsDone?: number;
   /** The name of the item it stopped on. */
   name: string;
+  /** A stopped list: the names of its files not known to be in place. */
+  notLanded?: string[];
   /** The engine job that item was on, when the run was interrupted: it may still be going. */
   jobId?: string;
 }
@@ -110,7 +131,7 @@ const SAVE_KEY = "ps5upload.fsUpload.v1";
 const inflight: Record<string, FsUploadStopped> = {};
 
 /** Writes every console's resumable run to disk: the stopped ones, and the ones in flight
- *  (which a restart finds as "interrupted"). Called at item boundaries, never per byte. */
+ *  (which a restart finds as "interrupted"). Called at step boundaries, never per byte. */
 function save(): void {
   const out: Record<string, FsUploadStopped> = { ...inflight };
   for (const [key, st] of Object.entries(useFsUploadStore.getState().byHost)) {
@@ -134,8 +155,10 @@ export function restoreFsUploads(): void {
   for (const key of Object.keys(inflight)) delete inflight[key];
   const { patch } = useFsUploadStore.getState();
   for (const [key, st] of Object.entries(saved ?? {})) {
-    if (!st || !Array.isArray(st.srcPaths) || st.srcPaths.length === 0)
-      continue;
+    if (!st) continue;
+    const hasSteps = Array.isArray(st.steps) && st.steps.length > 0;
+    const hasSrcs = Array.isArray(st.srcPaths) && st.srcPaths.length > 0;
+    if (!hasSteps && !hasSrcs) continue;
     patch(key, { stopped: st });
   }
 }
@@ -146,6 +169,19 @@ export interface FsUploadDeps {
   /** `capMbps`: the upload speed limit (0 = none), read as each job starts. */
   startFile: (src: string, dest: string, addr: string, capMbps: number) => Promise<string>;
   startDir: (src: string, dest: string, addr: string, capMbps: number) => Promise<string>;
+  /** Starts ONE file-list job (POST /api/transfer/file-list) under `txId`: every file to
+   *  `dest` below `destRoot`. Absent: list steps go file by file. */
+  startList?: (
+    destRoot: string,
+    files: { src: string; dest: string }[],
+    addr: string,
+    txId: string,
+    capMbps: number,
+  ) => Promise<string>;
+  /** The console folder's listing, to tell which files of a stopped list are in place. */
+  listDir?: (addr: string, dir: string) => Promise<FsExistingEntry[]>;
+  /** A running job's planned files with their sizes (GET /api/jobs/{id}/files). */
+  jobFiles?: (jobId: string) => Promise<{ rel_path: string; size: number }[] | null>;
   /** The user's upload speed limit in MiB/s, 0 = none. Absent: no limit. */
   bandwidthCapMbps?: () => number;
   jobStatus: (jobId: string) => Promise<JobSnapshot>;
@@ -154,11 +190,11 @@ export interface FsUploadDeps {
   /** Told the raw error when a run fails (not when it is cancelled). */
   onFailed?: (raw: string) => void;
   /** Whether a failed item is worth trying again unasked (a dropped connection is; a full
-   *  drive is not). Absent: never. */
-  shouldRetry?: (reason: string | undefined, error: string) => boolean;
+   *  drive is not). `host` is the console the run goes to. Absent: never. */
+  shouldRetry?: (reason: string | undefined, error: string, host: string) => boolean;
 }
 
-/** How many times one item is tried again unasked, and the wait before each. */
+/** How many times one step is tried again unasked, and the wait before each. */
 const RETRY_WAITS_MS = [5_000, 15_000, 30_000] as const;
 
 /** A failed job, with the engine's reason kept beside its message. */
@@ -171,35 +207,78 @@ class JobFailed extends Error {
   }
 }
 
+/** The engine (or the desktop shell) does not know the file-list job: the engine answers
+ *  HTTP 404/405 for a route it lacks, the desktop shell "command … not found" for a command it
+ *  lacks. Only those: anything else (a source that cannot be read, a busy console) is a real
+ *  failure, never a reason to re-send the files one by one. The list then goes file by file,
+ *  exactly as before. Every engine this app ships with has the route (since 5.35 at least), and
+ *  the AVA1 job it runs is the same kind a folder upload runs (a manifest of files under one
+ *  root, merged into the existing folder), so the helper on the console needs nothing newer:
+ *  there is no helper version to detect. */
+export function listUnsupported(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /^engine HTTP (404|405)\b|^command [\w-]+ not found$/i.test(msg.trim());
+}
+
+/** What `runFsUpload` answers when the console already has a run. */
+export const FS_UPLOAD_BUSY = "an upload is already running";
+
 export interface FsUploadRequest {
+  queueId?: string;
   host: string;
   addr: string;
   destDir: string;
+  /** Items as one job each (what a run saved before steps existed resumes as this). */
   srcPaths: string[];
+  /** The planned steps (state/fsUploadPlan). When given, `srcPaths` is ignored. */
+  steps?: FsUploadStep[];
   /** Replace one file: the single picked file lands under this name. */
   replaceRemoteName?: string;
   /** The task's label in Tasks. */
   label?: string;
   /** A resumed run: how many of the original pick had already finished. */
   doneBefore?: number;
-  /** A resumed run: the engine job its first item was on, to pick back up if it still runs. */
+  /** A resumed run: how many the original pick was. */
+  countTotal?: number;
+  /** A resumed run: the engine job its first step was on, to pick back up if it still runs. */
   attachJobId?: string;
 }
 
 const joinRemote = (dir: string, name: string) =>
   dir.endsWith("/") ? `${dir}${name}` : `${dir}/${name}`;
 
-/** Uploads the picked items one after another into `destDir`. Sequential on purpose: a
- *  failure stops the batch instead of racing more writes onto a full or read-only drive. */
+/** The steps a request stands for: its own, or one per source path (the old shape). */
+function stepsOf(req: FsUploadRequest): FsUploadStep[] {
+  if (req.steps) return req.steps;
+  return req.srcPaths.map((src) =>
+    req.replaceRemoteName !== undefined
+      ? { kind: "one", src, name: req.replaceRemoteName, asFile: true }
+      : { kind: "one", src, name: baseNameOf(src) },
+  );
+}
+
+const srcsOf = (steps: FsUploadStep[]) =>
+  steps.flatMap((s) => (s.kind === "list" ? s.files.map((f) => f.src) : [s.src]));
+
+/** A list step as one job per file (no file-list job on this engine). */
+const unlist = (s: FsUploadStep): FsUploadStep[] =>
+  s.kind === "list"
+    ? s.files.map((f) => ({ kind: "one", src: f.src, name: f.name, asFile: true }))
+    : [s];
+
+/** Uploads the planned steps one after another into `destDir`. Sequential on purpose: a
+ *  failure stops the run instead of racing more writes onto a full or read-only drive. */
 export async function runFsUpload(
   req: FsUploadRequest,
   deps: FsUploadDeps,
 ): Promise<{ ok: boolean; error?: string }> {
-  const { host, addr, destDir, srcPaths, replaceRemoteName } = req;
-  if (srcPaths.length === 0) return { ok: true };
+  const { host, addr, destDir, replaceRemoteName } = req;
+  // A copy: a list that falls back to file by file is spliced in place.
+  const steps = [...stepsOf(req)];
+  if (steps.length === 0) return { ok: true };
   const store = useFsUploadStore.getState();
   if (fsUploadForHost(store, host).active)
-    return { ok: false, error: "an upload is already running" };
+    return { ok: false, error: FS_UPLOAD_BUSY };
 
   const cancelled = () =>
     fsUploadForHost(useFsUploadStore.getState(), host).cancelRequested;
@@ -208,44 +287,58 @@ export async function runFsUpload(
   const startedAtMs = Date.now();
   const hostKey = hostOf(host);
   const doneBefore = req.doneBefore ?? 0;
-  const count = doneBefore + srcPaths.length;
-  const nameOf = (src: string) =>
-    replaceRemoteName ?? (src.split(/[\\/]/).pop() || "file");
-  const firstName = nameOf(srcPaths[0]);
+  const pickCount = steps.reduce((n, s) => n + stepCount(s), 0);
+  const count = Math.max(req.countTotal ?? 0, doneBefore + pickCount);
+  const firstName =
+    steps[0].kind === "list" ? steps[0].files[0]?.name ?? "" : steps[0].name;
   const task = beginTask({
-    kind: srcPaths.length === 1 ? "upload-file" : "upload-dir",
+    kind: pickCount === 1 ? "upload-file" : "upload-dir",
     origin: "files",
     label:
       req.label ??
-      (srcPaths.length === 1
-        ? firstName
-        : `${firstName} +${srcPaths.length - 1}`),
+      (pickCount === 1 ? firstName : `${firstName} +${pickCount - 1}`),
     consoleId: hostOf(host),
     detail: destDir,
   });
   store.patch(host, { stopped: null, cancelRequested: false });
   save();
 
-  let i = 0;
-  // The item the run is on (or about to start): where a resume picks up.
+  // The step the run is on (or about to start): where a resume picks up.
   let at = 0;
+  /** Items of the pick in the steps before `at`. */
+  let doneItems = 0;
+  /** A stopped list step: what of it is known to be in place. */
+  let partial: { landed: number; notLanded: string[] } | null = null;
   /** What is left from `at`, as a stopped run. */
   const left = (
     why: FsUploadStopped["why"],
     error: string,
     reason: string | null,
-  ): FsUploadStopped => ({
-    why,
-    error,
-    reason,
-    addr,
-    destDir,
-    srcPaths: srcPaths.slice(at),
-    replaceRemoteName,
-    doneCount: doneBefore + at,
-    count,
-    name: nameOf(srcPaths[Math.min(at, srcPaths.length - 1)]),
-  });
+  ): FsUploadStopped => {
+    const rest = steps.slice(at);
+    const cur = rest[0];
+    const stepsDone = doneBefore + doneItems;
+    return {
+      queueId: req.queueId,
+      why,
+      error,
+      reason,
+      addr,
+      destDir,
+      srcPaths: srcsOf(rest),
+      replaceRemoteName,
+      steps: rest,
+      doneCount: stepsDone + (partial?.landed ?? 0),
+      stepsDone,
+      count,
+      name:
+        partial?.notLanded[0] ??
+        (cur ? (cur.kind === "list" ? cur.files[0]?.name ?? "" : cur.name) : ""),
+      ...(partial && partial.notLanded.length > 0
+        ? { notLanded: partial.notLanded }
+        : {}),
+    };
+  };
   const ended = (stopped: FsUploadStopped | null) => {
     delete inflight[hostKey];
     store.patch(host, {
@@ -256,15 +349,35 @@ export async function runFsUpload(
     });
     save();
   };
+
+  /** After a list step stopped: which of its files are in place (best effort). */
+  const settleList = async (
+    step: Extract<FsUploadStep, { kind: "list" }>,
+    sizes: Map<string, number> | null,
+  ) => {
+    const listing = deps.listDir
+      ? await deps.listDir(addr, destDir).catch(() => null)
+      : null;
+    const r = landedOfList(step.files, listing, sizes);
+    partial = { landed: r.landed.length, notLanded: r.notLanded.map((f) => f.name) };
+  };
+
   try {
-    for (; i < srcPaths.length; i++) {
-      at = i;
+    for (; at < steps.length; ) {
       if (cancelled()) break;
-      const src = srcPaths[i];
-      const name = nameOf(src);
+      const step = steps[at];
+      // A list on an engine without the file-list job goes file by file (see listUnsupported).
+      if (step.kind === "list" && !deps.startList) {
+        steps.splice(at, 1, ...unlist(step));
+        continue;
+      }
+      const isList = step.kind === "list";
+      const order = step.kind === "list" ? sendOrder(step.files) : [];
+      const stepName =
+        step.kind === "list" ? order[0] ?? "" : step.name;
       const base: FsUploadActive = {
-        name,
-        index: doneBefore + i,
+        name: stepName,
+        index: doneBefore + doneItems,
         count,
         destDir,
         jobId: "",
@@ -277,25 +390,18 @@ export async function runFsUpload(
       // A folder (picked with Add folder, or dropped) uploads whole, into a same-named
       // folder; a file goes up on its own. A replacement is always one file.
       const isFolder =
-        replaceRemoteName === undefined &&
-        (await deps.pathKind(src)) === "folder";
-      const dest = joinRemote(destDir, name);
-      // One item, tried again by itself after a dropped connection: the console kept what
-      // landed, so each try sends only the rest.
+        step.kind === "one" &&
+        !step.asFile &&
+        (await deps.pathKind(step.src)) === "folder";
       // If the app dies from here on, this is what the next launch offers to resume.
       const leftNow = (jobId?: string): FsUploadStopped => ({
-        why: "interrupted",
-        error: "",
-        reason: null,
-        addr,
-        destDir,
-        srcPaths: srcPaths.slice(i),
-        replaceRemoteName,
-        doneCount: doneBefore + i,
-        count,
-        name,
+        ...left("interrupted", "", null),
         jobId,
       });
+      /** Sizes the engine planned for the list's files, by name (for the landed report). */
+      let sizes: Map<string, number> | null = null;
+      let fellBack = false;
+      let stepFailed: unknown = null;
       for (let attempt = 0; ; attempt++) {
         base.jobId = "";
         base.retry = null;
@@ -304,18 +410,40 @@ export async function runFsUpload(
         save();
         try {
           // An interrupted run's job may have carried on without the app: watch it rather
-          // than start a second one onto the same file.
+          // than start a second one onto the same files.
           let jobId = "";
-          if (i === 0 && attempt === 0 && req.attachJobId) {
+          if (at === 0 && attempt === 0 && req.attachJobId) {
             const old = await deps.jobStatus(req.attachJobId).catch(() => null);
             if (old?.status === "done") break;
             if (old?.status === "running") jobId = req.attachJobId;
           }
           if (!jobId) {
             const cap = deps.bandwidthCapMbps?.() ?? 0;
-            jobId = isFolder
-              ? await deps.startDir(src, dest, addr, cap)
-              : await deps.startFile(src, dest, addr, cap);
+            if (step.kind === "list") {
+              try {
+                // The same list under the same id every time (retry, resume): the console's
+                // journal then sends only what it does not have.
+                jobId = await deps.startList!(
+                  destDir,
+                  step.files.map((f) => ({
+                    src: f.src,
+                    dest: joinRemote(destDir, f.name),
+                  })),
+                  addr,
+                  step.txId,
+                  cap,
+                );
+              } catch (e) {
+                if (!listUnsupported(e)) throw e;
+                fellBack = true;
+                break;
+              }
+            } else {
+              const dest = joinRemote(destDir, step.name);
+              jobId = isFolder
+                ? await deps.startDir(step.src, dest, addr, cap)
+                : await deps.startFile(step.src, dest, addr, cap);
+            }
           }
           base.jobId = jobId;
           store.patch(host, { active: { ...base } });
@@ -323,6 +451,7 @@ export async function runFsUpload(
           save();
           // A Cancel pressed before the job id arrived had nothing to end: end it now.
           if (cancelled()) void deps.jobCancel(jobId).catch(() => {});
+          let askedFiles = false;
           for (;;) {
             const snap = await deps.jobStatus(jobId);
             if (snap.status === "done") break;
@@ -333,16 +462,34 @@ export async function runFsUpload(
                 snap.error_reason,
               );
             }
+            if (isList && !askedFiles && deps.jobFiles && (snap.files_count ?? 0) > 0) {
+              askedFiles = true;
+              const planned = await deps.jobFiles(jobId).catch(() => null);
+              if (planned && planned.length > 0)
+                sizes = new Map(planned.map((f) => [f.rel_path, f.size]));
+            }
             const sent = snap.bytes_sent ?? 0;
             const total = snap.total_bytes ?? 0;
             base.sent = sent;
             base.total = total;
+            if (isList && order.length > 0) {
+              // The file the sender is on (its counter, in the order it sends them), and how
+              // many the console has made permanent: "N of M" counts finished files, which the
+              // sender's counter runs well ahead of on small files.
+              const last = order.length - 1;
+              const k = Math.min(last, Math.max(0, (snap.files_processing ?? 0) - 1));
+              const durable = Math.min(last, Math.max(0, snap.files_finalized ?? 0));
+              base.name = order[k];
+              base.index = doneBefore + doneItems + durable;
+            }
             store.patch(host, {
               active: { ...base, live: jobLiveFromSnapshot(snap) },
             });
             task.report({
               stage:
-                count > 1 ? `${doneBefore + i + 1}/${count} ${name}` : name,
+                count > 1
+                  ? `${base.index + 1}/${count} ${base.name}`
+                  : base.name,
               progress:
                 total > 0 ? { current: sent, total, unit: "bytes" } : undefined,
             });
@@ -355,17 +502,30 @@ export async function runFsUpload(
           if (
             cancelled() ||
             attempt >= RETRY_WAITS_MS.length ||
-            !deps.shouldRetry?.(reason, raw)
-          )
-            throw e;
+            !deps.shouldRetry?.(reason, raw, host)
+          ) {
+            stepFailed = e;
+            break;
+          }
           base.retry = { attempt: attempt + 1, of: RETRY_WAITS_MS.length };
           store.patch(host, { active: { ...base } });
           await deps.sleep(RETRY_WAITS_MS[attempt]);
           if (cancelled()) break;
         }
       }
-      // Stopped during this item: it is not done, so a resume starts with it.
-      if (cancelled()) break;
+      if (fellBack) {
+        steps.splice(at, 1, ...unlist(step));
+        continue;
+      }
+      // Stopped or failed during this step: it is not done, so a resume starts with it. A
+      // list says which of its files made it.
+      if (stepFailed !== null || cancelled()) {
+        if (step.kind === "list") await settleList(step, sizes);
+        if (stepFailed !== null) throw stepFailed;
+        break;
+      }
+      doneItems += stepCount(step);
+      at++;
     }
   } catch (e) {
     const raw = e instanceof Error ? e.message : String(e);
@@ -380,11 +540,18 @@ export async function runFsUpload(
   if (wasCancelled) task.fail(new Error("Cancelled"));
   else task.done();
   // Stopped on purpose is resumable too: the console kept what landed.
-  ended(wasCancelled && at < srcPaths.length ? left("user", "", null) : null);
+  ended(wasCancelled && at < steps.length ? left("user", "", null) : null);
   return { ok: !wasCancelled };
 }
 
-/** Uploads what a stopped run left, the failed item first. */
+/** Uploads what a stopped run left, the failed step first.
+ *
+ *  A stopped list is re-sent exactly as planned (same files, same names, same job id): that is
+ *  what lets the console's journal skip the files it already has. Its Keep both names are NOT
+ *  re-checked against the folder: the job's own partial files may already sit under them, and a
+ *  renamed entry would change the job's manifest, so the console would start the job over.
+ *  The window is small (a name taken by something else between the stop and the resume), and
+ *  what it costs is the same as a Replace of that name. */
 export async function resumeFsUpload(
   host: string,
   deps: FsUploadDeps,
@@ -395,11 +562,14 @@ export async function resumeFsUpload(
   return runFsUpload(
     {
       host,
+      queueId: st.queueId,
       addr: st.addr,
       destDir: st.destDir,
       srcPaths: st.srcPaths,
+      steps: st.steps,
       replaceRemoteName: st.replaceRemoteName,
-      doneBefore: st.doneCount,
+      doneBefore: st.stepsDone ?? st.doneCount,
+      countTotal: st.count,
       attachJobId: st.why === "interrupted" ? st.jobId : undefined,
     },
     deps,

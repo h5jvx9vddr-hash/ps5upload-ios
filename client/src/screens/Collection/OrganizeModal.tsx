@@ -66,6 +66,9 @@ export function OrganizeModal({
     (s) => s.reason !== "already correct",
   );
   const inPlace = (plan?.skipped.length ?? 0) - notInPlace.length;
+  /** A container as shown: "Server: /path" for a folder on a saved server. */
+  const where = (container: string) => plan?.labels?.[container] ?? container;
+  const manyPlaces = (plan?.containers.length ?? 0) > 1;
 
   const apply = async () => {
     if (!plan || chosen.length === 0) return;
@@ -99,7 +102,7 @@ export function OrganizeModal({
       message: tr(
         "collection.org_undo_body",
         { n: run.moved },
-        "The {n} packages it moved go back to their old names and folders. A package moved or renamed since then is left where it is.",
+        "The {n} moved items return to their original names and folders. Items moved or renamed since then stay where they are.",
       ),
       confirmLabel: tr("collection.org_undo", undefined, "Undo"),
     });
@@ -115,6 +118,7 @@ export function OrganizeModal({
           "Undone: {n} restored, {problems} left where they are",
         ),
       );
+      if (r.note) pushNotification("info", r.note);
       await loadCollection();
       await refresh();
     } catch (e) {
@@ -137,21 +141,21 @@ export function OrganizeModal({
       open={open}
       onClose={onClose}
       size="xl"
-      title={tr("collection.org_title", undefined, "Organize packages")}
+      title={tr("collection.org_title", undefined, "Organize collection")}
       bodyClassName="p-4 sm:p-5"
     >
       <p className="text-sm text-[var(--color-muted)]">
         {tr(
           "collection.org_body",
           undefined,
-          "Renames every package “Title - Game ID - vVersion - Region - KIND” and files it under Platform › Game ID - Title, inside the folder it is already in. Nothing is overwritten or deleted, files are only renamed (never copied), and every run can be undone.",
+          "Organize packages, images and extracted game folders under Platform \u203a Game ID - Title in each collection root. Game folders move intact; image formats stay unchanged. Moves never copy or replace existing items, and every run has Undo.",
         )}
       </p>
       {error && <p className="mt-3 text-sm text-[var(--color-bad)]">{error}</p>}
       {!plan && !error && (
         <div className="mt-4 flex items-center gap-2 text-sm text-[var(--color-muted)]">
           <Spinner size={14} />
-          {tr("collection.org_planning", undefined, "Reading the packages…")}
+          {tr("collection.org_planning", undefined, "Reading collection items\u2026")}
         </div>
       )}
       {result && (
@@ -174,9 +178,10 @@ export function OrganizeModal({
           )}
           {result.failed.map((f) => (
             <div
-              key={f.from}
+              key={`${f.container}|${f.from}`}
               className="mt-1 break-all text-[var(--color-bad)]"
             >
+              {manyPlaces ? `${where(f.container)} › ` : ""}
               {f.from}: {f.error}
             </div>
           ))}
@@ -190,7 +195,7 @@ export function OrganizeModal({
                 ? tr(
                     "collection.org_nothing",
                     undefined,
-                    "Every package is already where it belongs.",
+                    "No moves planned.",
                   )
                 : tr(
                     "collection.org_summary",
@@ -241,11 +246,17 @@ export function OrganizeModal({
                 </button>
               </div>
               <ul className="mt-2 flex max-h-[45vh] flex-col gap-1.5 overflow-y-auto pr-1">
-                {plan.moves.map((m) => (
+                {plan.moves.map((m, i) => (
                   <li
                     key={moveKey(m)}
                     className="rounded-2xl border border-[var(--glass-edge)] bg-[var(--color-surface)] p-2 text-xs"
                   >
+                    {(i === 0 ||
+                      plan.moves[i - 1].container !== m.container) && (
+                      <div className="mb-1 truncate text-[0.6875rem] font-medium text-[var(--color-accent)]">
+                        {where(m.container)}
+                      </div>
+                    )}
                     <div className="flex items-start gap-2">
                       <Checkbox
                         checked={!unticked.has(moveKey(m))}
@@ -325,6 +336,9 @@ export function OrganizeModal({
                   <li key={`${s.container}|${s.path}`} className="break-all">
                     <span className="text-[var(--color-warn)]">{s.reason}</span>
                     {": "}
+                    {manyPlaces && s.container && (
+                      <span>{where(s.container)} › </span>
+                    )}
                     <span className="font-mono">{s.path}</span>
                     {s.detail ? ` (${s.detail})` : ""}
                   </li>
@@ -354,7 +368,7 @@ export function OrganizeModal({
                 {tr(
                   "collection.org_go",
                   { n: chosen.length },
-                  "Organize {n} packages",
+                  "Organize {n} items",
                 )}
               </Button>
             </div>
@@ -378,8 +392,11 @@ export function OrganizeModal({
                 <span className="text-[var(--color-muted)]">
                   {tr("collection.org_run_moved", { n: r.moved }, "{n} moved")}
                 </span>
-                <span className="min-w-0 flex-1 truncate font-mono text-[0.6875rem] text-[var(--color-muted)]">
-                  {r.container_root}
+                <span
+                  className="min-w-0 flex-1 truncate font-mono text-[0.6875rem] text-[var(--color-muted)]"
+                  title={r.container_root}
+                >
+                  {r.label ?? r.container_root}
                 </span>
                 {r.reverted_at ? (
                   <span className="text-[var(--color-muted)]">

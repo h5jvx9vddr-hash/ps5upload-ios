@@ -13,7 +13,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 vi.mock("./tauriEnv", () => ({ isTauriEnv: () => false }));
 
-import { setTransferKeepAwake } from "./keepAwakeHold";
+import { setBackgroundWorkHold, setTransferKeepAwake } from "./keepAwakeHold";
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
@@ -22,6 +22,10 @@ describe("setTransferKeepAwake in a browser", () => {
     setTransferKeepAwake(true);
     await flush();
     setTransferKeepAwake(false);
+    await flush();
+    setBackgroundWorkHold(true);
+    await flush();
+    setBackgroundWorkHold(false);
     await flush();
     expect(calls).toEqual([]);
   });

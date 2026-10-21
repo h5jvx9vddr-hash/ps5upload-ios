@@ -12,9 +12,12 @@ use tokio::sync::Mutex;
 use super::store::{Connection, Secret};
 use super::{Entry, Page, RemoteError, RemoteFile, RemoteFs, PAGE};
 
+type PendingCloses = Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<Result<(), smb2::Error>>>>>;
+
 pub struct SmbFs {
     session: Mutex<(smb2::SmbClient, smb2::Tree)>,
     host: String,
+    pending_closes: PendingCloses,
 }
 
 #[derive(Serialize)]
@@ -53,8 +56,10 @@ fn map_err(host: &str, e: smb2::Error) -> RemoteError {
     use smb2::ErrorKind as K;
     let msg = e.to_string();
     match e.kind() {
-        K::AuthRequired | K::SigningRequired | K::AccessDenied => RemoteError::Auth(msg),
+        K::AuthRequired | K::SigningRequired => RemoteError::Auth(msg),
+        K::AccessDenied => RemoteError::Io(format!("SMB permission denied: {msg}")),
         K::NotFound | K::NotADirectory => RemoteError::NotFound(msg),
+        K::AlreadyExists => RemoteError::Exists(msg),
         K::ConnectionLost | K::TimedOut => RemoteError::Unreachable(format!("{host}: {msg}")),
         _ => RemoteError::Io(msg),
     }
@@ -82,6 +87,7 @@ async fn sign_in(
             smb2::ErrorKind::Io | smb2::ErrorKind::TimedOut | smb2::ErrorKind::ConnectionLost => {
                 RemoteError::Unreachable(format!("{addr}: {e}"))
             }
+            smb2::ErrorKind::AccessDenied => RemoteError::Auth(e.to_string()),
             _ => map_err(&addr, e),
         })?;
     Ok((client, addr))
@@ -111,7 +117,30 @@ impl SmbFs {
         Ok(Self {
             session: Mutex::new((client, tree)),
             host: addr,
+            pending_closes: Arc::default(),
         })
+    }
+
+    async fn finish_closes(&self) -> Result<(), RemoteError> {
+        let pending = std::mem::take(
+            &mut *self
+                .pending_closes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let mut error = None;
+        for close in pending {
+            match close.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error.get_or_insert_with(|| map_err(&self.host, e));
+                }
+                Err(e) => {
+                    error.get_or_insert_with(|| RemoteError::Io(format!("SMB close failed: {e}")));
+                }
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
 
     async fn entries(&self, path: &str) -> Result<Vec<Entry>, RemoteError> {
@@ -136,9 +165,25 @@ impl SmbFs {
 }
 
 struct SmbFile {
-    reader: Arc<smb2::FileReader>,
+    reader: Option<smb2::FileReader>,
+    runtime: tokio::runtime::Handle,
+    pending_closes: PendingCloses,
     size: u64,
     host: String,
+}
+
+// smb2's FileReader::drop deliberately does not send CLOSE. A metadata read must not
+// leave a live server handle inside a game directory until the entire session ends.
+impl Drop for SmbFile {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            let close = self.runtime.spawn(async move { reader.close().await });
+            self.pending_closes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(close);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -152,6 +197,8 @@ impl RemoteFile for SmbFile {
         }
         let len = len.min(self.size - offset);
         self.reader
+            .as_ref()
+            .expect("live SMB reader")
             .read_at(offset, len)
             .await
             .map_err(|e| map_err(&self.host, e))
@@ -203,6 +250,7 @@ impl RemoteFs for SmbFs {
     }
 
     async fn open(&self, path: &str) -> Result<Arc<dyn RemoteFile>, RemoteError> {
+        self.finish_closes().await?;
         let s = self.session.lock().await;
         let (client, tree) = &*s;
         let reader = client
@@ -211,7 +259,9 @@ impl RemoteFs for SmbFs {
             .map_err(|e| map_err(&self.host, e))?;
         let size = reader.size();
         Ok(Arc::new(SmbFile {
-            reader: Arc::new(reader),
+            reader: Some(reader),
+            runtime: tokio::runtime::Handle::current(),
+            pending_closes: self.pending_closes.clone(),
             size,
             host: self.host.clone(),
         }))
@@ -245,11 +295,65 @@ impl RemoteFs for SmbFs {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
+
+    async fn create_dir(&self, path: &str) -> Result<(), RemoteError> {
+        let made = {
+            let mut s = self.session.lock().await;
+            let (client, tree) = &mut *s;
+            client.create_directory(tree, &share_path(path)).await
+        };
+        match made.map_err(|e| map_err(&self.host, e)) {
+            Err(RemoteError::Exists(m)) => match self.stat(path).await {
+                Ok(e) if e.is_dir => Ok(()),
+                _ => Err(RemoteError::Exists(m)),
+            },
+            other => other,
+        }
+    }
+
+    /// SMB2 SET_INFO FileRenameInformation with ReplaceIfExists = false (the crate's only
+    /// form): the server itself refuses a taken name with OBJECT_NAME_COLLISION.
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteError> {
+        // Finish closes started by inspection before asking the server to move its folder.
+        self.finish_closes().await?;
+        let mut s = self.session.lock().await;
+        let (client, tree) = &mut *s;
+        client
+            .rename(tree, &share_path(from), &share_path(to))
+            .await
+            .map_err(|e| map_err(&self.host, e))
+    }
+
+    async fn remove_dir(&self, path: &str) -> Result<(), RemoteError> {
+        if share_path(path).is_empty() {
+            return Err(RemoteError::BadPath(
+                "the share itself cannot be removed".into(),
+            ));
+        }
+        self.finish_closes().await?;
+        let mut s = self.session.lock().await;
+        let (client, tree) = &mut *s;
+        client
+            .delete_directory(tree, &share_path(path))
+            .await
+            .map_err(|e| map_err(&self.host, e))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_denied_rename_is_not_a_failed_sign_in() {
+        let error = smb2::Error::Protocol {
+            status: smb2::types::status::NtStatus::ACCESS_DENIED,
+            command: smb2::types::Command::SetInfo,
+        };
+        let mapped = map_err("nas", error);
+        assert!(!matches!(mapped, RemoteError::Auth(_)));
+        assert!(mapped.to_string().contains("permission"));
+    }
 
     #[test]
     fn server_addresses_from_what_people_type() {
@@ -275,8 +379,44 @@ mod tests {
         let mut conn = crate::remote::store::conn("t", crate::remote::store::Protocol::Smb);
         conn.host = host.into();
         conn.port = port.parse().unwrap();
-        conn.user = String::new();
-        let fs = SmbFs::connect(&conn, &Secret::None).await.unwrap();
+        conn.user = std::env::var("PS5UPLOAD_SAMBA_USER").unwrap_or_default();
+        let secret = match std::env::var("PS5UPLOAD_SAMBA_PASS") {
+            Ok(password) => Secret::Password { password },
+            Err(_) => Secret::None,
+        };
+        let fs = SmbFs::connect(&conn, &secret).await.unwrap();
         crate::remote::contract::check(&fs, "/").await;
+        // A writable share with files `w/a` and `w/b` of different sizes. The share's folder must
+        // keep extended attributes: on a Docker Desktop bind mount Samba answers every rename
+        // with STATUS_NOT_SUPPORTED, so seed the files inside the container.
+        if fs.stat("/w/a").await.is_ok() {
+            crate::remote::contract::check_writes(&fs, "/w").await;
+            // An extracted game is a populated directory, not an empty folder.
+            if fs.stat("/w/game/sce_sys/param.json").await.is_ok() {
+                let size = fs.stat("/w/game/sce_sys/param.json").await.unwrap().size;
+                // Collection inspection opens metadata before it tries to move the folder.
+                // Dropping that reader must close the SMB handle, not leave it in the session.
+                let metadata = fs.open("/w/game/sce_sys/param.json").await.unwrap();
+                assert!(!metadata.read_at(0, 1024).await.unwrap().is_empty());
+                drop(metadata);
+                fs.rename("/w/game", "/w/PS5/game")
+                    .await
+                    .expect("move an intact game directory");
+                assert_eq!(
+                    fs.stat("/w/PS5/game/sce_sys/param.json")
+                        .await
+                        .unwrap()
+                        .size,
+                    size
+                );
+                assert!(matches!(
+                    fs.stat("/w/game").await,
+                    Err(RemoteError::NotFound(_))
+                ));
+                fs.rename("/w/PS5/game", "/w/game")
+                    .await
+                    .expect("undo intact game move");
+            }
+        }
     }
 }

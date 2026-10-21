@@ -324,6 +324,24 @@ impl FtpFs {
         })
     }
 
+    /// SIZE, then MDTM, on one exact path.
+    async fn probe(&self, path: &str) -> Probe {
+        let full = under(&self.home, path);
+        let mut s = self.session.lock().await;
+        let size = tokio::time::timeout(STEP, s.size(full.as_str())).await;
+        let size_absent = match size {
+            Ok(Ok(n)) => return Probe::Present(Some(n as u64)),
+            Ok(Err(FtpError::UnexpectedResponse(r))) => r.status.code() == 550,
+            _ => false,
+        };
+        match tokio::time::timeout(STEP, s.mdtm(full.as_str())).await {
+            Ok(Ok(_)) => Probe::Present(None),
+            Ok(Err(FtpError::UnexpectedResponse(r))) if r.status.code() == 550 => Probe::Absent,
+            _ if size_absent => Probe::Absent,
+            _ => Probe::Unknown,
+        }
+    }
+
     async fn entries(&self, path: &str) -> Result<Vec<Entry>, RemoteError> {
         let dir = under(&self.home, path);
         let dir = dir.as_str();
@@ -348,6 +366,57 @@ impl FtpFs {
             }
         })
         .await
+    }
+}
+
+/// What SIZE and MDTM say about one exact path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Probe {
+    /// A file is there (with its size when SIZE gave one).
+    Present(Option<u64>),
+    /// Both answered "no such file" (550).
+    Absent,
+    /// The server answers neither command: only the listing can tell.
+    Unknown,
+}
+
+/// (parent folder, name) of a server path without a trailing `/`.
+fn split_parent(p: &str) -> (&str, &str) {
+    let (parent, name) = p.rsplit_once('/').unwrap_or(("", p));
+    (if parent.is_empty() { "/" } else { parent }, name)
+}
+
+/// Whether a rename may go to `to` (`name` in a folder whose listing is `listing`): only when
+/// the folder could be listed (a folder that cannot be is no proof the name is free), no entry
+/// in it has the name in any case (a case-insensitive server would replace it), and the exact
+/// path probes as absent (a listing can hide dot-files).
+pub(crate) fn target_free(
+    to: &str,
+    name: &str,
+    listing: Result<Vec<Entry>, RemoteError>,
+    probe: Probe,
+) -> Result<(), RemoteError> {
+    let entries = match listing {
+        Ok(v) => v,
+        Err(RemoteError::NotFound(m)) => {
+            return Err(RemoteError::NotFound(format!(
+                "no folder for {to}, so it cannot be checked ({m})"
+            )))
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some(e) = entries
+        .iter()
+        .find(|e| e.name == name || e.name.to_lowercase() == name.to_lowercase())
+    {
+        return Err(RemoteError::Exists(format!(
+            "{to} is taken (by {})",
+            e.name
+        )));
+    }
+    match probe {
+        Probe::Present(_) => Err(RemoteError::Exists(format!("{to} already exists"))),
+        Probe::Absent | Probe::Unknown => Ok(()),
     }
 }
 
@@ -493,13 +562,25 @@ impl RemoteFs for FtpFs {
                 mtime: None,
             });
         }
-        let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
-        let parent = if parent.is_empty() { "/" } else { parent };
-        self.entries(parent)
+        let (parent, name) = split_parent(trimmed);
+        if let Some(e) = self
+            .entries(parent)
             .await?
             .into_iter()
             .find(|e| e.name == name)
-            .ok_or_else(|| RemoteError::NotFound(format!("{path} not found")))
+        {
+            return Ok(e);
+        }
+        // Not in the listing is not proof of absence: LIST hides dot-files on many servers.
+        match self.probe(trimmed).await {
+            Probe::Present(size) => Ok(Entry {
+                name: name.to_string(),
+                is_dir: false,
+                size: size.unwrap_or(0),
+                mtime: None,
+            }),
+            _ => Err(RemoteError::NotFound(format!("{path} not found"))),
+        }
     }
 
     async fn open(&self, path: &str) -> Result<Arc<dyn RemoteFile>, RemoteError> {
@@ -563,6 +644,70 @@ impl RemoteFs for FtpFs {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
+
+    async fn create_dir(&self, path: &str) -> Result<(), RemoteError> {
+        let full = under(&self.home, path);
+        let made = {
+            let mut s = self.session.lock().await;
+            let host = self.host.as_str();
+            timed(host, "making a folder", async {
+                s.mkdir(full.as_str()).await.map_err(|e| map_err(host, e))
+            })
+            .await
+        };
+        match made {
+            Ok(()) => Ok(()),
+            // MKD answers 550 (or 521) for a name already taken; whether that is a folder
+            // (fine) or a file (not) only a look can tell.
+            Err(e @ (RemoteError::NotFound(_) | RemoteError::Io(_))) => match self.stat(path).await
+            {
+                Ok(st) if st.is_dir => Ok(()),
+                Ok(_) => Err(RemoteError::Exists(format!("{path} is a file"))),
+                Err(_) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// RNFR/RNTO replaces an existing target on many servers (vsftpd and ProFTPD among them),
+    /// so the target is looked up first and a taken name refused. Something that appears at
+    /// `to` between that look and the RNTO (a few milliseconds) would still be replaced: FTP
+    /// has no rename that refuses on its own.
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteError> {
+        let trimmed = to.trim_end_matches('/');
+        let (parent, name) = split_parent(trimmed);
+        let listing = self.entries(parent).await;
+        let probe = if listing.is_ok() {
+            self.probe(trimmed).await
+        } else {
+            Probe::Unknown
+        };
+        target_free(to, name, listing, probe)?;
+        let (src, dst) = (under(&self.home, from), under(&self.home, to));
+        let mut s = self.session.lock().await;
+        let host = self.host.as_str();
+        timed(host, "a rename", async {
+            s.rename(src.as_str(), dst.as_str())
+                .await
+                .map_err(|e| map_err(host, e))
+        })
+        .await
+    }
+
+    async fn remove_dir(&self, path: &str) -> Result<(), RemoteError> {
+        if path.trim_matches('/').is_empty() {
+            return Err(RemoteError::BadPath(
+                "the login folder cannot be removed".into(),
+            ));
+        }
+        let full = under(&self.home, path);
+        let mut s = self.session.lock().await;
+        let host = self.host.as_str();
+        timed(host, "removing a folder", async {
+            s.rmdir(full.as_str()).await.map_err(|e| map_err(host, e))
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -571,6 +716,52 @@ mod tests {
 
     fn lines(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn ent(name: &str) -> Entry {
+        Entry {
+            name: name.into(),
+            is_dir: false,
+            size: 1,
+            mtime: None,
+        }
+    }
+
+    #[test]
+    fn a_rename_target_is_free_only_when_the_server_says_so_every_way() {
+        let listed = || Ok(vec![ent("Game.pkg"), ent("b")]);
+        // Free: listed folder without it, and SIZE/MDTM say absent (or cannot say).
+        assert!(target_free("/g/new.pkg", "new.pkg", listed(), Probe::Absent).is_ok());
+        assert!(target_free("/g/new.pkg", "new.pkg", listed(), Probe::Unknown).is_ok());
+        // The same name in another case: a case-insensitive server would replace it.
+        assert!(matches!(
+            target_free("/g/GAME.PKG", "GAME.PKG", listed(), Probe::Absent),
+            Err(RemoteError::Exists(_))
+        ));
+        // Hidden from the listing (a dot-file), but SIZE finds it.
+        assert!(matches!(
+            target_free("/g/.x", ".x", listed(), Probe::Present(Some(3))),
+            Err(RemoteError::Exists(_))
+        ));
+        // A folder that cannot be listed proves nothing.
+        assert!(matches!(
+            target_free(
+                "/g/new.pkg",
+                "new.pkg",
+                Err(RemoteError::NotFound("550".into())),
+                Probe::Absent
+            ),
+            Err(RemoteError::NotFound(_))
+        ));
+        assert!(target_free(
+            "/g/new.pkg",
+            "new.pkg",
+            Err(RemoteError::Io("421".into())),
+            Probe::Absent
+        )
+        .is_err());
+        assert_eq!(split_parent("/a.pkg"), ("/", "a.pkg"));
+        assert_eq!(split_parent("/g/h/a.pkg"), ("/g/h", "a.pkg"));
     }
 
     #[test]
@@ -651,6 +842,23 @@ mod tests {
         .await
         .unwrap();
         crate::remote::contract::check(&fs, "/").await;
+        // A writable folder `w/` holding files `a` and `b` of different sizes, and a dot-file
+        // `.hidden` that the server's LIST leaves out.
+        if fs.stat("/w/a").await.is_ok() {
+            crate::remote::contract::check_writes(&fs, "/w").await;
+            assert!(matches!(
+                fs.rename("/w/a", "/w/B").await,
+                Err(RemoteError::Exists(_))
+            ));
+            if fs.stat("/w/.hidden").await.is_ok() {
+                assert!(matches!(
+                    fs.rename("/w/a", "/w/.hidden").await,
+                    Err(RemoteError::Exists(_))
+                ));
+            }
+            assert!(fs.rename("/w/a", "/nope-7f3a/x").await.is_err());
+            assert_eq!(fs.stat("/w/a").await.unwrap().size, 3);
+        }
     }
 
     /// FTPS with a self-signed certificate (the delfer image with TLS_CERT/TLS_KEY), then

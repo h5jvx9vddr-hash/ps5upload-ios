@@ -1,6 +1,7 @@
 #ifndef PS5UPLOAD2_REGISTER_H
 #define PS5UPLOAD2_REGISTER_H
 
+#include "unregister_outcome.h"
 #include <stddef.h>
 
 /*
@@ -81,22 +82,29 @@ int register_title_from_path(const char *src_path,
                              int *out_used_nullfs,
                              const char **err_reason_out);
 
-/* Reverse of register_title_from_path. Best-effort: always unmounts
- * the nullfs at /system_ex/app/<title_id>, removes tracking files,
- * and (if available) calls sceAppInstUtilAppUninstall to clear the
- * XMB tile. Returns 0 if the unmount succeeded (tile removal is
- * optional).
+/* Reverse of register_title_from_path, and the uninstall of a package
+ * install. Unmounts our nullfs at /system_ex/app/<title_id> when we put one
+ * there, removes the tracking files, and calls sceAppInstUtilAppUninstall.
+ * Returns 0 when our own teardown succeeded; -1 with *err_reason_out set
+ * otherwise.
  *
- * `sony_rc_out` (may be NULL) receives sceAppInstUtilAppUninstall's
- * return code: 0 when it succeeded or was never called, non-zero when
- * Sony REFUSED the uninstall. That refusal used to be logged to stderr
- * and nowhere else, so callers reported a clean success while the
- * console kept the title — a real user hit this with a title Sony
- * rejected with 0x80B21B02, and the tool insisted the uninstall had
- * worked. Surface it instead of swallowing it. */
+ * `out` (may be NULL) says what the uninstall achieved: Sony's return code,
+ * and whether the title's folders were still on the console after a bounded
+ * wait. Sony's code alone proves nothing (it is 0 for a title id that was
+ * never installed), and treating a refusal as success put an "Unregistered"
+ * toast on the console while the game stayed listed (#476). The caller
+ * decides the reply with unregister_verdict(). */
 int unregister_title(const char *title_id,
                      const char **err_reason_out,
-                     unsigned *sony_rc_out);
+                     unregister_outcome_t *out);
+
+/* Re-establish only the nullfs bind /system_ex/app/<title_id> -> src_path
+ * (step 4 of register_title_from_path, with its /system_ex rw remount and
+ * eboot.bin checks) for a title that is still registered with Sony but whose
+ * bind did not survive a reboot. No Sony call, no copies, no app.db write.
+ * 0, or -1 with *err_reason_out set. */
+int register_remount_nullfs(const char *title_id, const char *src_path,
+                           const char **err_reason_out);
 
 /* Launch an already-registered title via sceLncUtilLaunchApp. The title
  * must already be in app.db; this does not register. On firmware where

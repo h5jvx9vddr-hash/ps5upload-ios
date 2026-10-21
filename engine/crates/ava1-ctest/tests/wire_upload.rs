@@ -640,6 +640,15 @@ fn the_reaper_takes_parked_jobs_only_and_never_one_just_attached() {
     assert_eq!(ava1_ctest::c_reap_rules(&d.join("jobs")), 0);
 }
 
+#[test]
+fn ended_uploads_leave_the_table_while_their_session_runs_on() {
+    // #475, in C: a session runs job after job, so the uploads that ended on it make room for
+    // the next JobOpen (the one that ended longest ago and nobody holds goes first) and leave
+    // 10 s after their end; running or still-settling jobs never do, nor a copy.
+    let d = dir("wire-ended");
+    assert_eq!(ava1_ctest::c_ended_transfers(&d.join("jobs")), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_server_restarts_on_the_same_port() {
     let d = dir("wire-restart");

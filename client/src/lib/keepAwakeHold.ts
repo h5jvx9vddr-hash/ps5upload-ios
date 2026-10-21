@@ -71,3 +71,36 @@ export function setTransferKeepAwake(active: boolean): void {
     }
   });
 }
+
+// ── Background-work hold (#457) ─────────────────────────────────────────
+// The host's background watcher (src-tauri/src/bg_activity.rs) keeps the app
+// running — on Android, a foreground service — while the engine has a job, and
+// also while this hold says work is queued between jobs (an upload queue
+// settling before its next item), when the engine has nothing running. The host
+// drops a hold not refreshed for 5 minutes, so a renderer frozen while holding
+// cannot keep the service up forever: refresh it every minute while held.
+
+const BG_REFRESH_MS = 60_000;
+let bgHeld = false;
+let bgRefresh: ReturnType<typeof setInterval> | null = null;
+
+function sendBgHold(active: boolean): void {
+  // Native command only; the self-hosted web UI has no host (see above).
+  if (!isTauriEnv()) return;
+  invoke("bg_work_hold", { active }).catch(() => {
+    // Best-effort, like the keep-awake hold.
+  });
+}
+
+/** Hold (`true`) or release the host's background-work hold. Edge-only, plus a
+ *  refresh every minute while held. */
+export function setBackgroundWorkHold(active: boolean): void {
+  if (active === bgHeld) return;
+  bgHeld = active;
+  if (bgRefresh !== null) {
+    clearInterval(bgRefresh);
+    bgRefresh = null;
+  }
+  sendBgHold(active);
+  if (active) bgRefresh = setInterval(() => sendBgHold(true), BG_REFRESH_MS);
+}

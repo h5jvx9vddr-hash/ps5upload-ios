@@ -67,6 +67,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
       - name: Sync version from VERSION
         run: node scripts/update-version.js
 
@@ -98,6 +100,12 @@ jobs:
 
       - name: Install pinned PS5 Payload SDK
         run: sudo env PS5_SDK_INSTALL_DIR=/opt/ps5-payload-sdk bash scripts/install-ps5-sdk.sh
+
+      # make payload embeds the console web page (payload/Makefile: build/webui_page.c runs
+      # `npm run build:console` in client/), so the client's dependencies must be installed.
+      - name: Install client deps (console web page)
+        working-directory: client
+        run: npm ci --no-audit --no-fund
 
       - name: Build payload ELF
         env:

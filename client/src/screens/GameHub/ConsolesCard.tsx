@@ -16,7 +16,7 @@ import {
   rowActions,
   type RowAction,
 } from "../../lib/gamePage";
-import { useConnectionStore } from "../../state/connection";
+import { useConnectionStore, useHostRuntime } from "../../state/connection";
 import { useCopyActivity } from "../../state/copyActivity";
 import { useTr } from "../../state/lang";
 import { pushNotification } from "../../state/notifications";
@@ -166,6 +166,8 @@ function ConsoleRow({
   const activity =
     activities.find((a) => a && a.phase !== "done" && a.phase !== "failed") ?? activities.find((a) => a) ?? null;
   const connectedHost = useConnectionStore((s) => s.host ?? "");
+  // This console's own live state (the poller probes every saved console), for a rest badge.
+  const rt = useHostRuntime(host);
 
   const doRefresh = async () => {
     setBusy(true);
@@ -290,6 +292,11 @@ function ConsoleRow({
             {connected && (
               <Badge tone="good" size="sm">
                 {tr("game_connected", undefined, "Connected")}
+              </Badge>
+            )}
+            {!connected && rt.payloadStatus !== "up" && rt.power === "rest" && (
+              <Badge tone="accent" size="sm">
+                {tr("status_ps5_rest_mode", undefined, "In rest mode")}
               </Badge>
             )}
           </div>

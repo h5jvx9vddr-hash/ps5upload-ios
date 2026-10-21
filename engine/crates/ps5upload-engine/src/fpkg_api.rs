@@ -65,6 +65,10 @@ pub(crate) struct BuildReq {
     /// A PlayGo language code (`fr-FR`, …) the package declares as its only one.
     #[serde(default)]
     language: Option<String>,
+    /// Read the whole package back to verify it. Off (the default): the structure is checked
+    /// in full and a seeded sample of the data blocks.
+    #[serde(default)]
+    full_verify: bool,
 }
 
 /// The language a build asked for, trimmed; none when blank.
@@ -397,6 +401,7 @@ pub(crate) async fn fpkg_build_handler(
             }),
             cancel: Some(&cancel),
             stage: Some(&mut on_stage),
+            sample: (!req.full_verify).then(ps5upload_fpkg::sample::fresh_seed),
         };
         // The build's phase lines go to the engine log, where the Log tab shows them.
         let mut phase = |line: &str| {
@@ -541,6 +546,9 @@ pub(crate) struct CompressReq {
     /// zlib level 1–9; the library default when absent.
     #[serde(default)]
     level: Option<u32>,
+    /// Decode every block to verify the output; by default a seeded sample (and the table).
+    #[serde(default)]
+    full_verify: bool,
 }
 
 /// POST /api/ffpfsc/compress — compress a game image into a `.ffpfsc` for ShadowMountPlus.
@@ -665,6 +673,7 @@ pub(crate) async fn ffpfsc_compress_handler(
         if let Some(level) = req.level {
             options.level = level;
         }
+        options.sample = (!req.full_verify).then(ps5upload_fpkg::sample::fresh_seed);
         let mut progress = |done: u64, _total: u64| bytes.store(done, Ordering::Relaxed);
         let mut control = ffpfsc::Control {
             progress: Some(&mut progress),
@@ -682,13 +691,17 @@ pub(crate) async fn ffpfsc_compress_handler(
                 crate::engine_log::record(
                     "info",
                     format!(
-                        "ffpfsc: {} -> {} ({} -> {} bytes, {}/{} blocks compressed, verified)",
+                        "ffpfsc: {} -> {} ({} -> {} bytes, {}/{} blocks compressed, verified; elapsed_ms={} level={} workers={} full_verify={})",
                         source.display(),
                         report.output.display(),
                         report.raw_size,
                         report.image_size,
                         report.compressed_blocks,
-                        report.blocks
+                        report.blocks,
+                        completed_at_ms.saturating_sub(started_at_ms),
+                        options.level,
+                        std::thread::available_parallelism().map_or(4, |n| n.get()),
+                        options.sample.is_none(),
                     ),
                 );
                 set_job(
@@ -760,6 +773,10 @@ pub(crate) struct ExfatBuildReq {
     /// when absent, which measured fastest.
     #[serde(default)]
     verify_chunk_kib: Option<u32>,
+    /// Read every byte of the image back to verify it. Off (the default): names, sizes and
+    /// folders are checked in full and a seeded sample of the data.
+    #[serde(default)]
+    full_verify: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -835,6 +852,11 @@ pub(crate) async fn exfat_build_handler(
         Ok(c) => c,
         Err(e) => return json_err(StatusCode::BAD_REQUEST, e).into_response(),
     };
+    // A fast read-back also covers UFS2's indirect-block seam.
+    let mode = ps5upload_fpkg::sample::VerifyMode::from_full(
+        req.full_verify,
+        format == crate::image_build::ImageFormat::Ffpkg,
+    );
     let packs = match &req.ampr_lz4 {
         None => None,
         Some(_) if format != crate::image_build::ImageFormat::Exfat || req.compress => {
@@ -882,7 +904,15 @@ pub(crate) async fn exfat_build_handler(
     let check_packs = packs.is_some();
     let install_runtime = req.ampr_lz4.as_ref().is_some_and(|r| r.install_runtime);
     let scanned = tokio::task::spawn_blocking(move || {
-        let mut tree = ps5upload_fpkg::source::open(&scan_source).map_err(|e| e.to_string())?;
+        // A UFS2 image (.ffpkg) is case-sensitive like /data: give modules the eboot's spelling.
+        let (mut tree, renamed) =
+            ps5upload_fpkg::module_case::open(&scan_source).map_err(|e| e.to_string())?;
+        if !renamed.is_empty() {
+            crate::log_info!(
+                "image build: renamed to the eboot's spelling: {}",
+                ps5upload_fpkg::module_case::describe(&renamed)
+            );
+        }
         if check_packs && install_runtime {
             // The game's own ampr_emu is missing or too old for packs: the image gets the
             // release one, its own kept beside it. Only for a game that reads through AMPR.
@@ -1031,6 +1061,7 @@ pub(crate) async fn exfat_build_handler(
                 &mut *tree,
                 &output,
                 packs,
+                mode,
                 verify_chunk,
                 &cancel,
                 &mut report,
@@ -1042,6 +1073,7 @@ pub(crate) async fn exfat_build_handler(
                     inner_name.as_deref(),
                     &mut indexed,
                     &output,
+                    mode,
                     verify_chunk,
                     &cancel,
                     &mut report,
@@ -1051,6 +1083,7 @@ pub(crate) async fn exfat_build_handler(
                     inner_name.as_deref(),
                     &mut *tree,
                     &output,
+                    mode,
                     verify_chunk,
                     &cancel,
                     &mut report,
@@ -1102,6 +1135,282 @@ pub(crate) async fn exfat_build_handler(
             }
             Err(error) => {
                 crate::engine_log::record("warn", format!("image: build failed: {error}"));
+                set_job(
+                    &state_for_job.jobs,
+                    &state_for_job.events_tx,
+                    job_id,
+                    JobState::Failed {
+                        started_at_ms,
+                        completed_at_ms,
+                        elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
+                        error,
+                        error_reason: None,
+                        error_detail: None,
+                        error_console: None,
+                    },
+                );
+            }
+        }
+        fail.mark_succeeded();
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(JobCreated {
+            job_id: job_id.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct FolderBuildReq {
+    /// A game image (`.exfat`, `.ffpkg`/`.ufs2`, `.ffpfs`, `.ffpfsc`) or a debug-key `.pkg`,
+    /// on this computer, a saved server (`remote://`) or a console (`ps5://`).
+    source: String,
+    #[serde(default)]
+    output_dir: Option<String>,
+    /// The folder's name; the source file's name without its extension when absent.
+    #[serde(default)]
+    name: Option<String>,
+    /// Compare every file by SHA-256. Off (the default): every size, and a seeded sample.
+    #[serde(default)]
+    full_verify: bool,
+}
+
+/// POST /api/folder/build — unpack a game image or a debug-key package into a plain folder
+/// (#469). Runs as a job like an image build: stages `write` and `verify`, the folder written
+/// as `<name>.partial/` and renamed only once it reads back. Done's `dest` is the folder.
+pub(crate) async fn folder_build_handler(
+    State(state): State<AppState>,
+    Json(req): Json<FolderBuildReq>,
+) -> impl IntoResponse {
+    use crate::folder_build;
+    let source = resolve_engine_path(&req.source);
+    let remote = ps5upload_fpkg::remote_source::is_remote(&source);
+    if !remote && tokio::fs::metadata(&source).await.is_ok_and(|m| m.is_dir()) {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            format!("{} is already a folder", source.display()),
+        )
+        .into_response();
+    }
+    // On a server or console only the name tells: a folder there has no image extension.
+    let named_as_image = if remote {
+        crate::image_build::has_image_extension(&source)
+    } else {
+        crate::image_build::is_image_file(&source)
+    };
+    if !named_as_image {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            format!("{} is not a game image or package", source.display()),
+        )
+        .into_response();
+    }
+    let name = match req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => {
+            if let Some(why) = folder_build::name_problem(n) {
+                return json_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("the folder name {n:?} {why}"),
+                )
+                .into_response();
+            }
+            n.to_string()
+        }
+        None => crate::image_build::stem_of(&source),
+    };
+    let out_dir = output_dir(req.output_dir.as_deref());
+    let target = out_dir.join(&name);
+    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
+        return json_err(
+            StatusCode::CONFLICT,
+            format!("{} already exists", target.display()),
+        )
+        .into_response();
+    }
+    // A `<name>.partial` that is not one of ours is the user's: never cleared, never used.
+    let partial = folder_build::partial_of(&target);
+    if tokio::fs::try_exists(&partial).await.unwrap_or(false)
+        && !folder_build::is_our_partial_dir(&partial)
+    {
+        return json_err(
+            StatusCode::CONFLICT,
+            format!("{} already exists", partial.display()),
+        )
+        .into_response();
+    }
+    if let Err(e) = tokio::fs::create_dir_all(&out_dir).await {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            format!("{}: {e}", out_dir.display()),
+        )
+        .into_response();
+    }
+    let scan_source = source.clone();
+    let scanned = tokio::task::spawn_blocking(move || {
+        // An image ignores letter case and /data does not: a Unity dump whose
+        // Il2cppUserAssemblies.prx the eboot loads as Il2CppUserAssemblies.prx plays from the
+        // image and crashes a second in from the folder. The folder takes the eboot's spelling.
+        let (tree, renamed) =
+            ps5upload_fpkg::module_case::open(&scan_source).map_err(|e| e.to_string())?;
+        if !renamed.is_empty() {
+            crate::log_info!(
+                "folder build: renamed to the eboot's spelling: {}",
+                ps5upload_fpkg::module_case::describe(&renamed)
+            );
+        }
+        Ok::<_, String>(tree)
+    })
+    .await;
+    let tree = match scanned {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return json_err(StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => {
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
+        }
+    };
+    if tree.files().is_empty() {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            format!("{} has no files in it", source.display()),
+        )
+        .into_response();
+    }
+    let total: u64 = tree.files().iter().map(|f| f.size).sum();
+    if let Some(why) =
+        build::free_bytes(&out_dir).and_then(|free| folder_build::shortfall(free, total, &out_dir))
+    {
+        return json_err(StatusCode::BAD_REQUEST, why).into_response();
+    }
+    let Some(writing) = Writing::claim_off_thread(partial.clone()).await else {
+        return already_building(&partial);
+    };
+    let mode = ps5upload_fpkg::sample::VerifyMode::from_full(req.full_verify, false);
+
+    let job_id = Uuid::new_v4();
+    let cancel = register_transfer_cancel(job_id);
+    let bytes = Arc::new(AtomicU64::new(0));
+    let started_at_ms = now_ms();
+    set_job(
+        &state.jobs,
+        &state.events_tx,
+        job_id,
+        JobState::Running {
+            stage: None,
+            started_at_ms,
+            bytes_sent: 0,
+            total_bytes: total,
+            files: Default::default(),
+            skipped_files: 0,
+            skipped_bytes: 0,
+            files_processing: 0,
+            files_finalized: 0,
+            files_finalizing_total: 0,
+            bytes_finalized: 0,
+        },
+    );
+    let jobs = state.jobs.clone();
+    let events_tx = state.events_tx.clone();
+    let tick_bytes = bytes.clone();
+    let current: Arc<std::sync::Mutex<Option<JobStage>>> = Arc::default();
+    let tick_stage = current.clone();
+    let ticker = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut g = jobs.lock().unwrap_or_else(|e| e.into_inner());
+            match g.get_mut(&job_id) {
+                Some(JobState::Running {
+                    bytes_sent, stage, ..
+                }) => {
+                    *bytes_sent = tick_bytes.load(Ordering::Relaxed);
+                    *stage = tick_stage.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let state = (events_tx.receiver_count() > 0)
+                        .then(|| g.get(&job_id).map(|st| serde_json::json!(st)))
+                        .flatten();
+                    drop(g);
+                    if let Some(state) = state {
+                        let msg = serde_json::json!({ "job_id": job_id.to_string(), "job": state });
+                        let _ = events_tx.send(msg.to_string());
+                    }
+                }
+                _ => break,
+            }
+        }
+    });
+
+    let state_for_job = state.clone();
+    let ticker = JobTicker(ticker.abort_handle());
+    tokio::task::spawn_blocking(move || {
+        let mut fail = JobFailOnDropGuard::new(
+            state_for_job.jobs.clone(),
+            state_for_job.events_tx.clone(),
+            job_id,
+            started_at_ms,
+        );
+        sweep_output_leftovers(&out_dir);
+        let mut tree = tree;
+        const STAGES: [&str; 2] = ["write", "verify"];
+        let mut report = |id: &str, done: u64, total: u64| {
+            if id == "write" {
+                bytes.store(done, Ordering::Relaxed);
+            }
+            let index = STAGES.iter().position(|s| *s == id).unwrap_or(0) as u32;
+            *current.lock().unwrap_or_else(|e| e.into_inner()) = Some(JobStage {
+                id: id.to_string(),
+                index,
+                count: STAGES.len() as u32,
+                done,
+                total,
+            });
+        };
+        let reopen_source = source.clone();
+        // Verification reads the source afresh by the folder's names, so with the same renames.
+        let reopen = move || {
+            ps5upload_fpkg::module_case::open(&reopen_source)
+                .map(|(t, _)| t)
+                .map_err(|e| e.to_string())
+        };
+        let outcome = folder_build::build(&mut *tree, &reopen, &target, mode, &cancel, &mut report);
+        drop(tree);
+        drop(writing);
+        if outcome.is_err() {
+            sweep_output_leftovers(&out_dir);
+        }
+        let completed_at_ms = now_ms();
+        drop(ticker);
+        match outcome {
+            Ok(built) => {
+                crate::engine_log::record(
+                    "info",
+                    format!(
+                        "folder: {} -> {} ({}, read back)",
+                        source.display(),
+                        target.display(),
+                        built.detail
+                    ),
+                );
+                set_job(
+                    &state_for_job.jobs,
+                    &state_for_job.events_tx,
+                    job_id,
+                    JobState::Done {
+                        started_at_ms,
+                        completed_at_ms,
+                        elapsed_ms: completed_at_ms.saturating_sub(started_at_ms),
+                        tx_id_hex: String::new(),
+                        bytes_sent: built.bytes,
+                        dest: target.display().to_string(),
+                        files_sent: built.files,
+                        skipped_files: 0,
+                        skipped_bytes: 0,
+                        commit_ack: None,
+                    },
+                );
+            }
+            Err(error) => {
+                crate::engine_log::record("warn", format!("folder: build failed: {error}"));
                 set_job(
                     &state_for_job.jobs,
                     &state_for_job.events_tx,
@@ -1262,8 +1571,12 @@ pub(crate) fn sweep_output_leftovers(out: &Path) {
                 let name = e.file_name().to_string_lossy().to_ascii_lowercase();
                 match e.file_type() {
                     Ok(t) if t.is_file() => is_our_partial(&name),
-                    // An LZ4 image build's pack volumes, `<name>.exfat.lz4spool/`.
-                    Ok(t) if t.is_dir() => name.ends_with(".exfat.lz4spool"),
+                    // An LZ4 image build's pack volumes, `<name>.exfat.lz4spool/`, and a
+                    // folder build's unfinished folder (marked, so a user's own is kept).
+                    Ok(t) if t.is_dir() => {
+                        name.ends_with(".exfat.lz4spool")
+                            || crate::folder_build::is_our_partial_dir(&e.path())
+                    }
                     _ => false,
                 }
             })

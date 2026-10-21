@@ -9,6 +9,7 @@
 
 mod archive_time;
 pub mod c2c;
+pub mod c2c_record;
 pub mod console;
 pub mod copy;
 pub mod download;

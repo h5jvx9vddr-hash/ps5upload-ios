@@ -7,6 +7,8 @@ import path from "node:path";
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const skipParts = new Set([
   ".git",
+  ".claude",
+  ".codex",
   "node_modules",
   "client/node_modules",
   "target",

@@ -268,15 +268,45 @@ static void cdb_build_app_sql(const cdb_app_schema_t *sc, char *sql,
              sc->table, sc->col_title, sc->col_title);
 }
 
-/* Row-level app list: SQL first, byte scan if the database will not open.
- * content_db_apps_json() and activity.c's "recently played" both build on
- * this so there is one schema-discovery implementation, not two. */
-int content_db_apps(content_db_app_t *out, int max, const char **source) {
+/* The byte scanner's bounds. It reads at most CDB_SCAN_RAW_MAX of the file
+ * and recovers at most CDB_SCAN_ROWS_MAX titles; a database past either is
+ * reported as truncated, never as a complete list. */
+#define CDB_SCAN_RAW_MAX (1024u * 1024u)
+#define CDB_SCAN_ROWS_MAX 4096
+
+static void cdb_fill_row(content_db_app_t *r, const char *tid,
+                         const char *name, int app_id) {
+    memset(r, 0, sizeof(*r));
+    snprintf(r->title_id, sizeof(r->title_id), "%s", tid);
+    snprintf(r->name, sizeof(r->name), "%s", name ? name : "");
+    r->app_id = app_id;
+}
+
+/*
+ * Row-level app list, windowed: rows [offset, offset + max) of the title
+ * table, in title order, go to `out`. SQL first, byte scan if the database
+ * will not open. content_db_apps(), the paged JSON and activity.c's
+ * "recently played" all build on this, so there is one schema-discovery
+ * implementation, not two.
+ *
+ * `total` (optional) receives how many rows the table holds -- with the
+ * scanner, a lower bound that is at least offset + max + 1 when more rows
+ * follow the window. `capped` (optional) is set when rows exist that the
+ * reader could not reach (the scanner's bounds).
+ *
+ * Returns the number of rows written to `out`, or -1 if nothing could be
+ * read at all.
+ */
+static int cdb_apps_window(content_db_app_t *out, unsigned offset, int max,
+                           unsigned *total, int *capped, const char **source) {
+    if (total) *total = 0;
+    if (capped) *capped = 0;
     if (!out || max <= 0) return -1;
     if (source) *source = "scan";
 
     sqlite3 *db = NULL;
     const char *how = "sqlite";
+    unsigned rows_seen = 0;
     int count = 0;
 
     if (cdb_open_ro(CONTENT_DB_APP, &db, &how) == SQLITE_OK && db) {
@@ -286,25 +316,29 @@ int content_db_apps(content_db_app_t *out, int max, const char **source) {
         /* First candidate that actually yields rows wins: a console with
          * several users has several of these tables, and the ones
          * belonging to other users are empty. */
-        for (int ci = 0; ci < ncand && count == 0; ci++) {
+        for (int ci = 0; ci < ncand && rows_seen == 0; ci++) {
             char sql[512];
             cdb_build_app_sql(&cands[ci], sql, sizeof(sql));
 
             sqlite3_stmt *st = NULL;
             if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
                 continue;
-            while (count < max && sqlite3_step(st) == SQLITE_ROW) {
+            /* Every row is counted (so the caller knows whether more
+             * follow); only the window is copied. */
+            int step;
+            while ((step = sqlite3_step(st)) == SQLITE_ROW) {
                 const unsigned char *tid = sqlite3_column_text(st, 0);
                 if (!tid) continue;
+                unsigned idx = rows_seen++;
+                if (idx < offset || count >= max) continue;
                 const unsigned char *nm = sqlite3_column_text(st, 2);
-                memset(&out[count], 0, sizeof(out[count]));
-                snprintf(out[count].title_id, sizeof(out[count].title_id),
-                         "%s", (const char *)tid);
-                snprintf(out[count].name, sizeof(out[count].name), "%s",
-                         nm ? (const char *)nm : "");
-                out[count].app_id = sqlite3_column_int(st, 1);
+                cdb_fill_row(&out[count], (const char *)tid,
+                             (const char *)nm, sqlite3_column_int(st, 1));
                 count++;
             }
+            /* A walk that ended on anything but DONE (BUSY under the
+             * shell's write, a damaged page) did not see every row. */
+            if (rows_seen > 0 && step != SQLITE_DONE && capped) *capped = 1;
             sqlite3_finalize(st);
         }
         sqlite3_close(db);
@@ -314,49 +348,65 @@ int content_db_apps(content_db_app_t *out, int max, const char **source) {
      * console has no games -- and install verification reads an empty list
      * as a failed install. Fall through to the scan rather than assert a
      * confident zero. */
-    if (count > 0) {
+    if (rows_seen > 0) {
         if (source) *source = how;
+        if (total) *total = rows_seen;
         return count;
     }
 
     int fd = open(CONTENT_DB_APP, O_RDONLY);
     if (fd < 0) return -1;
-    const size_t raw_cap = 1024 * 1024;
-    unsigned char *raw = (unsigned char *)malloc(raw_cap);
+    unsigned char *raw = (unsigned char *)malloc(CDB_SCAN_RAW_MAX);
     if (!raw) {
         close(fd);
         return -1;
     }
-    size_t total = 0;
-    while (total < raw_cap) {
-        ssize_t r = read(fd, raw + total, raw_cap - total);
+    size_t got = 0;
+    while (got < CDB_SCAN_RAW_MAX) {
+        ssize_t r = read(fd, raw + got, CDB_SCAN_RAW_MAX - got);
         if (r <= 0) break;
-        total += (size_t)r;
+        got += (size_t)r;
+    }
+    /* A file larger than the read window has rows the scan never sees. */
+    int raw_capped = 0;
+    if (got == CDB_SCAN_RAW_MAX) {
+        unsigned char probe;
+        raw_capped = read(fd, &probe, 1) > 0;
     }
     close(fd);
 
+    /* One past the window, so "more rows follow" is known without
+     * holding every row. */
+    unsigned long want = (unsigned long)offset + (unsigned long)max + 1ul;
+    int scan_max = want > CDB_SCAN_ROWS_MAX ? CDB_SCAN_ROWS_MAX : (int)want;
     appdb_entry_t *entries =
-        (appdb_entry_t *)malloc(sizeof(appdb_entry_t) * (size_t)max);
+        (appdb_entry_t *)malloc(sizeof(appdb_entry_t) * (size_t)scan_max);
     if (!entries) {
         free(raw);
         return -1;
     }
-    int scanned = appdb_scan_entries_ex(raw, total, entries, max, 1);
+    int scanned = appdb_scan_entries_ex(raw, got, entries, scan_max, 1);
     free(raw);
     if (scanned < 0) {
         free(entries);
         return -1;
     }
-    for (int i = 0; i < scanned; i++) {
-        memset(&out[i], 0, sizeof(out[i]));
-        snprintf(out[i].title_id, sizeof(out[i].title_id), "%s",
-                 entries[i].title_id);
-        snprintf(out[i].name, sizeof(out[i].name), "%s", entries[i].name);
-        out[i].app_id = 0;
+    for (int i = (int)(offset < (unsigned)scanned ? offset : (unsigned)scanned);
+         i < scanned && count < max; i++) {
+        cdb_fill_row(&out[count], entries[i].title_id, entries[i].name, 0);
+        count++;
     }
     free(entries);
+    if (capped)
+        *capped = raw_capped || (scanned == CDB_SCAN_ROWS_MAX &&
+                                 scan_max == CDB_SCAN_ROWS_MAX);
+    if (total) *total = (unsigned)scanned;
     if (source) *source = "scan";
-    return scanned;
+    return count;
+}
+
+int content_db_apps(content_db_app_t *out, int max, const char **source) {
+    return cdb_apps_window(out, 0, max, NULL, NULL, source);
 }
 
 int content_db_select_text(const char *db_path, const char *sql, int max_rows,
@@ -395,16 +445,26 @@ int content_db_select_text(const char *db_path, const char *sql, int max_rows,
     return rows;
 }
 
-int content_db_apps_json(char *buf, size_t cap, size_t *written) {
-    if (!buf || cap < 64) return -1;
+/* The longest tail a page can end with:
+ * ],"source":"sqlite-immutable","offset":4294967295,"next":4294967295,
+ * "more":false,"truncated":false} -- about 110 bytes. */
+#define CDB_PAGE_TAIL_RESERVE 160
 
-    const int max_rows = 256;
+int content_db_apps_page_json(unsigned offset, unsigned limit, char *buf,
+                              size_t cap, size_t *written) {
+    if (!buf || cap < 64) return -1;
+    if (limit == 0 || limit > CONTENT_DB_APPS_PAGE_MAX)
+        limit = CONTENT_DB_APPS_PAGE_MAX;
+
     content_db_app_t *rows =
-        (content_db_app_t *)malloc(sizeof(content_db_app_t) * (size_t)max_rows);
+        (content_db_app_t *)malloc(sizeof(content_db_app_t) * (size_t)limit);
     if (!rows) return cdb_emit_apps_err(buf, cap, written, "out of memory");
 
     const char *source = "scan";
-    int count = content_db_apps(rows, max_rows, &source);
+    unsigned total = 0;
+    int capped = 0;
+    int count = cdb_apps_window(rows, offset, (int)limit, &total, &capped,
+                                &source);
     if (count < 0) {
         free(rows);
         return cdb_emit_apps_err(buf, cap, written, "cannot read app.db");
@@ -424,18 +484,44 @@ int content_db_apps_json(char *buf, size_t cap, size_t *written) {
                             "%s{\"title_id\":\"%s\",\"app_id\":%d,"
                             "\"name\":\"%s\"}",
                             emitted ? "," : "", tid, rows[i].app_id, name);
-        if (more < 0 || (size_t)(n + more) + 40 >= cap) break;
+        /* Full: stop here and let `next` say where the following page
+         * starts. This used to close the JSON as if it were the whole
+         * list (#473). */
+        if (more < 0 || (size_t)(n + more) + CDB_PAGE_TAIL_RESERVE >= cap)
+            break;
         n += more;
         emitted++;
     }
     free(rows);
 
-    int end2 = snprintf(buf + n, cap - (size_t)n, "],\"source\":\"%s\"}",
-                        source);
+    unsigned next = offset + (unsigned)emitted;
+    /* Rows remain after this page: the table holds more than `next`. */
+    int more_rows = total > next;
+    /* A row that cannot fit even on an empty page can never be delivered:
+     * say so and stop, rather than send the caller round in a loop. */
+    int stuck = more_rows && emitted == 0 && count > 0;
+    int truncated = capped || stuck;
+    if (stuck) more_rows = 0;
+
+    /* `total` is exact only from SQL: the scanner's is a lower bound that
+     * grows with the window, so it is left out rather than mislead a
+     * caller comparing pages. */
+    char total_field[32] = "";
+    if (strcmp(source, "scan") != 0)
+        snprintf(total_field, sizeof(total_field), ",\"total\":%u", total);
+    int end2 = snprintf(buf + n, cap - (size_t)n,
+                        "],\"source\":\"%s\",\"offset\":%u,\"next\":%u,"
+                        "\"more\":%s,\"truncated\":%s%s}",
+                        source, offset, next, more_rows ? "true" : "false",
+                        truncated ? "true" : "false", total_field);
     if (end2 < 0 || (size_t)(n + end2) >= cap) return -1;
     n += end2;
     if (written) *written = (size_t)n;
     return 0;
+}
+
+int content_db_apps_json(char *buf, size_t cap, size_t *written) {
+    return content_db_apps_page_json(0, 0, buf, cap, written);
 }
 
 /* ── appinfo.db ──────────────────────────────────────────────────────── */
@@ -738,6 +824,70 @@ int content_db_icon_set_visible(const char *title_id, int visible, char *err,
     }
     sqlite3_close(db);
     return 0;
+
+fail:
+    if (st) sqlite3_finalize(st);
+    if (in_txn) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+    return -1;
+}
+
+int content_db_icons_rehide(const char *const *ids, int n, char *err, size_t errcap) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    int in_txn = 0, hid = 0;
+    char tables[CDB_MAX_ICON_TABLES][96];
+
+    if (!err || errcap == 0 || !ids || n <= 0) return 0;
+    if (sqlite3_open_v2(CONTENT_DB_APP, &db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK || !db) {
+        snprintf(err, errcap, "cannot open app.db for writing");
+        if (db) sqlite3_close(db);
+        return -1;
+    }
+    sqlite3_busy_timeout(db, 5000);
+    int nt = cdb_icon_tables(db, tables, CDB_MAX_ICON_TABLES);
+    if (nt == 0) {
+        snprintf(err, errcap, "app.db has no icon table with a visible column");
+        goto fail;
+    }
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        snprintf(err, errcap, "app.db is locked by the system");
+        goto fail;
+    }
+    in_txn = 1;
+    for (int i = 0; i < nt; i++) {
+        char sql[192];
+        snprintf(sql, sizeof sql,
+                 "UPDATE \"%s\" SET visible = 0 WHERE titleId = ? AND visible <> 0", tables[i]);
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+            snprintf(err, errcap, "app.db has an unexpected schema");
+            goto fail;
+        }
+        for (int k = 0; k < n; k++) {
+            if (!cdb_valid_title_id(ids[k]) || strncasecmp(ids[k], "NPXS", 4) == 0) continue;
+            sqlite3_reset(st);
+            sqlite3_bind_text(st, 1, ids[k], -1, SQLITE_STATIC);
+            if (sqlite3_step(st) != SQLITE_DONE) {
+                snprintf(err, errcap, "%s", sqlite3_errmsg(db));
+                goto fail;
+            }
+            int c = sqlite3_changes(db);
+            if (c > 1) {
+                snprintf(err, errcap, "refusing to change %d rows for %s in %s", c, ids[k],
+                         tables[i]);
+                goto fail;
+            }
+            hid += c;
+        }
+        sqlite3_finalize(st);
+        st = NULL;
+    }
+    if (sqlite3_exec(db, hid ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) {
+        snprintf(err, errcap, "could not commit the app.db change");
+        goto fail;
+    }
+    sqlite3_close(db);
+    return hid;
 
 fail:
     if (st) sqlite3_finalize(st);

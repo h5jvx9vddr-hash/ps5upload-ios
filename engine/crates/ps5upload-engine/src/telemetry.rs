@@ -55,6 +55,7 @@ fn held() -> &'static Mutex<HashMap<Uuid, Held>> {
 /// Marks a job as one that gets a record when it ends. `kind` is the transfer's shape
 /// (`file`, `dir`, `zip`, `7z`, `rar`, `file_list`, `download`, `relay`, …).
 pub(crate) fn tag(job_id: Uuid, kind: &'static str) {
+    crate::activity::set_kind(&job_id.to_string(), crate::activity::kind_of_shape(kind));
     held()
         .lock()
         .unwrap_or_else(|e| e.into_inner())

@@ -514,9 +514,13 @@ static hw_temps_cache_t g_temps_cache = {0};
  *     helper thread was strictly worse — it crashed the payload on the
  *     first read of every console. Inline on the mgmt worker (which the
  *     Sony runtime set up) is the only path that reads cleanly. The
- *     companion desktop change makes this safe to keep simple: live
- *     sensors are no longer auto-polled, only read on an explicit
- *     "Read sensors" click, so a read can never fire unattended.
+ *     desktop app reads live sensors only on an explicit "Read sensors"
+ *     click. The console page (PS5Upload Minion) is the one unattended
+ *     reader: its status polls HW_TEMPS every 10 s, inline on a web
+ *     worker thread (webui_server.c, 512 KiB stack). That worker is also
+ *     a pthread we spawned, and it read cleanly for whole sessions on
+ *     FW 13.60 hardware, so the fresh-thread crash above did not
+ *     reproduce there; keep these reads inline on the request thread.
  *
  * 1-second cache so a double-click / rapid re-read coalesces into one
  * round of syscalls. */

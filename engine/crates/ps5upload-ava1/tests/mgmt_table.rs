@@ -77,4 +77,14 @@ fn the_ids_the_gate_and_the_converters_key_on_are_the_schema_numbers() {
     assert_eq!(m::HW_INFO.id, gen::METHOD_HW_INFO);
     assert_eq!(m::LOG_KLOG.id, gen::METHOD_LOG_KLOG);
     assert_eq!(m::LOG_SYSLOG.id, gen::METHOD_LOG_SYSLOG);
+    assert_eq!(m::FILES_PREFS_GET.id, gen::METHOD_FILES_PREFS_GET);
+    assert_eq!(m::FILES_PREFS_SET.id, gen::METHOD_FILES_PREFS_SET);
+    assert_eq!(m::FILES_HANDOFF_PUT.id, gen::METHOD_FILES_HANDOFF_PUT);
+    assert_eq!(m::FILES_HANDOFF_TAKE.id, gen::METHOD_FILES_HANDOFF_TAKE);
+    assert_eq!(m::MINION_TILE.id, gen::METHOD_MINION_TILE);
+    // The core's feature detect (an older helper) keys on the schema's unknown-method status.
+    assert_eq!(
+        ps5upload_core::console_files::ERR_UNKNOWN_METHOD,
+        gen::ERR_UNKNOWN_METHOD
+    );
 }

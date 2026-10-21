@@ -367,9 +367,10 @@ export async function backupDelete(
 export async function profileAvatarPreview(
   imagePath: string,
   mode: SquareMode,
+  crop?: { x: number; y: number },
 ): Promise<string> {
   const res = await invoke<{ data_url: string }>("profile_avatar_preview", {
-    req: { image_path: imagePath, mode },
+    req: { image_path: imagePath, mode, crop },
   });
   return res.data_url;
 }
@@ -404,12 +405,14 @@ export async function profileApplyAvatar(
   uid?: number | null,
   username?: string | null,
   addr?: string,
+  crop?: { x: number; y: number },
 ): Promise<AvatarApplied> {
   return invoke<AvatarApplied>("profile_apply_avatar", {
     req: {
       addr: addr ?? null,
       image_path: imagePath,
       mode,
+      crop,
       uid: uid ?? null,
       username: username ?? null,
     },
@@ -536,6 +539,33 @@ export async function startTransferDir(
       addr,
       tx_id: txId ?? null,
       excludes: excludes ?? [],
+      bandwidth_cap_mbps:
+        bandwidthCapMbps && bandwidthCapMbps > 0 ? bandwidthCapMbps : null,
+    },
+  });
+  return res.job_id;
+}
+
+/** Start ONE upload job for a set of files (POST /api/transfer/file-list): each `src` lands
+ *  at its `dest` (absolute, below `destRoot`). One AVA1 job instead of one per file, so a pick
+ *  of thousands of small files goes at the console's small-file speed rather than paying a
+ *  job's setup for each. `txId` (32 hex): the same list under the same id resumes, the
+ *  console's journal skipping the files it already has. The engine stats every source before
+ *  it answers with the job id, hence the long request (a slow disk, tens of thousands of
+ *  files). */
+export async function startTransferFileList(
+  destRoot: string,
+  files: { src: string; dest: string }[],
+  addr: string,
+  txId?: string | null,
+  bandwidthCapMbps?: number,
+): Promise<string> {
+  const res = await invoke<{ job_id: string }>("transfer_file_list", {
+    req: {
+      dest_root: destRoot,
+      files,
+      addr,
+      tx_id: txId ?? null,
       bandwidth_cap_mbps:
         bandwidthCapMbps && bandwidthCapMbps > 0 ? bandwidthCapMbps : null,
     },
@@ -1142,6 +1172,25 @@ export async function fsDelete(
   });
 }
 
+/** Decompress a `.ffpfsc` on the console into the image it holds, beside it (#453). Resolves
+ *  when the image is written and checked; follow it with `fsOpStatus(addr, opId)` and stop it
+ *  with `fsOpCancel`. Throws "cancelled" when stopped, else the helper's cause
+ *  (`fs_unpack_no_space: ...`, `fs_unpack_destination_exists`, ...). */
+export async function fsUnpack(
+  transferAddr: string,
+  path: string,
+  opId: number,
+): Promise<{ path: string; size: number }> {
+  const res = await fetch(`${getEngineUrl()}/api/ps5/fs/unpack`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ addr: toMgmtAddr(transferAddr), path, op_id: opId }),
+  });
+  const body = (await res.json().catch(() => ({}))) as { path?: string; size?: number; error?: string };
+  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+  return { path: body.path ?? "", size: body.size ?? 0 };
+}
+
 export interface FsDirEntry {
   name: string;
   kind: "file" | "dir" | "unknown";
@@ -1508,19 +1557,41 @@ export async function appRegister(
   });
 }
 
-/** Reverse of `appRegister`: tears down the nullfs at
- *  `/system_ex/app/<titleId>`, removes tracking, calls Sony's
- *  AppUninstall when available. Best-effort — succeeds even when
- *  Sony's API isn't available on the running firmware as long as
- *  the unmount went through. */
+/** What an uninstall left behind. */
+export interface UnregisterResult {
+  /** The PS5 accepted the uninstall, but the title's folders were still there when the helper
+   *  looked (a large game can take minutes). Keep it listed and refresh. False from a helper
+   *  older than 7.1.6, which did not check. */
+  stillPresent: boolean;
+}
+
+/** Reverse of `appRegister` (tears down our nullfs at `/system_ex/app/<titleId>`), and the
+ *  uninstall of a package install: both end in Sony's AppUninstall.
+ *
+ *  Rejects when the PS5 refused (#476). A 7.1.6 helper reports that as an error; an older one
+ *  acknowledged it with `sony_uninstall_refused`, and the app used to drop the game from its
+ *  list until the next refresh brought it back. */
 export async function appUnregister(
   transferAddr: string,
   titleId: string,
-): Promise<void> {
+): Promise<UnregisterResult> {
   const addr = toMgmtAddr(transferAddr);
-  await invoke("ps5_app_unregister", {
+  const res = await invoke<{
+    ok?: boolean;
+    error?: string | null;
+    sony_uninstall_refused?: boolean;
+    sony_uninstall_rc?: string;
+    still_present?: boolean | null;
+  } | null>("ps5_app_unregister", {
     req: { addr, title_id: titleId },
   });
+  if (res) assertOk(res, "Uninstall");
+  // A 7.1.6 helper that tore down our own folder registration reports Sony's refusal with
+  // still_present:false: the title is gone, so that is not a failure.
+  if (res?.sony_uninstall_refused && res.still_present !== false) {
+    throw new Error(`uninstall_refused:${res.sony_uninstall_rc ?? "unknown"}`);
+  }
+  return { stillPresent: res?.still_present === true };
 }
 
 // ─── Hardware monitoring ──────────────────────────────────────────────
@@ -2147,6 +2218,19 @@ export async function powerShutdown(addr: string): Promise<PowerControlAck> {
   return invoke<PowerControlAck>("power_shutdown", { addr });
 }
 
+/** What a helper stop ended with (#471): `stopped` (its port went quiet), `not_running`
+ *  (nothing answered), or `refused` with the engine's reason — `busy` while a transfer, install
+ *  or console file operation runs against that console, `refused` / `still_running` otherwise. */
+export type HelperStopResult =
+  | { state: "stopped" | "not_running" }
+  | { state: "refused"; reason: string; error: string };
+
+/** Turn the console's helper off (`POST /api/ps5/helper/stop`). The engine refuses while it has
+ *  a job on that console. Throws only when the engine could not be asked at all. */
+export async function helperStop(addr: string): Promise<HelperStopResult> {
+  return invoke<HelperStopResult>("ps5_helper_stop", { addr });
+}
+
 /** Wake a console in standby, over Sony's Device Discovery Protocol.
  *
  *  Not Wake-on-LAN — a PS5 does not wake from a magic packet. This speaks the
@@ -2521,8 +2605,9 @@ export async function saveArchiveZip(
   // is a content:// URI with no usable name; pass this so the backend keeps
   // distinct backups from colliding on one fixed Downloads filename.
   fileName?: string,
-): Promise<void> {
-  await invoke("save_archive_zip", {
+): Promise<string> {
+  // Where the zip landed: `destZip` on desktop, a Downloads file when Android redirected it.
+  const written = await invoke<string | null>("save_archive_zip", {
     req: {
       src_dir: srcDir,
       inner_root: innerRoot,
@@ -2530,6 +2615,7 @@ export async function saveArchiveZip(
       dest_filename: fileName,
     },
   });
+  return typeof written === "string" && written ? written : destZip;
 }
 
 export interface SaveArchiveUnzipResult {
@@ -2819,6 +2905,10 @@ export interface AppDbEntry {
 export interface AppDbList {
   apps: AppDbEntry[];
   err?: string;
+  /** Which reader answered: "sqlite", "sqlite-immutable" or "scan". */
+  source?: string;
+  /** True when app.db holds rows this list does not (#473). */
+  truncated?: boolean;
 }
 
 export async function appdbQuery(addr: string): Promise<AppDbList> {
@@ -3030,9 +3120,10 @@ export interface LibraryEntry {
   /** For `image` kind only: the disk image type derived from the file
    *  extension. `exfat` = .exfat (exFAT volume), `ffpkg` = .ffpkg
    *  (UFS2 volume), `ffpfs` = .ffpfs (PFS save-data volume,
-   *  experimental). Null for game entries. Drives the label + mount
+   *  experimental), `ffpfsc` = compressed container (SMP playback, decompress to edit).
+   *  Null for game entries. Drives the label + mount
    *  behavior in the Library row. */
-  imageFormat?: "exfat" | "ffpkg" | "ffpfs" | null;
+  imageFormat?: "exfat" | "ffpkg" | "ffpfs" | "ffpfsc" | null;
   /** For `game` kind: PS5 title id (e.g. "PPSA00000") read from the
    *  game's sce_sys/param.json during scan. Used to dedup rows when
    *  the same game appears at multiple paths -- typically when a
@@ -3048,7 +3139,7 @@ export interface LibraryEntry {
   mtime?: number;
 }
 
-/** Walk every writable PS5 volume recursively and return all games
+/** Walk every non-placeholder PS5 volume recursively and return all games
  *  and disk images found anywhere on them.
  *
  *  Detection rules:
@@ -3057,7 +3148,7 @@ export interface LibraryEntry {
  *     against extracted fragments since fragments don't carry
  *     `sce_sys/param.json`.
  *   - **Disk image** = a file whose name (case-insensitive) ends in
- *     `.exfat` or `.ffpkg`.
+ *     `.exfat`, `.ffpkg`, `.ffpfs` or `.ffpfsc`.
  *
  *  Determinism guarantees:
  *   - Listings are sorted by (kind, name) before they drive traversal
@@ -3148,15 +3239,18 @@ export async function scanLibrary(
   > =>
     scanLimit(async () => {
       try {
-        const res = await invoke<{
-          entries?: Array<{
-            name?: string;
-            kind?: string;
-            size?: number;
-            mtime?: number;
-          }>;
-        }>("ps5_list_dir", { addr, path, offset: 0, limit: 512 });
-        const out = res.entries ?? [];
+        type Entry = { name?: string; kind?: string; size?: number; mtime?: number };
+        const out: Entry[] = [];
+        // The helper paginates directory listings. A busy games directory can
+        // put every image beyond the first page; honor the same scan budget.
+        while (out.length < MAX_ENTRIES_PER_VOLUME) {
+          const res = await invoke<{ entries?: Entry[]; truncated?: boolean }>(
+            "ps5_list_dir", { addr, path, offset: out.length, limit: 512 },
+          );
+          const page = res.entries ?? [];
+          out.push(...page);
+          if (!res.truncated || page.length === 0) break;
+        }
         // Stable sort: dir/file kind first, then name. Eliminates
         // non-determinism from the payload returning entries in
         // inode or readdir order instead of alphabetical.
@@ -3195,14 +3289,16 @@ export async function scanLibrary(
         if (!e.name) continue;
         if (e.kind === "file") {
           const lower = e.name.toLowerCase();
-          const imageFormat: "exfat" | "ffpkg" | "ffpfs" | null =
+          const imageFormat: LibraryEntry["imageFormat"] =
             lower.endsWith(".exfat")
               ? "exfat"
               : lower.endsWith(".ffpkg")
                 ? "ffpkg"
                 : lower.endsWith(".ffpfs")
                   ? "ffpfs"
-                  : null;
+                  : lower.endsWith(".ffpfsc")
+                    ? "ffpfsc"
+                    : null;
           if (imageFormat) {
             const full = path === "/" ? `/${e.name}` : `${path}/${e.name}`;
             byPath.set(full, {
@@ -3434,11 +3530,29 @@ export async function fetchGameMeta(
 /** Stable URL pointing at the engine's game-icon endpoint for this folder.
  *  Suitable for `<img src=...>` — the engine streams back `image/png`
  *  (or 404 if no icon). Browser caches the response for 5 minutes. */
-export function gameIconUrl(transferAddr: string, path: string): string {
+export function gameIconUrl(transferAddr: string, path: string, size?: IconSize): string {
   const mgmt = toMgmtAddr(transferAddr);
   return `${engineBase()}/api/ps5/game-icon?addr=${encodeURIComponent(
     mgmt,
-  )}&path=${encodeURIComponent(path)}`;
+  )}&path=${encodeURIComponent(path)}${sizeQuery(size)}`;
+}
+
+/** A scaled cover the engine makes once and caches (128, 256 or 384 px). A console's
+ *  icon0.png is 300-700 KiB at 512 px; a grid of hundreds of them stuttered on macOS (#450).
+ *  Absent: the full cover. */
+export type IconSize = 128 | 256 | 384;
+
+/** The size grids ask for: sharp at a card's width on a 2x display. */
+export const GRID_ICON_SIZE: IconSize = 384;
+
+/** The scaled cover for an icon drawn `cssPx` wide, sharp on a 2x display. */
+export function iconSizeFor(cssPx: number): IconSize {
+  const device = cssPx * 2;
+  return device <= 128 ? 128 : device <= 256 ? 256 : 384;
+}
+
+function sizeQuery(size: IconSize | undefined): string {
+  return size ? `&size=${size}` : "";
 }
 
 /** How an installed title got onto the PS5:
@@ -3467,6 +3581,9 @@ export interface InstalledAppsResult {
   /** True if the payload couldn't report the "registered" set (older
    *  payload); the UI then shows everything as "installed" with a note. */
   registeredUnavailable: boolean;
+  /** True if the console's list may be missing titles (a listing hit its
+   *  page size, or app.db could not be read in full, #473). */
+  incomplete: boolean;
 }
 
 /** List every installed title on the PS5, grouped by origin. Routes through
@@ -3486,6 +3603,7 @@ export async function appsInstalled(
       system?: boolean;
     }>;
     registered_unavailable?: boolean;
+    incomplete?: boolean;
   }>("ps5_apps_installed", { addr });
   const titles: InstalledTitle[] = (res?.titles ?? [])
     .filter((t): t is { title_id: string } & typeof t => !!t.title_id)
@@ -3498,7 +3616,11 @@ export async function appsInstalled(
       source: t.source ?? "",
       system: !!t.system,
     }));
-  return { titles, registeredUnavailable: !!res?.registered_unavailable };
+  return {
+    titles,
+    registeredUnavailable: !!res?.registered_unavailable,
+    incomplete: !!res?.incomplete,
+  };
 }
 
 export type InstalledPkgKind = "base" | "patch" | "dlc";
@@ -3749,11 +3871,11 @@ export async function pkgMetadataConsole(
  *  (/user/appmeta/<titleId>/icon0.png), streamed back as `image/png` by
  *  the engine. Works identically on desktop and Android (in-process engine
  *  on the same loopback port; CSP allows 127.0.0.1:19113 for img-src). */
-export function appIconUrl(transferAddr: string, titleId: string): string {
+export function appIconUrl(transferAddr: string, titleId: string, size?: IconSize): string {
   const mgmt = toMgmtAddr(transferAddr);
   return `${engineBase()}/api/ps5/app-icon?addr=${encodeURIComponent(
     mgmt,
-  )}&title_id=${encodeURIComponent(titleId)}`;
+  )}&title_id=${encodeURIComponent(titleId)}${sizeQuery(size)}`;
 }
 
 /**
@@ -3779,8 +3901,10 @@ export function appIconUrl(transferAddr: string, titleId: string): string {
  * Keyed on the console as well as the title: one console's artwork must
  * never be served under another's name.
  */
-const appIconKey = (addr: string, titleId: string) => `app|${addr}|${titleId}`;
-const gameIconKey = (addr: string, path: string) => `game|${addr}|${path}`;
+const appIconKey = (addr: string, titleId: string, size?: IconSize) =>
+  `app|${addr}|${titleId}${size ? `|${size}` : ""}`;
+const gameIconKey = (addr: string, path: string, size?: IconSize) =>
+  `game|${addr}|${path}${size ? `|${size}` : ""}`;
 
 /**
  * Artwork this session already holds for a title, or undefined.
@@ -3792,30 +3916,34 @@ const gameIconKey = (addr: string, path: string) => `game|${addr}|${path}`;
 export function cachedAppIcon(
   transferAddr: string,
   titleId: string,
+  size?: IconSize,
 ): string | undefined {
-  return getCachedIcon(appIconKey(toMgmtAddr(transferAddr), titleId));
+  return getCachedIcon(appIconKey(toMgmtAddr(transferAddr), titleId, size));
 }
 
 /** Folder cover art this session already holds. See {@link cachedAppIcon}. */
 export function cachedGameIcon(
   transferAddr: string,
   path: string,
+  size?: IconSize,
 ): string | undefined {
-  return getCachedIcon(gameIconKey(toMgmtAddr(transferAddr), path));
+  return getCachedIcon(gameIconKey(toMgmtAddr(transferAddr), path, size));
 }
 
 export async function appIconDataUrl(
   transferAddr: string,
   titleId: string,
+  size?: IconSize,
 ): Promise<string | null> {
   const addr = toMgmtAddr(transferAddr);
-  const key = appIconKey(addr, titleId);
+  const key = appIconKey(addr, titleId, size);
   const hit = getCachedIcon(key);
   if (hit) return hit;
   try {
     const url = await invoke<string>("ps5_app_icon_data", {
       addr,
       titleId,
+      size: size ?? null,
     });
     if (typeof url === "string" && url.startsWith("data:")) {
       setCachedIcon(key, url);
@@ -3831,13 +3959,14 @@ export async function appIconDataUrl(
 export async function gameIconDataUrl(
   transferAddr: string,
   path: string,
+  size?: IconSize,
 ): Promise<string | null> {
   const addr = toMgmtAddr(transferAddr);
-  const key = gameIconKey(addr, path);
+  const key = gameIconKey(addr, path, size);
   const hit = getCachedIcon(key);
   if (hit) return hit;
   try {
-    const url = await invoke<string>("ps5_game_icon_data", { addr, path });
+    const url = await invoke<string>("ps5_game_icon_data", { addr, path, size: size ?? null });
     if (typeof url === "string" && url.startsWith("data:")) {
       setCachedIcon(key, url);
       return url;
@@ -4239,10 +4368,31 @@ export function humanizeJobErrorReason(
         "joberr.ava1_busy",
         "The PS5 helper is busy and did not accept this transfer in time. Wait for its other work to finish, then click Retry.",
       );
+    // Console to console (#444).
+    case "ava1_taken_over":
+      return trStatic(
+        "joberr.ava1_taken_over",
+        "Another device took over this send; it continues there.",
+      );
+    case "ava1_shared_jobs_unsupported":
+      return trStatic(
+        "joberr.ava1_shared_jobs_unsupported",
+        "Another device is still running this send. Taking it over (or watching it) while it runs needs the newer helper on both consoles: update them, or pause the send on that device first.",
+      );
+    case "ava1_cannot_watch":
+      return trStatic(
+        "joberr.ava1_cannot_watch",
+        "This send goes through the other device, so it can be taken over but not watched.",
+      );
     case "ava1_unreachable":
       return trStatic(
         "joberr.ava1_unreachable",
         "The PS5 could not be reached. Check that it is on and on the same network, and that the helper is running, then click Retry.",
+      );
+    case "console_rest_mode":
+      return trStatic(
+        "joberr.console_rest_mode",
+        "The PS5 is in rest mode. Wake it, and the transfer carries on from where it stopped.",
       );
     case "ava1_no_space":
       return trStatic(
@@ -4582,6 +4732,8 @@ export interface UpdateDownload {
   path: string;
   /** Total bytes written. Handy for "Downloaded N MB" status lines. */
   bytes: number;
+  /** A packaged Linux install: the command that installs the download (#456). */
+  install_command?: string;
 }
 
 /** Ask GitHub for the latest-release manifest and compare to our
@@ -4655,12 +4807,22 @@ export async function payloadCheck(ip: string): Promise<{
    *  went wrong (TCP connect refused, STATUS_ACK timeout, etc.)
    *  instead of just "didn't come up". null when reachable. */
   error: string | null;
+  /** The engine's token for why the probe failed (`console_rest_mode`, `ava1_unreachable`,
+   *  `helper_not_ava1`, `not_paired`, ...), from the status 502 body. Absent when reachable
+   *  or from an engine too old to send it. */
+  reason?: string;
+  /** What DDP said about the console's power when the engine asked it: `rest` (DDP 620),
+   *  `unreachable` (no DDP reply and no TCP answer), `awake` (DDP 200). Absent when the
+   *  engine did not ask. */
+  power?: "awake" | "rest" | "unreachable";
 }> {
   const resp = await invoke<{
     reachable?: boolean;
     loaded?: boolean;
     engine?: boolean;
     error?: string;
+    reason?: string;
+    power?: string;
     status?: {
       version?: string;
       ps5_kernel?: string;
@@ -4669,7 +4831,16 @@ export async function payloadCheck(ip: string): Promise<{
     };
   }>("payload_check", { ip });
   const error = resp?.reachable ? null : (resp?.error ?? null);
+  const reason =
+    !resp?.reachable && typeof resp?.reason === "string" ? resp.reason : undefined;
+  const power =
+    !resp?.reachable &&
+    (resp?.power === "awake" || resp?.power === "rest" || resp?.power === "unreachable")
+      ? resp.power
+      : undefined;
   return {
+    ...(reason !== undefined ? { reason } : {}),
+    ...(power !== undefined ? { power } : {}),
     reachable: !!resp?.reachable,
     loaded: !!resp?.loaded,
     engineReachable: resp?.engine !== false,

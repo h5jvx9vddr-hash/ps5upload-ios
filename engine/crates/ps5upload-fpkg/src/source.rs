@@ -112,8 +112,12 @@ pub fn open(path: &Path) -> Result<Box<dyn SourceTree>> {
             Box::new(std::fs::File::open(path)?),
             format!("ffpfs {}", path.display()),
         ),
+        "pkg" => Ok(Box::new(crate::pkg_source::open(
+            path,
+            crate::crypto::DEFAULT_PASSCODE,
+        )?)),
         _ => format_err(format!(
-            "{} is neither a folder nor a supported image (.exfat, .ffpkg, .ffpfs, .ffpfsc)",
+            "{} is neither a folder nor a supported image (.exfat, .ffpkg, .ffpfs, .ffpfsc) or debug package (.pkg)",
             path.display()
         )),
     }
@@ -845,6 +849,21 @@ pub fn readiness(tree: &mut dyn SourceTree) -> Readiness {
     if imports_ampr(tree, "eboot.bin") {
         let (ok, detail) = ampr_index_check(tree);
         r.push("ampr_emu.index for a libSceAmpr title", ok, detail);
+    }
+
+    // A module named in another letter case than the path eboot.bin loads: fine in an exFAT
+    // or PFS image, fatal (a crash a second in) in a folder on /data or a .ffpkg.
+    let renames = crate::module_case::tree_fixes(tree);
+    if !renames.is_empty() {
+        r.push(
+            "module names match eboot.bin",
+            true,
+            format!(
+                "eboot.bin loads these in another letter case; a game folder or .ffpkg built \
+                 here takes the eboot's spelling, the source is left as it is: {}",
+                crate::module_case::describe(&renames)
+            ),
+        );
     }
 
     if let Some(m) = module_magic(tree, "eboot.bin") {

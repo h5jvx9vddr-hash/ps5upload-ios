@@ -68,6 +68,28 @@ interface ThumbCache {
   urls: Map<string, string>;
   inflight: Map<string, Promise<string | null>>;
   dir: { current: string | null };
+  /** Set when the screen unmounts: a thumbnail still waiting for its turn is not fetched. */
+  closed: { current: boolean };
+}
+
+/** Thumbnail downloads in flight at once, across every mount. Each one is a transfer job on
+ *  the console's session; a screen of rows started them all together, filled every data lane
+ *  and kept doing so after the screen was left, which made the Games tab stutter (#450). */
+const THUMB_PARALLEL = 2;
+let thumbActive = 0;
+const thumbWaiting: Array<() => void> = [];
+
+async function thumbSlot<T>(work: () => Promise<T>): Promise<T> {
+  if (thumbActive >= THUMB_PARALLEL) {
+    await new Promise<void>((resolve) => thumbWaiting.push(resolve));
+  }
+  thumbActive += 1;
+  try {
+    return await work();
+  } finally {
+    thumbActive -= 1;
+    thumbWaiting.shift()?.();
+  }
 }
 
 /** Download a shot's (thumbnail, else full-res) `.jxr` and decode it to a
@@ -81,7 +103,8 @@ async function buildThumb(
   if (cache.urls.has(item.path)) return cache.urls.get(item.path) ?? null;
   const existing = cache.inflight.get(item.path);
   if (existing) return existing;
-  const run = (async (): Promise<string | null> => {
+  const run = thumbSlot(async (): Promise<string | null> => {
+    if (cache.closed.current) return null;
     if (!cache.dir.current) cache.dir.current = await saveArchiveMakeTemp("ss-thumb");
     const dir = cache.dir.current;
     const fetchDecode = async (srcPath: string): Promise<string> => {
@@ -104,14 +127,16 @@ async function buildThumb(
     const thumb = thumbnailPathFor(item.path);
     let url: string;
     try {
-      url = thumb ? await fetchDecode(thumb) : await fetchDecode(item.path);
+      // A shot outside the photo tree has no thumbnail: the shot itself is the picture.
+      url = await fetchDecode(thumb ?? item.path);
     } catch {
-      // Thumbnail missing/odd path → fall back to the full-res shot.
-      url = await fetchDecode(item.path);
+      // No thumbnail (the console had none for many shots in #450): the row keeps its glyph.
+      // Fetching the full-size shot instead pulled megabytes per row; Preview still opens it.
+      return null;
     }
     cache.urls.set(item.path, url);
     return url;
-  })();
+  });
   cache.inflight.set(item.path, run);
   try {
     return await run;
@@ -518,14 +543,18 @@ export default function ScreenshotsScreen({ tabs }: { tabs?: ReactNode } = {}) {
     urls: new Map(),
     inflight: new Map(),
     dir: { current: null },
+    closed: { current: false },
   }));
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // Open again after a StrictMode remount; closed on the real unmount.
+    thumbCache.closed.current = false;
+    return () => {
+      thumbCache.closed.current = true;
       const d = thumbCache.dir.current;
+      thumbCache.dir.current = null;
       if (d) void saveArchiveCleanupTemp(d).catch(() => {});
-    },
-    [thumbCache],
-  );
+    };
+  }, [thumbCache]);
 
   return (
     <div className="app-page">

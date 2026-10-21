@@ -12,23 +12,27 @@ import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 export type ConvertThen = "keep" | "stream" | "upload";
 export type ConvertStatus = "pending" | "running" | "installing" | "handed" | "done" | "failed";
 
-/** What a queued game becomes: an installable package, or a game image (compressed into a
- *  .ffpfsc when `compress`). Only a game folder can become an image. `lz4`: pack the game's
- *  data into AMPR LZ4 asset packs (an .exfat of a game that reads through libSceAmpr). */
+/** What a queued game becomes: an installable package, a game image (compressed into a
+ *  .ffpfsc when `compress`), or a plain folder (#469: from a game image or a debug-key
+ *  package). `lz4`: pack the game's data into AMPR LZ4 asset packs (an .exfat of a game that
+ *  reads through libSceAmpr). */
 export type ConvertBuild =
   | { kind: "pkg" }
-  | { kind: "image"; format: ImageFormat; compress: boolean; lz4?: AmprLz4Options };
+  | { kind: "image"; format: ImageFormat; compress: boolean; lz4?: AmprLz4Options }
+  | { kind: "folder" };
 
-/** The file a build makes, by its extension: what the queue row and the add button say. */
+/** The file a build makes, by its extension: what the queue row and the add button say. A
+ *  folder has none; its row says "folder". */
 export function buildExtension(build: ConvertBuild | undefined): string {
   if (!build || build.kind === "pkg") return ".pkg";
+  if (build.kind === "folder") return "folder";
   return build.compress ? ".ffpfsc" : `.${build.format}`;
 }
 
 /** What is done after converting, as it can be done: an image is never streamed (it is
- *  uploaded), and nothing is sent anywhere while no console answers. */
+ *  uploaded), a folder is only kept, and nothing is sent anywhere while no console answers. */
 export function thenFor(kind: ConvertBuild["kind"], then: ConvertThen, canInstall: boolean): ConvertThen {
-  if (!canInstall) return "keep";
+  if (!canInstall || kind === "folder") return "keep";
   return kind === "image" && then === "stream" ? "upload" : then;
 }
 

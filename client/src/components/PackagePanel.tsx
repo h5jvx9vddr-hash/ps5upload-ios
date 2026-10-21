@@ -164,7 +164,9 @@ export function PackagePanelView({
         inst.relation === "not-installed"
           ? tr("viewer_not_installed", undefined, "Not installed")
           : inst.relation === "base-missing"
-            ? tr("viewer_base_missing", undefined, "Base game not installed")
+            ? inst.verdict === "warn"
+              ? tr("viewer_base_missing_ps5", undefined, "Base game not installed (the PS5 may still accept it)")
+              : tr("viewer_base_missing", undefined, "Base game not installed")
             : inst.relation === "installed"
               ? ver
                 ? tr("viewer_installed_same", { ver }, `Already installed (${ver})`)
@@ -437,7 +439,7 @@ export function PackagePanel({
             })
               .then((pre) => {
                 if (!current()) return;
-                setInstalled(installedFromPreflight(g.specs.app_ver, pre));
+                setInstalled(installedFromPreflight(g.specs.app_ver, pre, g.identity.platform));
               })
               .catch(() => {});
           }

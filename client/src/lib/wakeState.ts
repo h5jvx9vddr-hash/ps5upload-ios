@@ -37,8 +37,12 @@ export function wakeUi(
 ): WakeUi {
   return {
     // Session keys imply a wake credential (it derives from the regist key),
-    // so either is enough to enable the wake button.
-    showWakeButton: state === "standby" && (hasCredential || hasSessionKeys),
+    // so either is enough to enable the wake button. Offered whenever the
+    // console is not known to be awake: a sleeping PS5 can look like one that
+    // is not answering (a Mac on Wi-Fi and Ethernet at once could not reach a
+    // sleeping console at all), and a wake sent to a console that is off does
+    // no harm.
+    showWakeButton: state !== "awake" && (hasCredential || hasSessionKeys),
     showSetup: !hasCredential && !hasSessionKeys,
     canAutoSetup: state === "awake",
     canSignIn: hasSessionKeys,

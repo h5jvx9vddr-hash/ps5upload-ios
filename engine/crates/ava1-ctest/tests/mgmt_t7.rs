@@ -206,7 +206,6 @@ const SONY: &[&str] = &[
     "profile.clear_slot",
     "profile.set_local_username",
     "user.list",
-    "user.create",
     "user.delete",
     "cheats.toggle",
     "cheats.reload",

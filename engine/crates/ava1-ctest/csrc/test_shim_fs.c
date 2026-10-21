@@ -237,3 +237,15 @@ void ava1_test_mgmtfs_stats(uint32_t *counted, uint32_t *shutdowns, uint32_t *un
 int ava1_test_path_in_protected(const char *p) { return path_in_protected(p); }
 int ava1_test_path_contains_protected(const char *p) { return path_contains_protected(p); }
 int ava1_test_path_tree_op_refused(const char *p) { return path_tree_op_refused(p); }
+
+/* The .ffpfsc unpack (payload/src/ffpfsc_unpack.c) mounts the container through the console's
+ * LVD driver, which a host has no part of; fs_jobs.c registers it, so the host gets a refusal. */
+#include "ava1_op.h"
+#include "fs_jobs.h"
+int fsj_op_ffpfsc_unpack(void *arg, struct ava1_op_ctx *c, const uint8_t *args, size_t n) {
+    (void)arg;
+    (void)args;
+    (void)n;
+    ava1_op_message(c, "fs_unpack_unsupported_on_host");
+    return AVA1_ERR_UNKNOWN_METHOD;
+}

@@ -1,3 +1,4 @@
+import { LocalCheatImport } from "./LocalCheatImport";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Gamepad2, Globe, Power, RefreshCw, RotateCcw, WandSparkles, Zap } from "lucide-react";
 import {
@@ -206,7 +207,8 @@ export default function CheatsScreen() {
           "Pick a game, download cheats made for its version, then switch them on while you play.",
         )}
         right={
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {up && <LocalCheatImport key={host} host={host} onImported={() => void refresh()} />}
             <Button
               variant="secondary"
               size="sm"

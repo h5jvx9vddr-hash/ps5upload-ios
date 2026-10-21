@@ -1,16 +1,30 @@
 import { useCallback, useEffect, useState } from "react";
-import { ArrowDown, ArrowUp, Play, RefreshCw, Trash2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Download, Play, RefreshCw, Trash2 } from "lucide-react";
 
 import { Badge, Button, Callout, ErrorCard, Spinner, Toggle } from "../../components";
 import { useConfirm } from "../../components/ConfirmDialog";
 import {
+  autoloadKey,
   pmDelete,
   pmLaunch,
   pmOverview,
   pmSetAutoload,
+  pmStore,
   type PmOverview,
   type PmStoredPayload,
 } from "../../api/payloadManager";
+import { payloadsDownload, payloadsReleases, type PayloadReleaseInfo } from "../../api/ps5";
+import { hostOf } from "../../lib/addr";
+import { defaultRelease } from "../../lib/payloadVersions";
+import {
+  forgetPmStore,
+  isRepoManaged,
+  pmRecords,
+  pmUpdateFor,
+  recordPmStore,
+  swapAutoloadKey,
+} from "../../lib/pmUpdates";
+import { isTauriEnv } from "../../lib/tauriEnv";
 import { useConnectionStore } from "../../state/connection";
 import { useTr } from "../../state/lang";
 import { pushNotification } from "../../state/notifications";
@@ -40,6 +54,9 @@ export default function PayloadManagerPanel() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  /** The catalogue's current release for each payload this app stored here (native builds:
+   *  the catalogue talks to GitHub from the app). */
+  const [latest, setLatest] = useState<Record<string, PayloadReleaseInfo | null>>({});
 
   const refresh = useCallback(async () => {
     const h = host.trim();
@@ -59,6 +76,21 @@ export default function PayloadManagerPanel() {
     setView(null);
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (!isTauriEnv() || !view?.present) return;
+    const ids = new Set(Object.values(pmRecords(hostOf(host))).map((r) => r.id));
+    let live = true;
+    for (const id of ids) {
+      if (id in latest) continue;
+      payloadsReleases(id)
+        .then((list) => live && setLatest((m) => ({ ...m, [id]: defaultRelease(list) })))
+        .catch(() => live && setLatest((m) => ({ ...m, [id]: null })));
+    }
+    return () => {
+      live = false;
+    };
+  }, [view, host, latest]);
 
   const run = async (key: string, work: () => Promise<void>, failTitle: string) => {
     setBusy(key);
@@ -107,6 +139,37 @@ export default function PayloadManagerPanel() {
     );
   };
 
+  /** Downloads the newer release, stores it in Payload Manager (which replaces the old file in
+   *  its folder), keeps its place in the boot list, and drops an old copy left under another name. */
+  const update = (p: PmStoredPayload, id: string, to: PayloadReleaseInfo) =>
+    run(
+      `update:${p.path}`,
+      async () => {
+        const h = hostOf(host);
+        const local = await payloadsDownload(id, to.picked_asset_url, to.tag);
+        const name = local.path.split(/[\\/]/).pop() || p.filename;
+        const r = await pmStore(h, name, local.path, true);
+        if (!r.stored) throw new Error("Payload Manager did not store it");
+        const after = await pmOverview(h);
+        if (after.present) {
+          const fresh = after.payloads.find((x) => x.filename === name && x.path !== p.path) ??
+            after.payloads.find((x) => x.filename === name);
+          const oldKey = autoloadKey(p);
+          if (fresh && after.autoload?.list.includes(oldKey)) {
+            await pmSetAutoload(h, after.autoload.enabled, swapAutoloadKey(after.autoload.list, oldKey, autoloadKey(fresh)));
+          }
+          if (name !== p.filename && after.payloads.some((x) => x.path === p.path)) await pmDelete(h, p.filename);
+        }
+        if (name !== p.filename) forgetPmStore(h, p.filename);
+        recordPmStore(h, name, id, to.tag);
+        pushNotification(
+          "success",
+          withConsolePrefix(host, tr("pm_updated", { name, tag: to.tag }, `Updated ${name} to ${to.tag}`)),
+        );
+      },
+      tr("pm_update_failed", { name: p.filename }, `Couldn't update ${p.filename}`),
+    );
+
   const setAutoload = (enabled: boolean, list: string[]) =>
     run(
       "autoload",
@@ -149,14 +212,18 @@ export default function PayloadManagerPanel() {
   }
 
   const autoload = view.autoload;
-  const inList = (p: PmStoredPayload) => !!autoload?.list.includes(p.filename);
+  const inList = (p: PmStoredPayload) => !!autoload?.list.includes(autoloadKey(p));
   const stored = view.payloads.filter((p) => p.path.startsWith("/data/pldmgr/"));
   const onUsb = view.payloads.filter((p) => !p.path.startsWith("/data/pldmgr/"));
 
+  const records = pmRecords(hostOf(host));
   const row = (p: PmStoredPayload) => {
+    const rec = isRepoManaged(p) ? undefined : records[p.filename];
+    const to = rec ? pmUpdateFor(rec, latest[rec.id]) : null;
     const listed = inList(p);
+    const key = autoloadKey(p);
     const order = autoload ? autoload.list.filter((e) => !e.startsWith("!")) : [];
-    const pos = order.indexOf(p.filename);
+    const pos = order.indexOf(key);
     return (
       <li
         key={p.path}
@@ -168,6 +235,11 @@ export default function PayloadManagerPanel() {
             {p.version && (
               <Badge tone="neutral" variant="outline">
                 {p.version}
+              </Badge>
+            )}
+            {to && (
+              <Badge tone="warn" variant="outline">
+                {tr("pm_update_available", { tag: to.tag }, `${to.tag} available`)}
               </Badge>
             )}
             {listed && autoload && (
@@ -195,7 +267,7 @@ export default function PayloadManagerPanel() {
                 onClick={() =>
                   void setAutoload(
                     autoload.enabled,
-                    listed ? autoload.list.filter((e) => e !== p.filename) : [...autoload.list, p.filename],
+                    listed ? autoload.list.filter((e) => e !== key) : [...autoload.list, key],
                   )
                 }
                 title={tr(
@@ -214,7 +286,7 @@ export default function PayloadManagerPanel() {
                     variant="ghost"
                     size="sm"
                     disabled={busy !== null || pos <= 0}
-                    onClick={() => void setAutoload(autoload.enabled, moveEntry(autoload.list, p.filename, -1))}
+                    onClick={() => void setAutoload(autoload.enabled, moveEntry(autoload.list, key, -1))}
                     title={tr("pm_autoload_earlier", undefined, "Load earlier")}
                   >
                     <ArrowUp size={12} />
@@ -223,7 +295,7 @@ export default function PayloadManagerPanel() {
                     variant="ghost"
                     size="sm"
                     disabled={busy !== null || pos >= order.length - 1}
-                    onClick={() => void setAutoload(autoload.enabled, moveEntry(autoload.list, p.filename, 1))}
+                    onClick={() => void setAutoload(autoload.enabled, moveEntry(autoload.list, key, 1))}
                     title={tr("pm_autoload_later", undefined, "Load later")}
                   >
                     <ArrowDown size={12} />
@@ -231,6 +303,22 @@ export default function PayloadManagerPanel() {
                 </>
               )}
             </>
+          )}
+          {to && rec && (
+            <Button
+              variant="secondary"
+              size="sm"
+              leftIcon={busy === `update:${p.path}` ? <Spinner size={12} tone="inherit" /> : <Download size={12} />}
+              disabled={busy !== null}
+              onClick={() => void update(p, rec.id, to)}
+              title={tr(
+                "pm_update_tooltip",
+                undefined,
+                "Downloads the newer release and stores it in Payload Manager in place of this one, keeping its place in the boot list.",
+              )}
+            >
+              {tr("pm_update", undefined, "Update")}
+            </Button>
           )}
           <Button
             variant="primary"

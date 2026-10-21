@@ -78,18 +78,41 @@ int content_db_select_text(const char *db_path, const char *sql, int max_rows,
                                          const char *const *vals));
 
 /*
- * Installed titles from app.db: title id, app id and display name.
+ * Installed titles from app.db, one page at a time (#473): title id, app
+ * id and display name for rows [offset, offset + limit) in title order.
  *
  * Emits {"apps":[{"title_id":"..","app_id":N,"name":".."}, ...],
- *        "source":"sqlite"|"scan"}
+ *        "source":"sqlite"|"sqlite-immutable"|"scan",
+ *        "offset":O,"next":N,"more":bool,"truncated":bool,"total":T}
+ *
+ * `total` is the table's row count, sent only from SQL (the scanner's is a
+ * lower bound); a caller that sees it change between pages knows rows
+ * moved under it.
+ * `next` is the row the following page starts at; `more` is true while
+ * rows remain after it. A page that fills `buf` before `limit` rows stops
+ * early with `more` set, so a small buffer pages rather than silently
+ * dropping the rest. `truncated` is true only when rows exist that no
+ * page can deliver: one row larger than `buf`, a SQL walk that stopped
+ * before the end (SQLITE_BUSY and the like), or the byte scanner (the
+ * fallback for a database that will not open) hitting its own bounds.
+ *
+ * `limit` 0 (or above CONTENT_DB_APPS_PAGE_MAX) means
+ * CONTENT_DB_APPS_PAGE_MAX. An older engine sends no window at all and
+ * reads page one; the extra fields are ignored by its decoder.
  *
  * `source` is reported rather than hidden: a caller that sees "scan"
  * knows the SQL open failed and the row set came from the byte-level
  * reader, which recovers ids reliably but names only sometimes.
  *
- * Never fails outright — falls back to appdb_scan.h. Returns 0 on
- * success, non-zero only if `buf` is too small to hold even an error.
+ * Never fails outright — falls back to appdb_scan.h, and an unreadable
+ * database is {"err":"..","apps":[]}. Returns 0 on success, non-zero only
+ * if `buf` is too small to hold even an error.
  */
+#define CONTENT_DB_APPS_PAGE_MAX 512
+int content_db_apps_page_json(unsigned offset, unsigned limit, char *buf,
+                              size_t cap, size_t *written);
+
+/* Page one: content_db_apps_page_json(0, 0, ...). */
 int content_db_apps_json(char *buf, size_t cap, size_t *written);
 
 /*
@@ -150,5 +173,12 @@ int content_db_icon_set_visible(const char *title_id, int visible, char *err,
  * {"ok":false,"error":".."}. Read-only.
  */
 int content_db_hidden_json(char *buf, size_t cap, size_t *written);
+
+/*
+ * Hide again whichever of `ids` (`n` title ids) the system made visible: one transaction, and
+ * only rows with visible != 0 are written, so a pass with nothing to undo leaves app.db as it
+ * was. Returns how many icons it hid again, or -1 with a short reason in `err` (#450).
+ */
+int content_db_icons_rehide(const char *const *ids, int n, char *err, size_t errcap);
 
 #endif /* PS5UPLOAD_CONTENT_DB_H */

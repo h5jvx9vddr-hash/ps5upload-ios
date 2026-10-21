@@ -60,6 +60,11 @@ export interface TabbedShellProps<Id extends string> {
   /** Ordered list of tabs. The first one is the default when no
    *  `?tab=...` is present in the URL. */
   tabs: ReadonlyArray<TabbedShellTab<Id>>;
+  /** The tab shown when the URL names none (or an unknown one). Defaults to the first
+   *  tab; ignored when it is not one of `tabs`. */
+  defaultTab?: Id;
+  /** Shown beside the title (e.g. a count), like PageHeader's `count`. */
+  count?: number;
   /** Render the active tab's content. Called once per render with the
    *  active id; caller switches on id and returns the panel JSX. */
   renderPanel: (activeId: Id) => ReactNode;
@@ -74,10 +79,12 @@ export interface TabbedShellProps<Id extends string> {
 function coerceTabId<Id extends string>(
   raw: string | null,
   tabs: ReadonlyArray<TabbedShellTab<Id>>,
+  fallback?: Id,
 ): Id {
   if (raw && tabs.some((t) => t.id === raw)) {
     return raw as Id;
   }
+  if (fallback && tabs.some((t) => t.id === fallback)) return fallback;
   return tabs[0].id;
 }
 
@@ -87,12 +94,14 @@ export default function TabbedShell<Id extends string>({
   titleKey,
   titleFallback,
   tabs,
+  defaultTab,
+  count,
   renderPanel,
 }: TabbedShellProps<Id>) {
   const tr = useTr();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const activeTab = coerceTabId<Id>(searchParams.get("tab"), tabs);
+  const activeTab = coerceTabId<Id>(searchParams.get("tab"), tabs, defaultTab);
   const setActiveTab = (next: Id) => {
     if (next === activeTab) return;
     // A tab here is a full user-facing view, not a transient filter. Push it
@@ -120,6 +129,7 @@ export default function TabbedShell<Id extends string>({
       <PageHeader
         icon={IconForTitle}
         title={tr(titleKey, undefined, titleFallback)}
+        count={count}
         description={description}
       />
 

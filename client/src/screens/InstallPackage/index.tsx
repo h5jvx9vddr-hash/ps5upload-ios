@@ -1,3 +1,5 @@
+import { planStreamSelection } from "../../lib/streamSelection";
+import { invoke } from "../../lib/invokeLogged";
 import { formatDate } from "../../lib/formatDate";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -59,7 +61,7 @@ import { openInFileSystem } from "../../state/fsNavigation";
 import { useConfirm } from "../../components/ConfirmDialog";
 import { useConnectionStore } from "../../state/connection";
 import { useTr } from "../../state/lang";
-import { pickLocalPath } from "../../state/localPicker";
+import { pickLocalPaths } from "../../state/localPicker";
 import {
   usePkgLibrary,
   isFinishedPkg,
@@ -932,6 +934,25 @@ export default function InstallPackageScreen() {
     }
   }
 
+  async function queueStreamPaths(paths: string[]) {
+    if (!paths.length) return;
+    if (paths.some((path) => !isInstallPackagePath(path))) {
+      setPickError(tr("pkglib.stream.notPkg", undefined, "Pick a .pkg or .fpkg file."));
+      return;
+    }
+    const targetHost = host;
+    const plan = await planStreamSelection(paths,
+      (path) => invoke("pkg_metadata_split", { path }));
+    if (plan.length > 1 && !await confirm({
+      title: tr("queue_title", undefined, "Queue"),
+      message: plan.map((item) => `${item.name}${item.category ? ` (${item.category})` : ""}`).join("\n"),
+      confirmLabel: tr("pkglib.url.confirm", "Start install"),
+    })) return;
+    await Promise.all(plan.map((item) => installStream(item.path, targetHost, {
+      displayName: item.name, category: item.category, contentId: item.contentId,
+    })));
+  }
+
   async function handleStreamPick() {
     setPickError(null);
     if (!host?.trim()) {
@@ -950,27 +971,14 @@ export default function InstallPackageScreen() {
       // does, so a 50 GB package is served in place instead of being
       // uploaded from the viewer's device first. "From this device" keeps
       // the old upload path.
-      const picked = await pickLocalPath({
-        mode: "file",
-        title: tr(
-          "pkglib.stream.pickServer",
-          undefined,
-          "Choose a package on the server",
-        ),
-      });
-      if (!picked) return;
-      if (!isInstallPackagePath(picked)) {
-        setPickError(
-          tr("pkglib.stream.notPkg", undefined, "Pick a .pkg or .fpkg file."),
-        );
-        return;
-      }
       try {
-        const name = picked.split(/[\\/]/).pop() ?? picked;
-        await runStreamInstall(picked, name);
-      } catch (e) {
-        setPickError(`${e}`);
-      }
+        const picked = await pickLocalPaths({
+          mode: "file",
+          title: tr("pkglib.stream.pickServer", undefined, "Choose a package on the server"),
+          filters: [{ name: "PlayStation Package", extensions: ["pkg", "fpkg"] }],
+        });
+        await queueStreamPaths(picked);
+      } catch (e) { setPickError(String(e)); }
       return;
     }
     // No beta gate. Stream is the RELIABLE path and is no longer hidden
@@ -992,14 +1000,10 @@ export default function InstallPackageScreen() {
             filters: [{ name: "PlayStation Package", extensions: ["pkg", "fpkg"] }],
           })
         : await openDialog({
-            multiple: false,
+            multiple: true,
             filters: [{ name: "PlayStation Package", extensions: ["pkg", "fpkg"] }],
           });
-      const p = Array.isArray(sel) ? sel[0] : sel;
-      if (!p) return;
-      const sourcePath = String(p);
-      const streamName = sourcePath.split(/[\\/]/).pop() ?? sourcePath;
-      await runStreamInstall(sourcePath, streamName);
+      if (sel) await queueStreamPaths(Array.isArray(sel) ? sel : [sel]);
     } catch (e) {
       setPickError(`${e}`);
     }
@@ -1133,7 +1137,13 @@ export default function InstallPackageScreen() {
           undefined,
           "Base game isn't installed",
         ),
-        message: baseInLib
+        message: entry.platform === "ps5" && !baseInLib
+          ? tr(
+              "pkglib.baseMissing.bodyPs5",
+              { kind, id: entry.titleId ?? "" },
+              `This ${kind} is for ${entry.titleId}, but its base game isn't installed on the PS5. Some PS5 updates carry the whole app and install on their own; if this one can't, the PS5 will say so.`,
+            )
+          : baseInLib
           ? tr(
               "pkglib.baseMissing.bodyInLib",
               { kind, id: entry.titleId ?? "" },

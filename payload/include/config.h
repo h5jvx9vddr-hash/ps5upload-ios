@@ -5,7 +5,7 @@
  * UI tell apart an old payload still running from a build that includes
  * a particular fix, without having to boot the console. Keep in sync
  * with the desktop app's package.json during releases. */
-#define PS5UPLOAD2_VERSION "7.0.22"
+#define PS5UPLOAD2_VERSION "7.1.13"
 /* Author credit — embedded in the startup toast so anyone looking at
  * the console screen knows who wrote the software that just loaded.
  * Kept separate from VERSION so release scripts can bump the version
@@ -32,5 +32,10 @@
  * backs each /mnt/ps5upload/<name> mount point, and by payload
  * startup reconciliation to detect orphaned mounts. */
 #define PS5UPLOAD2_MOUNTS_DIR "/data/ps5upload/mounts"
+
+/* Console web UI (webui_server.c): loopback-only unless LAN access is on. */
+#define WEBUI_PORT 9180
+/* The home-screen tile that opens the browser on the web UI (webui_tile.c). */
+#define WEBUI_TILE_TITLE_ID "PSUP00001"
 
 #endif

@@ -6,6 +6,7 @@ import { guardElfldr, STUCK_LOADER_MESSAGE, waitForLoader } from "./elfldrGuard"
 import { resetHelperSendGate, sendHelperOnce, sentAgoMs } from "./helperSendGate";
 import { compareVersions } from "./semver";
 import { log } from "../state/logs";
+import { clearHelperStopped, isHelperStopped } from "../state/helperStopped";
 
 export type EnsurePayloadResult =
   | "current"
@@ -46,12 +47,27 @@ function sleep(ms: number): Promise<void> {
  * place and the resume retry just fails again on a refused connection (the
  * "I had to re-send the ELF manually" symptom). On a connection-class
  * failure the payload is already suspect, so force a clean redeploy.
+ *
+ * `mode` says who asked (#471). `"explicit"` is an action the user started that needs the
+ * helper (starting an upload): it sends as before and clears a "stopped by you" mark.
+ * `"auto"` (the default) is everything unattended — the reconnect loop, a queue's mid-run
+ * recovery, a run nobody clicked — and leaves a console whose helper the user stopped alone,
+ * returning "no-push" without touching it.
  */
 export function ensurePayloadCurrent(
   host: string,
   shouldCancel?: () => boolean,
   force = false,
+  mode: "auto" | "explicit" = "auto",
 ): Promise<EnsurePayloadResult> {
+  if (mode === "explicit") clearHelperStopped(host);
+  else if (isHelperStopped(host)) {
+    log.info(
+      "payload",
+      `not sending the helper to ${host}: you stopped it there; send it from Connection when you need it`,
+    );
+    return Promise.resolve("no-push");
+  }
   // One at a time per console. The redeploy loop, both queues and their
   // recovery paths each call this on their own schedule, and two sends that
   // land together start two helpers: the Phat's startup log has pairs of

@@ -268,6 +268,7 @@ fn the_operation_table_matches_the_schema() {
         (ops::BACKUP_RESTORE, gen::JOB_OP_BACKUP_RESTORE),
         (ops::CLEANUP, gen::JOB_OP_CLEANUP),
         (ops::SDK_SCAN, gen::JOB_OP_SDK_SCAN),
+        (ops::FFPFSC_UNPACK, gen::JOB_OP_FFPFSC_UNPACK),
     ];
     assert_eq!(want.len(), ops::ALL.len(), "every op is pinned here");
     for (op, id) in want {

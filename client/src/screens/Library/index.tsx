@@ -87,6 +87,7 @@ import {
   appIconUrl,
   appIconDataUrl,
   cachedAppIcon,
+  iconSizeFor,
   cachedGameIcon,
   gameIconDataUrl,
   appsInstalled,
@@ -280,7 +281,7 @@ export default function LibraryScreen() {
             "[library] installed-apps probe failed; disk-image rows will show filenames only:",
             e,
           );
-          return { titles: [], registeredUnavailable: true };
+          return { titles: [], registeredUnavailable: true, incomplete: true };
         }),
       ]);
       // Two ways a registered title points back at a Library row:
@@ -678,7 +679,7 @@ export default function LibraryScreen() {
                       title={tr(
                         "library_disk_image_files",
                         undefined,
-                        "Disk image files (.exfat / .ffpkg / .ffpfs)",
+                        "Disk image files (.exfat / .ffpkg / .ffpfs / .ffpfsc)",
                       )}
                       count={split.images.length}
                     />
@@ -694,6 +695,9 @@ export default function LibraryScreen() {
                         undefined,
                         "Mount to play a game, or Edit files to change what's inside it — adding DLC, swapping assets, or applying a backport patch. Edits are written straight into the image.",
                       )}
+                    </p>
+                    <p className="mb-2 text-xs text-[var(--color-muted)]">
+                      {tr("library_compressed_hint", undefined, "Compressed images need ShadowMount+ to play. To edit, open Files and decompress first.")}
                     </p>
                     <FpkgKstuffTip />
                     <CappedRows
@@ -935,7 +939,9 @@ function LibraryRowImpl({
   const kindLabel =
     entry.kind === "game"
       ? tr("library_row_kind_game", undefined, "Game")
-      : entry.imageFormat === "ffpkg"
+      : entry.imageFormat === "ffpfsc"
+        ? ".ffpfsc"
+        : entry.imageFormat === "ffpkg"
         ? tr("library_row_kind_ffpkg", undefined, ".ffpkg image")
         : entry.imageFormat === "ffpfs"
           ? tr("library_row_kind_ffpfs", undefined, ".ffpfs image")
@@ -2221,10 +2227,13 @@ function LibraryRowImpl({
     let okOutcome = true;
     let errMsg: string | null = null;
     try {
-      await appUnregister(consoleAddr(host), entry.titleId);
+      const { stillPresent } = await appUnregister(consoleAddr(host), entry.titleId);
       audit("library_unregister", withConsolePrefix(host, entry.name), { context: entry.titleId });
+      // #476: say so when the PS5 still lists the title, rather than claim the tile is gone.
       setMountNote(
-        `Unregistered ${entry.titleId}. The XMB tile is removed; the source files on disk were not touched.`,
+        stillPresent
+          ? `Unregistered ${entry.titleId}, but the PS5 still lists it. Refresh in a moment; if it stays, delete it from the PS5's Settings → Storage. The source files on disk were not touched.`
+          : `Unregistered ${entry.titleId}. The XMB tile is removed; the source files on disk were not touched.`,
       );
       onChanged();
     } catch (e) {
@@ -2367,7 +2376,7 @@ function LibraryRowImpl({
                   change what's inside), and users only discovered editing by
                   opening a menu they had no reason to open. Showing both is
                   what makes the distinction visible at all. */}
-                {smpRunning && !isMounted && (
+                {smpRunning && !isMounted && entry.imageFormat !== "ffpfsc" && (
                   <Button
                     variant="secondary"
                     size="sm"
@@ -2386,6 +2395,15 @@ function LibraryRowImpl({
                   >
                     {tr("library_edit_files_short", undefined, "Edit files")}
                   </Button>
+                )}
+                {entry.imageFormat === "ffpfsc" && (
+                  <Link
+                    className="text-xs underline"
+                    to={`/files?path=${encodeURIComponent(entry.path.slice(0, entry.path.lastIndexOf("/")) || "/")}`}
+                    title={tr("fs_unpack_action", undefined, "Decompress to .exfat…")}
+                  >
+                    {tr("saves_open_in_files", undefined, "Open in Files")}
+                  </Link>
                 )}
                 <Button
                   variant="primary"
@@ -2414,10 +2432,12 @@ function LibraryRowImpl({
                    * with a non-.exfat / non-.ffpkg / non-.ffpfs
                    * extension that still got into the library scan via
                    * the size / existence checks. */
-                  disabled={busy !== null || !entry.imageFormat}
+                  disabled={busy !== null || !entry.imageFormat || (entry.imageFormat === "ffpfsc" && !smpRunning)}
                   loading={busy === "mount"}
                   title={
-                    !entry.imageFormat
+                    entry.imageFormat === "ffpfsc" && !smpRunning
+                      ? tr("library_compressed_hint", undefined, "Compressed images need ShadowMount+ to play. To edit, open Files and decompress first.")
+                      : !entry.imageFormat
                       ? tr(
                           "library_mount_unsupported_tooltip",
                           undefined,
@@ -3884,6 +3904,9 @@ function MountModal({
   );
 }
 
+/** Library rows draw covers at 56 px (h-14). */
+const ROW_ICON_SIZE = iconSizeFor(56);
+
 function LibraryThumb({
   entry,
   meta,
@@ -3907,9 +3930,9 @@ function LibraryThumb({
   const wanted = !host?.trim()
     ? null
     : meta?.has_icon
-      ? gameIconUrl(consoleAddr(host), entry.path)
+      ? gameIconUrl(consoleAddr(host), entry.path, ROW_ICON_SIZE)
       : registeredTitleId
-        ? appIconUrl(consoleAddr(host), registeredTitleId)
+        ? appIconUrl(consoleAddr(host), registeredTitleId, ROW_ICON_SIZE)
         : null;
   // A 404 here is not always permanent — the console serves one client at a
   // time and the engine reports every read miss as 404. Retry a couple of
@@ -3917,16 +3940,16 @@ function LibraryThumb({
   const { src, onError } = useImageRetry(wanted, {
     // Already-held bytes short-circuit the whole chain.
     cached: meta?.has_icon
-      ? cachedGameIcon(consoleAddr(host), entry.path)
+      ? cachedGameIcon(consoleAddr(host), entry.path, ROW_ICON_SIZE)
       : registeredTitleId
-        ? cachedAppIcon(consoleAddr(host), registeredTitleId)
+        ? cachedAppIcon(consoleAddr(host), registeredTitleId, ROW_ICON_SIZE)
         : undefined,
     // Same bytes over the IPC when the webview refuses the direct URL.
     fallbackLoader: () =>
       meta?.has_icon
-        ? gameIconDataUrl(consoleAddr(host), entry.path)
+        ? gameIconDataUrl(consoleAddr(host), entry.path, ROW_ICON_SIZE)
         : registeredTitleId
-          ? appIconDataUrl(consoleAddr(host), registeredTitleId)
+          ? appIconDataUrl(consoleAddr(host), registeredTitleId, ROW_ICON_SIZE)
           : Promise.resolve(null),
   });
   return (

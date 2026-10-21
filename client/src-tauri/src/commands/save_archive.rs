@@ -144,7 +144,9 @@ pub struct SaveArchiveZipReq {
 }
 
 #[tauri::command]
-pub async fn save_archive_zip(req: SaveArchiveZipReq) -> Result<(), String> {
+/// Returns the path the zip was written to: the picked one on desktop, the Downloads file an
+/// Android `content://` (or empty) destination was redirected to.
+pub async fn save_archive_zip(req: SaveArchiveZipReq) -> Result<String, String> {
     // Android save dialogs return content:// URIs std::fs can't create; redirect
     // those to a real path under Downloads (desktop paths pass through), using
     // the renderer's filename so distinct backups stay distinct.
@@ -168,7 +170,7 @@ pub async fn save_archive_zip(req: SaveArchiveZipReq) -> Result<(), String> {
         let _ = std::fs::remove_file(&dest);
         return Err(format!("zip: {e:#}"));
     }
-    Ok(())
+    Ok(dest)
 }
 
 fn zip_folder(src_dir: &Path, inner_root: &str, dest_zip: &Path) -> Result<()> {

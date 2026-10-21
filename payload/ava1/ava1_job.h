@@ -92,7 +92,10 @@ struct ava1_job {
     int attached, refs, stopping, finished, prepared;
     int discard_parts;              /* a cancelled local copy: destroy removes the .ava-part files this job itself was writing (final review #9) */
     uint64_t parked_at_ms;
-    int op_delivered;               /* an operation job: its terminal status was first delivered at parked_at_ms (the grace starts) */
+    uint64_t concluded_ms;          /* an upload or download: when its end went out (our JobDone) or came in (the peer's),
+                                     * nothing of it in flight after; 0 before. The table lets it go from then (#475) */
+    int op_delivered;               /* an operation job, or a console-page copy (ava1_jobs_release_seen): its terminal status was
+                                     * first delivered at parked_at_ms (the grace starts) */
     int c2c;                        /* a send to another console (SPEC.md §18): kept the full park age once ended */
     uint8_t c2c_by[32];             /* ... and the device that asked for it, which may read its status or cancel it */
     uint8_t kind, policy;
@@ -285,6 +288,10 @@ void ava1_job_free_one(const uint8_t id[16]);      /* unlists it and drops the t
  * it and frees it now (its threads joined, its files closed) and returns 0; otherwise drops
  * the caller's reference and returns -1 (someone else may still be running it). */
 int ava1_job_retire(ava1_job_t *j);
+/* ava1_job_retire for a job no session drives (#444: another device takes it over). Takes the
+ * caller's reference. 0 = retired; -1 = a session is attached to it; -2 = someone else holds
+ * it for the moment or its files are still settling (try again). */
+int ava1_job_retire_parked(ava1_job_t *j);
 void ava1_job_emit(ava1_job_t *j, uint8_t type, uint8_t flags, const uint8_t *body, size_t len);
 
 /* Control-frame bytes queued across all jobs (their inboxes and the frames behind a

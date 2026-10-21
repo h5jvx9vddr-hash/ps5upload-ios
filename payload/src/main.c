@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
+#include <ucontext.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -20,6 +21,7 @@
 #include "proc_list.h"
 #include "hw_info.h"
 #include "wake_watchdog.h"
+#include "icon_keeper.h"
 #include "fakelib_overlay.h"
 #include "ava1_glue.h"
 #include "takeover_flag.h"
@@ -29,6 +31,10 @@
 #include "sony_api_lock.h"
 
 #include "proc_identity.h"
+#include "webui_api.h"
+#include "webui_server.h"
+#include "webui_settings.h"
+#include "webui_tile.h"
 /* Sony "debugger" / system-process authid. Setting our process's
  * ucred authid to this value grants the credentials Sony's kernel
  * stubs check before allowing sensor reads / launches / installs
@@ -179,6 +185,43 @@ static void write_fatal_breadcrumb(int sig, unsigned int frame) {
     }
     fatal_put_str(buf, sizeof(buf), &pos, "\n");
     (void)write(STDERR_FILENO, buf, pos);
+}
+
+/* Append `v` as 0x-prefixed hex. Async-signal-safe. */
+static void fatal_put_hex(char *buf, size_t cap, size_t *pos, uint64_t v) {
+    static const char digits[] = "0123456789abcdef";
+    char tmp[16];
+    size_t n = 0;
+    do {
+        tmp[n++] = digits[v & 0xf];
+        v >>= 4;
+    } while (v && n < sizeof(tmp));
+    fatal_put_str(buf, cap, pos, "0x");
+    while (n && *pos < cap) buf[(*pos)++] = tmp[--n];
+}
+
+static void handle_fatal(int sig);
+int main(void);
+
+/* Where it faulted: the bad address, the instruction, and where `main` sits (so the
+ * instruction can be found in the ELF despite the load address). */
+static void handle_fatal_info(int sig, siginfo_t *si, void *ucv) {
+    char buf[160];
+    size_t pos = 0;
+    fatal_put_str(buf, sizeof(buf), &pos, "[fatal] detail: addr=");
+    fatal_put_hex(buf, sizeof(buf), &pos, si ? (uint64_t)(uintptr_t)si->si_addr : 0);
+    fatal_put_str(buf, sizeof(buf), &pos, " code=");
+    fatal_put_uint(buf, sizeof(buf), &pos, si ? (unsigned int)si->si_code : 0);
+    fatal_put_str(buf, sizeof(buf), &pos, " rip=");
+    fatal_put_hex(buf, sizeof(buf), &pos,
+                  ucv ? (uint64_t)((ucontext_t *)ucv)->uc_mcontext.mc_rip : 0);
+    fatal_put_str(buf, sizeof(buf), &pos, " main=");
+    fatal_put_hex(buf, sizeof(buf), &pos, (uint64_t)(uintptr_t)&main);
+    fatal_put_str(buf, sizeof(buf), &pos, "\n");
+    /* A faulting Sony getter inside the hw guard is recovered (siglongjmp, no return). */
+    if (hw_guard_try_recover(sig)) return;
+    (void)write(STDERR_FILENO, buf, pos);
+    handle_fatal(sig);
 }
 
 static void handle_fatal(int sig) {
@@ -451,6 +494,7 @@ static void redirect_stdio_to_file(void) {
 
 /* Starts the AVA1 side; only ever reached through takeover_gate_start (no other helper holds the port). */
 static int g_ava1_start_rc = 0;
+
 static void start_ava1_cb(void *ctx) {
     (void)ctx;
     int ava1_rc = ava1_payload_start();
@@ -497,10 +541,18 @@ int main(void) {
     startup_trace("UCRED_JAILBREAK_DONE");
 
     /* Release port on crash or external kill. */
-    signal(SIGSEGV, handle_fatal);
+    {
+        /* Faults get the address and instruction logged (handle_fatal_info). */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = handle_fatal_info;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        sigaction(SIGILL, &sa, NULL); /* hw_guard recovers faulting Sony getters */
+    }
     signal(SIGABRT, handle_fatal);
-    signal(SIGBUS,  handle_fatal);
-    signal(SIGILL,  handle_fatal);  /* hw_guard recovers faulting Sony getters */
     signal(SIGTERM, handle_fatal);
     signal(SIGHUP,  handle_fatal);
     /* CRITICAL: ignore SIGPIPE. Without this, every client disconnect
@@ -539,6 +591,7 @@ int main(void) {
     /* Sweep orphan Tier-1 staging files. Crash-recovery only;
      * the desktop-side post-install delete handles steady-state. */
     runtime_sweep_stale_pkg_temp();
+    fs_pfsc_sweep();
     startup_trace("SWEEP_DONE");
 
     if (runtime_init(&state) != 0) {
@@ -689,6 +742,8 @@ int main(void) {
      * lifetime with negligible overhead (one sleep(5) per cycle). */
     start_wake_watchdog();
     startup_trace("WAKE_WATCHDOG_STARTED");
+    /* Icons hidden through ps5upload stay hidden when the system shows them on launch (#450). */
+    icon_keeper_start();
     /* A newer instance that finds this one serving AVA1 asks it to exit through a flag file
      * (takeover.c); poll it once a second. Failure only costs the graceful takeover: the new
      * instance escalates to the reap. */
@@ -741,6 +796,28 @@ int main(void) {
     }
     startup_trace("TOAST_DONE");
 
+    /* Console web UI, after AVA1 is up. A bind failure is not fatal: the server's accept thread
+     * retries every 5 s (a takeover's old instance may still hold the port for a moment). The
+     * settings file decides LAN access (a missing or garbled file: loopback only, tile on). The
+     * home-screen tile is registered on its own short-lived thread (Sony calls take seconds); a
+     * failure there is logged, never fatal. */
+    {
+        webui_cfg_t wc;
+        webui_settings_t ws;
+        if (webui_settings_load(WEBUI_SETTINGS_PATH, &ws) != 0)
+            fprintf(stderr, "webui: %s missing or unreadable; using defaults\n", WEBUI_SETTINGS_PATH);
+        webui_api_settings_init(&ws);
+        memset(&wc, 0, sizeof wc);
+        wc.port = WEBUI_PORT;
+        wc.lan = ws.lan;
+        wc.route = webui_api_route;
+        wc.stream_for = webui_api_stream_for;
+        wc.stream = webui_api_stream;
+        if (webui_start(&wc) != 0) fprintf(stderr, "webui: server did not start\n");
+        startup_trace("WEBUI_STARTED");
+        if (ws.tile) webui_tile_request(1, WEBUI_PORT);
+    }
+
     /* The AVA1 server runs on its own threads; this thread has nothing left to serve. It waits for
      * node.shutdown or the takeover flag (runtime_request_shutdown), then tears down. */
     runtime_wait_for_shutdown(&state);
@@ -760,6 +837,8 @@ int main(void) {
     /* The AVA1 half: stop accepting, wait for the sessions (2 s) and for any in-flight Sony call
      * (this does NOT return while one runs: only the exit watchdog armed above (8 s, or up to 60 s while a Sony call runs) can end the
      * process then), then stop the data layer so journals are closed and durable jobs resume. */
+    webui_stop(); /* bounded: joins its workers within 2 s, detaches a stuck one */
+
     {
         int sr = ava1_payload_stop(2000, 3000);
         if (sr) fprintf(stderr, "ava1: stop was slow (0x%x): sessions or a Sony call outlived the soft wait\n", sr);

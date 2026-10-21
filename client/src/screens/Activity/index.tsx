@@ -21,6 +21,7 @@ import { TaskList } from "../../components/TaskList";
 import { Tabs } from "../../components/Tabs";
 import { MissedSchedules } from "./MissedSchedules";
 import { RunningEngineJobs } from "../../components/RunningEngineJobs";
+import { RemoteSends } from "./RemoteSends";
 import { StatsPanel } from "./StatsPanel";
 import { parseActivityTab, stopActionFor, type ActivityTab } from "./activityView";
 import { useConfirm } from "../../components/ConfirmDialog";
@@ -178,6 +179,7 @@ export default function ActivityScreen() {
           made it unclear which controls were authoritative. */}
       {view === "tasks" && <MissedSchedules />}
       {view === "tasks" && <RunningEngineJobs />}
+      {view === "tasks" && <RemoteSends />}
       {view === "tasks" && <TaskList />}
       {view === "tasks" && taskCount === 0 && (
         <EmptyState

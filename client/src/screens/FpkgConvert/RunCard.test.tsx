@@ -208,6 +208,62 @@ describe("RunCard", () => {
       // Queueing still works: a folder of games can be queued as images.
       expect(button(out, "Add this game to the queue")?.disabled).toBe(false);
     });
+
+    it("a folder is only kept, and a folder source cannot become one", () => {
+      const ok = idle({ make: "folder" }, { canFolder: true });
+      expect(options(ok, "After converting")).toEqual(["Keep the folder"]);
+      expect(button(ok, "Make game folder")?.disabled).toBe(false);
+      expect(ok).not.toContain("This is already a folder");
+      const already = idle({ make: "folder" }, { canFolder: false, isFolderSource: true });
+      expect(button(already, "Make game folder")?.disabled).toBe(true);
+      expect(already).toContain("This is already a folder");
+      const archive = idle({ make: "folder" }, { canFolder: false });
+      expect(button(archive, "Make game folder")?.disabled).toBe(true);
+      expect(archive).toContain("Only a game image or a package made with the debug key can become a folder");
+      // Nothing is sent anywhere, so no console is asked for.
+      expect(idle({ make: "folder" }, { canFolder: true, canInstall: false })).not.toContain("Connect to a PS5");
+    });
+  });
+
+  it("a finished folder shows its path and Show in folder, nothing to install or delete", () => {
+    const out = html(
+      { ...done, mode: "folder", host: null, packagePath: "/out/Game", titleId: null, installMs: 0 },
+      { sourceBytes: 1024 },
+    );
+    expect(out).toContain("Game folder written and read back.");
+    expect(out).toContain("/out/Game");
+    expect(button(out, "Show in folder")).not.toBeNull();
+    expect(button(out, "Stream & install")).toBeNull();
+    expect(button(out, "Delete package")).toBeNull();
+    expect(button(out, "View details")).toBeNull();
+    expect(button(out, "Upload to PS5")).toBeNull();
+    expect(out).not.toContain("% of");
+  });
+
+  it("names a folder build's stages for a folder", () => {
+    const out = html({
+      phase: "running",
+      mode: "folder",
+      source: "/g/Game.exfat",
+      host: null,
+      stage: "write",
+      stageDone: 1,
+      stageTotal: 2,
+      startedMs: 0,
+      stageStartedMs: 0,
+      stageMs: {},
+      jobId: "j",
+      installTaskId: null,
+      taskId: null,
+      packagePath: null,
+      titleId: null,
+      copiedSource: null,
+      extractedSource: null,
+    });
+    expect(out).toContain("Write folder");
+    expect(out).toContain("Read the folder back");
+    expect(out).not.toContain("Write package");
+    expect(button(out, "Cancel")).not.toBeNull();
   });
 
   it("lists the stages while running, with Cancel during the build", () => {
@@ -387,7 +443,9 @@ describe("RunCard", () => {
       });
       const out = idle("exfat", refused);
       expect(checkbox(out, "AMPR LZ4 asset packs")).toEqual({ checked: false, disabled: true });
-      expect(out).toContain("Not available for this game");
+      // The runtime checkbox fixes this refusal, so the line points at it (#449).
+      expect(out).toContain("above to use packs: the game&#x27;s ampr_emu does not serve asset packs");
+      expect(out).not.toContain("Not available for this game");
       expect(lz4Active("exfat", refused)).toBe(false);
     });
   });

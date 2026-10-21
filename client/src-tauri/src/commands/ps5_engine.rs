@@ -12,7 +12,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::engine;
 
@@ -187,6 +187,70 @@ pub async fn engine_restart(app: tauri::AppHandle) -> Result<String, String> {
     }
 }
 
+/// Turn the console's helper off (`POST /api/ps5/helper/stop`, #471). The engine's decided
+/// refusals (409 busy, 502 refused / still running) come back as `{ state: "refused", reason,
+/// error }` rather than an error string, so the renderer can say which; anything else that is not
+/// a success is an error as usual.
+#[tauri::command]
+pub async fn ps5_helper_stop(addr: String) -> Result<JsonValue, String> {
+    let url = format!("{}/api/ps5/helper/stop", engine::url());
+    let resp = http_client()
+        .post(&url)
+        .json(&serde_json::json!({ "addr": addr }))
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "engine request failed: {}",
+                crate::engine_http::error_chain(&e)
+            )
+        })?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("engine response body read failed: {e}"))?;
+    helper_stop_answer(status.as_u16(), &text)
+}
+
+/// The renderer's view of a helper-stop answer (see `ps5_helper_stop`).
+fn helper_stop_answer(status: u16, body: &str) -> Result<JsonValue, String> {
+    let v = serde_json::from_str::<JsonValue>(body).unwrap_or(JsonValue::Null);
+    if (200..300).contains(&status) {
+        return Ok(v);
+    }
+    let error = v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| body.to_string());
+    match v.get("reason").and_then(|r| r.as_str()) {
+        Some(reason) => Ok(serde_json::json!({
+            "state": "refused",
+            "reason": reason,
+            "error": error,
+        })),
+        None => Err(format!("engine HTTP {status}: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod helper_stop_tests {
+    use super::helper_stop_answer;
+
+    #[test]
+    fn a_decided_refusal_is_an_answer_and_anything_else_an_error() {
+        let ok = helper_stop_answer(200, r#"{"state":"stopped"}"#).unwrap();
+        assert_eq!(ok["state"], "stopped");
+        let busy = helper_stop_answer(409, r#"{"error":"in use","reason":"busy"}"#).unwrap();
+        assert_eq!(busy["state"], "refused");
+        assert_eq!(busy["reason"], "busy");
+        assert_eq!(busy["error"], "in use");
+        assert!(helper_stop_answer(400, r#"{"error":"addr is required"}"#).is_err());
+        assert!(helper_stop_answer(500, "boom").is_err());
+    }
+}
+
 #[tauri::command]
 pub async fn ps5_volumes(addr: Option<String>) -> Result<JsonValue, String> {
     let base = engine::url();
@@ -338,6 +402,39 @@ pub async fn transfer_dir(req: TransferDirReq) -> Result<JsonValue, String> {
         "bandwidth_cap_mbps": req.bandwidth_cap_mbps,
     });
     post_json(&url, &body).await
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TransferFileListEntry {
+    pub src: String,
+    pub dest: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransferFileListReq {
+    pub dest_root: String,
+    pub files: Vec<TransferFileListEntry>,
+    pub addr: Option<String>,
+    pub tx_id: Option<String>,
+    #[serde(default)]
+    pub bandwidth_cap_mbps: Option<f64>,
+}
+
+/// Upload a set of files as ONE job (the Files screen's multi-file pick). Proxies the
+/// engine's `/api/transfer/file-list`. Long request: the engine stats every source before it
+/// answers with the job id, which on a slow disk and tens of thousands of files takes a while.
+#[tauri::command]
+pub async fn transfer_file_list(req: TransferFileListReq) -> Result<JsonValue, String> {
+    let base = engine::url();
+    let url = format!("{base}/api/transfer/file-list");
+    let body = serde_json::json!({
+        "dest_root": req.dest_root,
+        "files": req.files,
+        "addr": req.addr,
+        "tx_id": req.tx_id,
+        "bandwidth_cap_mbps": req.bandwidth_cap_mbps,
+    });
+    post_json_long(&url, &body).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -681,6 +778,8 @@ pub struct ProfileAvatarReq {
     pub uid: Option<u32>,
     #[serde(default)]
     pub username: Option<String>,
+    #[serde(default)]
+    pub crop: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -688,6 +787,8 @@ pub struct ProfilePreviewReq {
     pub image_path: String,
     #[serde(default)]
     pub mode: Option<String>,
+    #[serde(default)]
+    pub crop: Option<serde_json::Value>,
 }
 
 /// Foreground user + local users + offline-account name slots.
@@ -1274,7 +1375,8 @@ pub async fn fw_spoof_status(req: CheatsAddrReq) -> Result<JsonValue, String> {
 pub async fn profile_avatar_preview(req: ProfilePreviewReq) -> Result<JsonValue, String> {
     let base = engine::url();
     let url = format!("{base}/api/profile/avatar/preview");
-    let body = serde_json::json!({ "image_path": req.image_path, "mode": req.mode });
+    let body =
+        serde_json::json!({ "image_path": req.image_path, "mode": req.mode, "crop": req.crop });
     post_json(&url, &body).await
 }
 
@@ -1288,6 +1390,7 @@ pub async fn profile_apply_avatar(req: ProfileAvatarReq) -> Result<JsonValue, St
         "addr": req.addr,
         "image_path": req.image_path,
         "mode": req.mode,
+        "crop": req.crop,
         "uid": req.uid,
         "username": req.username,
     });
@@ -1796,9 +1899,8 @@ pub async fn ps5_app_register(req: AppRegisterReq) -> Result<JsonValue, String> 
     .await
 }
 
-/// Reverse of `app_register`. Succeeds when the nullfs at
-/// `/system_ex/app/<title_id>` is fully torn down, even if the Sony
-/// AppUninstall API isn't available on the firmware.
+/// Reverse of `app_register`, and a package's uninstall. The engine's reply
+/// says whether Sony refused and whether the title is still on the console.
 #[derive(serde::Deserialize)]
 pub struct AppUnregisterReq {
     pub addr: Option<String>,
@@ -1967,20 +2069,34 @@ async fn engine_icon_data_url(url: String) -> Result<String, String> {
 /// Cover art for an installed title, as a `data:` URL. See
 /// [`engine_icon_data_url`].
 #[tauri::command]
-pub async fn ps5_app_icon_data(addr: Option<String>, title_id: String) -> Result<String, String> {
+pub async fn ps5_app_icon_data(
+    addr: Option<String>,
+    title_id: String,
+    size: Option<u32>,
+) -> Result<String, String> {
     let mut url = addr_url("/api/ps5/app-icon", addr.as_deref());
     url.push_str(if url.contains('?') { "&" } else { "?" });
     url.push_str(&format!("title_id={}", urlencoding(&title_id)));
+    if let Some(px) = size {
+        url.push_str(&format!("&size={px}"));
+    }
     engine_icon_data_url(url).await
 }
 
 /// Cover art for an on-console game folder, as a `data:` URL. See
 /// [`engine_icon_data_url`].
 #[tauri::command]
-pub async fn ps5_game_icon_data(addr: Option<String>, path: String) -> Result<String, String> {
+pub async fn ps5_game_icon_data(
+    addr: Option<String>,
+    path: String,
+    size: Option<u32>,
+) -> Result<String, String> {
     let mut url = addr_url("/api/ps5/game-icon", addr.as_deref());
     url.push_str(if url.contains('?') { "&" } else { "?" });
     url.push_str(&format!("path={}", urlencoding(&path)));
+    if let Some(px) = size {
+        url.push_str(&format!("&size={px}"));
+    }
     engine_icon_data_url(url).await
 }
 
@@ -2225,12 +2341,13 @@ pub async fn game_inspect_files(token: String) -> Result<JsonValue, String> {
 }
 
 /// What a game source is, before converting it: readiness, size and cost.
+/// Remote image metadata reads may exceed the standard 60-second request limit.
 /// POST /api/fpkg/inspect.
 #[tauri::command]
 pub async fn fpkg_inspect(source: String, output_dir: Option<String>) -> Result<JsonValue, String> {
     let base = engine::url();
     let url = format!("{base}/api/fpkg/inspect");
-    post_json(
+    post_json_long(
         &url,
         &serde_json::json!({ "source": source, "output_dir": output_dir }),
     )
@@ -2241,6 +2358,7 @@ pub async fn fpkg_inspect(source: String, output_dir: Option<String>) -> Result<
 /// to poll with `job_status`; the finished job carries the package's path.
 /// POST /api/fpkg/build.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn fpkg_build(
     source: String,
     output_dir: Option<String>,
@@ -2249,10 +2367,12 @@ pub async fn fpkg_build(
     compression: Option<String>,
     firmware: Option<String>,
     language: Option<String>,
+    // Read everything back to verify; absent means the fast, sampled check.
+    full_verify: Option<bool>,
 ) -> Result<JsonValue, String> {
     let base = engine::url();
     let url = format!("{base}/api/fpkg/build");
-    post_json(
+    post_json_long(
         &url,
         &serde_json::json!({
             "source": source,
@@ -2262,6 +2382,7 @@ pub async fn fpkg_build(
             "compression": compression,
             "firmware": firmware,
             "language": language,
+            "full_verify": full_verify.unwrap_or(false),
         }),
     )
     .await
@@ -2294,7 +2415,7 @@ pub async fn fpkg_estimate(
 ) -> Result<JsonValue, String> {
     let base = engine::url();
     let url = format!("{base}/api/fpkg/estimate");
-    post_json(
+    post_json_long(
         &url,
         &serde_json::json!({ "source": source, "output_dir": output_dir }),
     )
@@ -2345,6 +2466,7 @@ pub async fn ffpfsc_compress(
     source: String,
     output_dir: Option<String>,
     level: Option<u32>,
+    full_verify: Option<bool>,
 ) -> Result<JsonValue, String> {
     let base = engine::url();
     let url = format!("{base}/api/ffpfsc/compress");
@@ -2354,6 +2476,7 @@ pub async fn ffpfsc_compress(
             "source": source,
             "output_dir": output_dir,
             "level": level,
+            "full_verify": full_verify.unwrap_or(false),
         }),
     )
     .await
@@ -2370,6 +2493,7 @@ pub async fn exfat_build(
     ampr_lz4: Option<JsonValue>,
     // The read-back check's chunk in KiB; the engine's default when absent.
     verify_chunk_kib: Option<u32>,
+    full_verify: Option<bool>,
 ) -> Result<JsonValue, String> {
     let base = engine::url();
     let url = format!("{base}/api/exfat/build");
@@ -2382,6 +2506,29 @@ pub async fn exfat_build(
             "compress": compress.unwrap_or(false),
             "ampr_lz4": ampr_lz4,
             "verify_chunk_kib": verify_chunk_kib,
+            "full_verify": full_verify.unwrap_or(false),
+        }),
+    )
+    .await
+}
+
+/// Unpack a game image or a debug-key package into a plain folder; runs as an engine job.
+#[tauri::command]
+pub async fn folder_build(
+    source: String,
+    output_dir: Option<String>,
+    name: Option<String>,
+    full_verify: Option<bool>,
+) -> Result<JsonValue, String> {
+    let base = engine::url();
+    let url = format!("{base}/api/folder/build");
+    post_json(
+        &url,
+        &serde_json::json!({
+            "source": source,
+            "output_dir": output_dir,
+            "name": name,
+            "full_verify": full_verify.unwrap_or(false),
         }),
     )
     .await

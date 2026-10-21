@@ -734,6 +734,7 @@ static int on_frame(ava1_job_t *j, uint8_t type, const uint8_t *body, size_t len
         }
         s->stop = 1;
         j->finished = 1;
+        __atomic_store_n(&j->concluded_ms, ava1_mono_ms() | 1u, __ATOMIC_RELEASE); /* the peer ended it: the table may let it go */
         pthread_cond_broadcast(&j->cv);
         pthread_mutex_unlock(&j->mu);
         return 0;

@@ -25,6 +25,7 @@
 #define AVA1_ERR_BUSY 8ULL
 #define AVA1_CAP_DATA_PLANE 1ULL
 #define AVA1_CAP_MGMT 2ULL
+#define AVA1_CAP_SHARED_JOBS 4ULL
 #define AVA1_METHOD_JOB_COPY 16ULL
 #define AVA1_METHOD_JOB_STATUS 17ULL
 #define AVA1_METHOD_JOB_CANCEL 18ULL
@@ -169,6 +170,12 @@
 #define AVA1_METHOD_USB_EJECT 144ULL
 #define AVA1_METHOD_SAVE_MOUNT 145ULL
 #define AVA1_METHOD_SAVE_UNMOUNT 146ULL
+#define AVA1_METHOD_NET_PORTS 147ULL
+#define AVA1_METHOD_FILES_PREFS_GET 148ULL
+#define AVA1_METHOD_FILES_PREFS_SET 149ULL
+#define AVA1_METHOD_FILES_HANDOFF_PUT 150ULL
+#define AVA1_METHOD_FILES_HANDOFF_TAKE 151ULL
+#define AVA1_METHOD_MINION_TILE 152ULL
 #define AVA1_JOB_OP_DELETE 1ULL
 #define AVA1_JOB_OP_CHMOD_R 2ULL
 #define AVA1_JOB_OP_HASH 3ULL
@@ -178,6 +185,7 @@
 #define AVA1_JOB_OP_BACKUP_RESTORE 7ULL
 #define AVA1_JOB_OP_CLEANUP 8ULL
 #define AVA1_JOB_OP_SDK_SCAN 9ULL
+#define AVA1_JOB_OP_FFPFSC_UNPACK 10ULL
 #define AVA1_ENTRY_LINK 2ULL
 #define AVA1_ENTRY_OTHER 3ULL
 #define AVA1_ENTRY_UNKNOWN 4ULL
@@ -223,6 +231,7 @@
 #define AVA1_TYPE_STATUS 0x2du
 #define AVA1_TYPE_JOB_DONE 0x2eu
 #define AVA1_TYPE_JOB_CANCEL 0x2fu
+#define AVA1_TYPE_SKIP_PROGRESS 0x30u
 
 typedef struct {
     const uint8_t *version;
@@ -1219,6 +1228,14 @@ typedef struct {
 
 int ava1_job_cancel_encode(const ava1_job_cancel_t *m, ava1_w_t *w);
 int ava1_job_cancel_decode(const uint8_t *buf, size_t len, ava1_job_cancel_t *m);
+
+typedef struct {
+    uint8_t job_id[16];
+    uint64_t bytes_skipped;
+} ava1_skip_progress_t;
+
+int ava1_skip_progress_encode(const ava1_skip_progress_t *m, ava1_w_t *w);
+int ava1_skip_progress_decode(const uint8_t *buf, size_t len, ava1_skip_progress_t *m);
 
 extern const char *const ava1_message_names[];
 extern const size_t ava1_message_count;

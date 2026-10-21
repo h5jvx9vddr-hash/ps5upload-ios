@@ -5,7 +5,7 @@
 //! with the same id as a relay would use, so either route resumes what the other left.
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -48,6 +48,8 @@ enum Direct {
     Done(SendReport),
     Fallback(String),
     Cancelled,
+    /// Another device took the send over (#444): stop driving it, end nothing.
+    Released(String),
     /// The job failed for a reason the relay would meet too (no space, a bad path).
     Failed(String),
 }
@@ -55,8 +57,67 @@ enum Direct {
 /// The port a console dials for a direct send when the address names none: the helper's.
 pub const DIRECT_PORT: u16 = gen::DEFAULT_PORT;
 
+/// Who drives a send (#444). The engine that started it holds a lease in the shared record on
+/// the receiving console; another device that takes the send over moves the lease to itself,
+/// and this engine then stops driving the send without ending either console's half.
+#[derive(Default)]
+pub struct Lease {
+    taken_by: Mutex<Option<String>>,
+    /// A fresh read of the record: the device that holds the lease now when it is not this
+    /// engine. It blocks (a management call), so it runs only outside async code.
+    check: Option<Box<dyn Fn() -> Option<String> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field("taken_by", &self.taken_by())
+            .finish()
+    }
+}
+
+impl Lease {
+    pub fn new(check: impl Fn() -> Option<String> + Send + Sync + 'static) -> Lease {
+        Lease {
+            taken_by: Mutex::default(),
+            check: Some(Box::new(check)),
+        }
+    }
+
+    /// The device that took the send over, as last seen (no I/O).
+    pub fn taken_by(&self) -> Option<String> {
+        self.taken_by
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn mark_taken(&self, by: String) {
+        *self.taken_by.lock().unwrap_or_else(|e| e.into_inner()) = Some(by);
+    }
+
+    /// Looks again before anything that would end a console's half or start the relay.
+    fn confirm(&self) -> Option<String> {
+        if let Some(by) = self.taken_by() {
+            return Some(by);
+        }
+        let by = self.check.as_ref().and_then(|c| c())?;
+        self.mark_taken(by.clone());
+        Some(by)
+    }
+}
+
+/// Why this engine stopped: another device drives the send now. Not a failure to retry.
+pub fn taken_over(by: &str) -> anyhow::Error {
+    crate::upload::UploadFailure {
+        reason: "ava1_taken_over".into(),
+        detail: format!("taken over by {by}"),
+    }
+    .into()
+}
+
 /// How a console-to-console copy may go (#444).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct RouteOptions {
     /// `Auto`: straight between the consoles when they can connect, else through this
     /// computer. `DirectOnly`: never through this computer (a phone on mobile data, say); a
@@ -69,6 +130,11 @@ pub struct RouteOptions {
     /// not the one the consoles use between themselves. The ticket and the peer key still
     /// decide who may send, not the address.
     pub dial: Option<String>,
+    /// Watch a direct send another device started (#444): no new send, this engine follows
+    /// the sending console's job (and falls back as usual if it stops).
+    pub attach: bool,
+    /// The shared record's lease; `None` runs without one (tests, the lab).
+    pub lease: Option<Arc<Lease>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -111,6 +177,54 @@ pub fn parse_dial(s: &str) -> std::result::Result<(String, u16), String> {
         ));
     }
     Ok((host.to_string(), port))
+}
+
+/// What the sending console dials to reach `to`, as a send would: `dial` when given, else
+/// `to`'s own IPv4 address on the helper's port.
+pub fn dial_target(to: &str, dial: Option<&str>) -> std::result::Result<(String, u16), String> {
+    let (host, mut port) = match dial {
+        Some(d) => parse_dial(d).map_err(|e| format!("the direct route address: {e}"))?,
+        None => ipv4_of(&pool().addr_for(to))
+            .ok_or_else(|| "the receiving console has no IPv4 address to dial".to_string())?,
+    };
+    let test_port = TEST_PORT.load(Ordering::Relaxed);
+    if test_port != 0 {
+        port = test_port;
+    }
+    Ok((host, port))
+}
+
+/// Ends both consoles' halves of a job (best effort): a send another device takes over is
+/// then free to resume from that device (#444).
+pub fn end_both(from: &str, to: &str, job_id: [u8; 16]) {
+    crate::block_on(async {
+        cancel_on(pool(), from, job_id).await;
+        cancel_on(pool(), to, job_id).await;
+    })
+}
+
+/// Whether a console's helper lets any paired device read and cancel a transfer and take over
+/// a parked one (`CAP_SHARED_JOBS`); `None` when the console cannot be asked.
+pub fn shared_jobs(console: &str) -> Option<bool> {
+    crate::block_on(async {
+        let s = pool().session(console).await.ok()?;
+        Some(s.peer_caps() & gen::CAP_SHARED_JOBS != 0)
+    })
+}
+
+/// A console's half of a job as this engine may read it: `Ok(None)` when the console does not
+/// list it (for this engine; an older helper lists another device's job for that device only).
+pub fn status_on(console: &str, job_id: [u8; 16]) -> Result<Option<Status>> {
+    crate::block_on(async {
+        let s = pool().session(console).await?;
+        let r = s
+            .rpc(gen::METHOD_JOB_STATUS, &JobRef { job_id }.to_bytes()?)
+            .await?;
+        Ok(match r.status {
+            gen::STATUS_OK => Some(Status::decode(&r.body)?),
+            _ => None,
+        })
+    })
 }
 
 /// Copies `src` on `from` to `dest` on `to`: directly when it can, else through this computer.
@@ -161,7 +275,7 @@ pub fn ps5_to_ps5_routed_between(
     cancel: Arc<AtomicBool>,
     on_route: impl Fn(&Route),
 ) -> Result<(SendReport, Route)> {
-    routed(
+    ps5_to_ps5_routed_between_with(
         from_pool,
         from,
         src,
@@ -171,9 +285,28 @@ pub fn ps5_to_ps5_routed_between(
         job_id,
         progress,
         cancel,
-        None,
         &RouteOptions::default(),
         on_route,
+    )
+}
+
+/// [`ps5_to_ps5_routed_between`] with route options (a lease, watching).
+#[allow(clippy::too_many_arguments)]
+pub fn ps5_to_ps5_routed_between_with(
+    from_pool: &Pool,
+    from: &str,
+    src: &str,
+    to_pool: &Pool,
+    to: &str,
+    dest: &str,
+    job_id: [u8; 16],
+    progress: Arc<Progress>,
+    cancel: Arc<AtomicBool>,
+    options: &RouteOptions,
+    on_route: impl Fn(&Route),
+) -> Result<(SendReport, Route)> {
+    routed(
+        from_pool, from, src, to_pool, to, dest, job_id, progress, cancel, None, options, on_route,
     )
 }
 
@@ -196,23 +329,50 @@ fn routed(
         Some(d) => Some(parse_dial(d).map_err(|e| anyhow!("the direct route address: {e}"))?),
         None => None,
     };
+    let lease = options.lease.as_deref();
+    let taken = || lease.and_then(Lease::confirm);
     let reason = if options.mode == RouteMode::RelayOnly {
         "a send through this computer was asked for".to_string()
     } else {
         let direct = crate::block_on(direct(
-            from_pool, from, src, to_pool, to, dest, job_id, &progress, &cancel, dial, &on_route,
+            from_pool,
+            from,
+            src,
+            to_pool,
+            to,
+            dest,
+            job_id,
+            &progress,
+            &cancel,
+            dial,
+            options.attach,
+            lease,
+            &on_route,
         ));
         match direct {
             Direct::Done(r) => return Ok((r, Route::Direct)),
-            Direct::Cancelled => return Err(anyhow!("transfer_cancelled")),
-            Direct::Failed(why) => return Err(anyhow!("{why}")),
-            Direct::Fallback(reason) if options.mode == RouteMode::DirectOnly => {
-                // Nothing through this computer: the receiving console's half is still
-                // ended, so the next try (or a relay, if asked for) is not refused as busy.
+            Direct::Released(by) => return Err(taken_over(&by)),
+            Direct::Cancelled => {
+                // A pause ends the receiving console's half too, also when the consoles have
+                // lost each other and the sending console's own cancel never reaches it: its
+                // journal is then free at once for a resume from this or any device (#444).
                 crate::block_on(cancel_on(to_pool, to, job_id));
-                return Err(anyhow!("direct_route_unavailable: {reason}"));
+                return Err(anyhow!("transfer_cancelled"));
             }
-            Direct::Fallback(reason) => reason,
+            Direct::Failed(why) => return Err(anyhow!("{why}")),
+            Direct::Fallback(reason) => {
+                // Another device's send now: neither half is this engine's to end or relay.
+                if let Some(by) = taken() {
+                    return Err(taken_over(&by));
+                }
+                if options.mode == RouteMode::DirectOnly {
+                    // Nothing through this computer: the receiving console's half is still
+                    // ended, so the next try (or a relay, if asked for) is not refused as busy.
+                    crate::block_on(cancel_on(to_pool, to, job_id));
+                    return Err(anyhow!("direct_route_unavailable: {reason}"));
+                }
+                reason
+            }
         }
     };
     // The receiving console's half of the direct job may still be open (the sending console
@@ -233,11 +393,25 @@ fn routed(
         dest,
         job_id,
         progress,
-        cancel,
+        cancel.clone(),
         bandwidth_cap,
-    )
-    .map_err(|e| with_route_reason(e, &reason))?;
-    Ok((r, route))
+    );
+    match r {
+        Ok(r) => Ok((r, route)),
+        Err(e) if cancel.load(Ordering::Relaxed) => {
+            // Paused: both halves end, so any device can resume it at once (#444).
+            crate::block_on(async {
+                cancel_on(from_pool, from, job_id).await;
+                cancel_on(to_pool, to, job_id).await;
+            });
+            Err(e)
+        }
+        // The receiving console ended the relay's job because another device took it over.
+        Err(e) => match taken() {
+            Some(by) => Err(taken_over(&by)),
+            None => Err(with_route_reason(e, &reason)),
+        },
+    }
 }
 
 /// A relay refused as busy after a direct send was given up says why the direct send ended:
@@ -293,6 +467,13 @@ async fn cancel_on(pool: &Pool, console: &str, job_id: [u8; 16]) {
     }
 }
 
+/// Ends the sending console's half before a fallback, unless another device drives it now.
+async fn cancel_unless_taken(pool: &Pool, console: &str, job_id: [u8; 16], lease: Option<&Lease>) {
+    if lease.and_then(Lease::taken_by).is_none() {
+        cancel_on(pool, console, job_id).await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn direct(
     from_pool: &Pool,
@@ -305,46 +486,87 @@ async fn direct(
     progress: &Progress,
     cancel: &AtomicBool,
     dial: Option<(String, u16)>,
+    attach: bool,
+    lease: Option<&Lease>,
     on_route: &impl Fn(&Route),
 ) -> Direct {
-    let sa = match from_pool.session(from).await {
-        Ok(s) => s,
-        Err(e) => return Direct::Fallback(format!("the sending console did not answer: {e}")),
-    };
-    let sb = match to_pool.session(to).await {
-        Ok(s) => s,
-        Err(e) => return Direct::Fallback(format!("the receiving console did not answer: {e}")),
-    };
+    if !attach {
+        if let Err(d) =
+            start_direct(from_pool, from, src, to_pool, to, dest, job_id, dial, lease).await
+        {
+            return d;
+        }
+    }
+    on_route(&Route::Direct);
+    follow(from_pool, from, job_id, progress, cancel, lease).await
+}
+
+/// c2c.allow on the receiving console, then c2c.send on the sending one. `Err` is how the
+/// direct route ended before it ran.
+#[allow(clippy::too_many_arguments)]
+async fn start_direct(
+    from_pool: &Pool,
+    from: &str,
+    src: &str,
+    to_pool: &Pool,
+    to: &str,
+    dest: &str,
+    job_id: [u8; 16],
+    dial: Option<(String, u16)>,
+    lease: Option<&Lease>,
+) -> std::result::Result<(), Direct> {
+    let sa = from_pool
+        .session(from)
+        .await
+        .map_err(|e| Direct::Fallback(format!("the sending console did not answer: {e}")))?;
+    let sb = to_pool
+        .session(to)
+        .await
+        .map_err(|e| Direct::Fallback(format!("the receiving console did not answer: {e}")))?;
     let allow = C2cAllow {
         job_id,
         key: sa.peer_key(),
         root: dest.into(),
     };
     let Ok(body) = allow.to_bytes() else {
-        return Direct::Fallback("the destination path is too long for a direct send".into());
+        return Err(Direct::Fallback(
+            "the destination path is too long for a direct send".into(),
+        ));
     };
     let token = match sb.rpc(gen::METHOD_C2C_ALLOW, &body).await {
         Ok(r) if r.status == gen::STATUS_OK => match C2cTicket::decode(&r.body) {
             Ok(t) => t.token,
-            Err(e) => return Direct::Fallback(format!("the receiving console's ticket: {e}")),
+            Err(e) => {
+                return Err(Direct::Fallback(format!(
+                    "the receiving console's ticket: {e}"
+                )))
+            }
         },
         Ok(r) if r.status == gen::ERR_UNKNOWN_METHOD => {
-            return Direct::Fallback("the receiving console's helper is older than 6.8".into())
-        }
-        Ok(r) => {
-            return Direct::Fallback(format!(
-                "the receiving console refused a direct send: {}",
-                text(&r.body)
+            return Err(Direct::Fallback(
+                "the receiving console's helper is older than 6.8".into(),
             ))
         }
-        Err(e) => return Direct::Fallback(format!("the receiving console did not answer: {e}")),
+        Ok(r) => {
+            return Err(Direct::Fallback(format!(
+                "the receiving console refused a direct send: {}",
+                text(&r.body)
+            )))
+        }
+        Err(e) => {
+            return Err(Direct::Fallback(format!(
+                "the receiving console did not answer: {e}"
+            )))
+        }
     };
     let (host, mut port) = match dial {
         Some(d) => d,
         None => match ipv4_of(&to_pool.addr_for(to)) {
             Some(a) => a,
             None => {
-                return Direct::Fallback("the receiving console has no IPv4 address to dial".into())
+                return Err(Direct::Fallback(
+                    "the receiving console has no IPv4 address to dial".into(),
+                ))
             }
         },
     };
@@ -363,30 +585,42 @@ async fn direct(
         flags: 0,
     };
     let Ok(body) = send.to_bytes() else {
-        return Direct::Fallback("the paths are too long for a direct send".into());
+        return Err(Direct::Fallback(
+            "the paths are too long for a direct send".into(),
+        ));
     };
     match sa
         .rpc_within(gen::METHOD_C2C_SEND, &body, SEND_TIMEOUT)
         .await
     {
-        Ok(r) if r.status == gen::STATUS_OK => {}
-        Ok(r) if r.status == gen::ERR_UNKNOWN_METHOD => {
-            return Direct::Fallback("the sending console's helper is older than 6.8".into())
-        }
-        Ok(r) if terminal(r.status) => return Direct::Failed(text(&r.body)),
-        Ok(r) => {
-            return Direct::Fallback(format!(
-                "the consoles could not connect to each other ({})",
-                text(&r.body)
-            ))
-        }
+        Ok(r) if r.status == gen::STATUS_OK => Ok(()),
+        Ok(r) if r.status == gen::ERR_UNKNOWN_METHOD => Err(Direct::Fallback(
+            "the sending console's helper is older than 6.8".into(),
+        )),
+        Ok(r) if terminal(r.status) => Err(Direct::Failed(text(&r.body))),
+        Ok(r) => Err(Direct::Fallback(format!(
+            "the consoles could not connect to each other ({})",
+            text(&r.body)
+        ))),
         Err(e) => {
             // It may have started anyway: the relay must not run beside it.
-            cancel_on(from_pool, from, job_id).await;
-            return Direct::Fallback(format!("the sending console did not answer: {e}"));
+            cancel_unless_taken(from_pool, from, job_id, lease).await;
+            Err(Direct::Fallback(format!(
+                "the sending console did not answer: {e}"
+            )))
         }
     }
-    on_route(&Route::Direct);
+}
+
+/// Follows the sending console's job until it ends, mirroring its progress.
+async fn follow(
+    from_pool: &Pool,
+    from: &str,
+    job_id: [u8; 16],
+    progress: &Progress,
+    cancel: &AtomicBool,
+    lease: Option<&Lease>,
+) -> Direct {
     let reference = JobRef { job_id }.to_bytes().unwrap_or_default();
     let (mut last_bytes, mut last_move) = (0u64, Instant::now());
     let mut status_ok_at = Instant::now();
@@ -394,6 +628,9 @@ async fn direct(
         if cancel.load(Ordering::Relaxed) {
             cancel_on(from_pool, from, job_id).await;
             return Direct::Cancelled;
+        }
+        if let Some(by) = lease.and_then(Lease::taken_by) {
+            return Direct::Released(by);
         }
         tokio::time::sleep(POLL).await;
         let reply = match from_pool.session(from).await {
@@ -410,7 +647,7 @@ async fn direct(
         };
         let Some(st) = st else {
             if let Some(why) = gave_up(status_ok_at.elapsed(), last_move.elapsed()) {
-                cancel_on(from_pool, from, job_id).await;
+                cancel_unless_taken(from_pool, from, job_id, lease).await;
                 return Direct::Fallback(why.into());
             }
             continue;
@@ -465,8 +702,63 @@ async fn direct(
             }
         }
         if let Some(why) = gave_up(Duration::ZERO, last_move.elapsed()) {
-            cancel_on(from_pool, from, job_id).await;
+            cancel_unless_taken(from_pool, from, job_id, lease).await;
             return Direct::Fallback(why.into());
+        }
+    }
+}
+
+/// What "Test connection" says about one connect from the sending console (#444): `reachable`,
+/// `refused` (the address answers, nothing listens on the port), `timeout`, `unreachable` (no
+/// route), `bad_address`, `helper_too_old` (no net.reach) or `error` (the probe could not run).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Reach {
+    pub verdict: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// The console's `net.reach` answer as a [`Reach`]. errno values are FreeBSD's (the console)
+/// and Linux's (the host-built helper in tests).
+pub fn reach_verdict(r: &Result<ps5upload_core::diagnostics::NetReach>) -> Reach {
+    let v = |verdict, ms, detail| Reach {
+        verdict,
+        ms,
+        detail,
+    };
+    match r {
+        Ok(n) if n.ok => v("reachable", Some(n.ms), None),
+        Ok(n) if n.timed_out => v("timeout", Some(n.ms), None),
+        Ok(n) => {
+            let err = n.err.to_ascii_lowercase();
+            let verdict = match n.errno {
+                61 | 111 => "refused",
+                51 | 65 | 64 | 101 | 113 | 112 => "unreachable",
+                60 | 110 => "timeout",
+                _ if err.contains("refused") => "refused",
+                _ if err.contains("unreachable") || err.contains("no route") => "unreachable",
+                _ => "error",
+            };
+            v(
+                verdict,
+                Some(n.ms),
+                Some(n.err.clone()).filter(|e| !e.is_empty()),
+            )
+        }
+        Err(e) => {
+            let unknown_method = e
+                .downcast_ref::<ps5upload_core::mgmt::MgmtError>()
+                .is_some_and(|m| m.status == gen::ERR_UNKNOWN_METHOD);
+            let text = format!("{e:#}");
+            if text.contains("bad_address") {
+                v("bad_address", None, None)
+            } else if unknown_method || text.contains(ps5upload_core::mgmt::HELPER_NOT_AVA1) {
+                v("helper_too_old", None, Some(text))
+            } else {
+                v("error", None, Some(text))
+            }
         }
     }
 }
@@ -474,6 +766,64 @@ async fn direct(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reach_answers_read_as_one_word_verdicts() {
+        use ps5upload_core::diagnostics::NetReach;
+        let n = |ok, timed_out, errno, err: &str| {
+            Ok(NetReach {
+                ok,
+                timed_out,
+                errno,
+                err: err.into(),
+                ms: 7,
+            })
+        };
+        let verdict = |r: Result<NetReach>| reach_verdict(&r).verdict;
+        assert_eq!(reach_verdict(&n(true, false, 0, "")).ms, Some(7));
+        assert_eq!(verdict(n(true, false, 0, "")), "reachable");
+        assert_eq!(verdict(n(false, true, 0, "timed out")), "timeout");
+        assert_eq!(
+            verdict(n(false, false, 61, "Connection refused")),
+            "refused"
+        );
+        assert_eq!(
+            verdict(n(false, false, 111, "Connection refused")),
+            "refused"
+        );
+        assert_eq!(
+            verdict(n(false, false, 65, "No route to host")),
+            "unreachable"
+        );
+        assert_eq!(
+            verdict(n(false, false, 101, "Network is unreachable")),
+            "unreachable"
+        );
+        assert_eq!(
+            verdict(n(false, false, 999, "No route to host")),
+            "unreachable"
+        );
+        assert_eq!(verdict(n(false, false, 999, "Something else")), "error");
+        let bad: anyhow::Error = ps5upload_core::mgmt::MgmtError {
+            label: "NET_REACH".into(),
+            status: gen::ERR_PROTOCOL,
+            cause: "bad_address".into(),
+        }
+        .into();
+        assert_eq!(verdict(Err(bad)), "bad_address");
+        let old: anyhow::Error = ps5upload_core::mgmt::MgmtError {
+            label: "NET_REACH".into(),
+            status: gen::ERR_UNKNOWN_METHOD,
+            cause: "unknown method".into(),
+        }
+        .into();
+        assert_eq!(verdict(Err(old)), "helper_too_old");
+        assert_eq!(
+            verdict(Err(ps5upload_core::mgmt::helper_not_ava1("NET_REACH"))),
+            "helper_too_old"
+        );
+        assert_eq!(verdict(Err(anyhow!("connection reset"))), "error");
+    }
 
     #[test]
     fn a_direct_send_is_given_up_when_status_fails_or_nothing_moves() {
@@ -502,5 +852,28 @@ mod tests {
         // Other failures are left as they are.
         let e = with_route_reason(anyhow!("disk full"), "x");
         assert_eq!(e.to_string(), "disk full");
+    }
+
+    #[test]
+    fn a_lease_remembers_who_took_the_send_over_and_asks_only_until_it_knows() {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = asked.clone();
+        let lease = Lease::new(move || {
+            n.fetch_add(1, Ordering::Relaxed);
+            Some("Phone".to_string())
+        });
+        assert_eq!(lease.taken_by(), None, "no I/O until confirm");
+        assert_eq!(lease.confirm().as_deref(), Some("Phone"));
+        assert_eq!(lease.confirm().as_deref(), Some("Phone"));
+        assert_eq!(asked.load(Ordering::Relaxed), 1);
+        assert_eq!(lease.taken_by().as_deref(), Some("Phone"));
+        let mine = Lease::new(|| None);
+        assert_eq!(mine.confirm(), None);
+        let e = taken_over("Phone");
+        let f = e.downcast_ref::<crate::upload::UploadFailure>().unwrap();
+        assert_eq!(
+            (f.reason.as_str(), f.detail.as_str()),
+            ("ava1_taken_over", "taken over by Phone")
+        );
     }
 }

@@ -24,6 +24,8 @@
  * is cheap and safe.
  */
 
+import { isRestModeReason } from "./consolePower";
+
 /** One initial attempt + this many automatic recovery attempts before the job
  *  is marked terminally failed and left for the manual Retry/Resume button. */
 export const MAX_AUTO_RECOVER_ATTEMPTS = 3;
@@ -89,6 +91,11 @@ const AVA1_FATAL_REASON_PREFIXES = [
   "ava1_zip_",
   "rar_password_required",
   "rar_password_wrong",
+  // Console to console (#444): another device drives the send now (retrying here would take
+  // it back), or adopting it needs newer helpers / a send that runs direct.
+  "ava1_taken_over",
+  "ava1_shared_jobs_unsupported",
+  "ava1_cannot_watch",
 ] as const;
 
 /** Local (no payload `reason`) error-message substrings that are FATAL. These
@@ -224,4 +231,32 @@ export function shouldAutoRecover(
 ): boolean {
   if (err instanceof PostUploadStepError) return false;
   return isAutoRecoverable(reason, message, opts);
+}
+
+/**
+ * Whether a failed upload should wait for the console to wake instead of failing or spending
+ * a recovery attempt.
+ *
+ * A console in rest mode cannot take bytes, and no amount of retrying or re-sending the helper
+ * changes that: only a wake does, and a wake is the user's to make. So the row is parked
+ * ("Waiting for the PS5 to wake") and resumes on the helper-up edge after the wake, in both
+ * builds (the browser build cannot send the helper, but it still sees the helper come back).
+ *
+ * - the engine said so (`console_rest_mode`), or
+ * - the console's power state reads rest and the failure is one a retry could fix at all
+ *   (a full drive is still a full drive after the wake).
+ *
+ * Never after the bytes committed (PostUploadStepError): there is nothing left to re-send.
+ */
+export function shouldParkForWake(
+  err: unknown,
+  reason: string | null | undefined,
+  message: string | null | undefined,
+  asleep: boolean,
+): boolean {
+  if (err instanceof PostUploadStepError) return false;
+  if (isRestModeReason(reason)) return true;
+  // canSendHelper: the wake brings the helper back (by itself or by the user's loader); what
+  // this build can send is beside the point while the console sleeps.
+  return asleep && isAutoRecoverable(reason, message, { canSendHelper: true });
 }

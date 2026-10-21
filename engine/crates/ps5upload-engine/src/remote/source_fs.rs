@@ -72,9 +72,15 @@ impl RemoteSourceFs {
     }
 }
 
-/// A `PathBuf` holding a server path, back to the `/`-separated string the server takes.
+/// A `PathBuf` holding a server path, back to the `/`-separated string the server takes. Only
+/// on Windows is a `\\` a `PathBuf` separator; elsewhere it is part of a name and stays.
 fn server_path(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
+    let s = p.to_string_lossy();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
 }
 
 fn io_err(e: RemoteError) -> std::io::Error {
@@ -171,25 +177,40 @@ impl SourceFs for RemoteSourceFs {
 
     fn read_dir(&self, p: &Path) -> std::io::Result<Vec<(PathBuf, bool)>> {
         let dir = server_path(p);
+        self.entries(&dir)?
+            .into_iter()
+            .map(|e| {
+                let child = super::path::join(&dir, &e.name).map_err(|err| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string())
+                })?;
+                Ok((PathBuf::from(child), e.is_dir))
+            })
+            .collect()
+    }
+}
+
+impl RemoteSourceFs {
+    /// Every entry of the server folder `dir` (a server path), names exactly as the server
+    /// gave them. Remembered for the stats that follow.
+    pub fn entries(&self, dir: &str) -> std::io::Result<Vec<super::Entry>> {
         let mut out = Vec::new();
         let mut cursor = None;
         loop {
             let page = self
                 .handle
                 .block_on(self.pool.with_fs(&self.store, &self.id, |fs| {
-                    let (dir, cursor) = (dir.clone(), cursor.clone());
+                    let (dir, cursor) = (dir.to_string(), cursor.clone());
                     async move { fs.list(&dir, cursor).await }
                 }))
                 .map_err(io_err)?;
             for e in page.entries {
-                let child = super::path::join(&dir, &e.name).map_err(|err| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string())
-                })?;
-                self.known
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(child.clone(), (e.size, e.is_dir, e.mtime));
-                out.push((PathBuf::from(child), e.is_dir));
+                if let Ok(child) = super::path::join(dir, &e.name) {
+                    self.known
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(child, (e.size, e.is_dir, e.mtime));
+                }
+                out.push(e);
             }
             match page.next_cursor {
                 Some(c) => cursor = Some(c),

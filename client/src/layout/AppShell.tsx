@@ -25,6 +25,7 @@ import { usePayloadPlaylistsStore } from "../state/payloadPlaylists";
 import { log } from "../state/logs";
 import { playlistResendsOurHelper } from "../lib/playlistOps";
 import { useAutoSaveBackup } from "./useAutoSaveBackup";
+import { useConsoleHandoff } from "./useConsoleHandoff";
 import {
   autoRunStillLoaded,
   bootEpochMs,
@@ -40,8 +41,10 @@ import {
 import { useUpdateStore } from "../state/update";
 import { engineApi } from "../api/engine";
 import { fetchHwPower, payloadCheck, portCheck, procListGet } from "../api/ps5";
+import { keepAwakeTargets, powerFromCheck } from "../lib/consolePower";
 import { sessionNeedsAttention } from "../lib/consoleSession";
 import { installActivityWiring } from "../state/activityWiring";
+import { installBgWork } from "../lib/bgWork";
 import { installTaskWiring } from "../state/taskWiring";
 import {
   ensureRosterMigrated,
@@ -98,6 +101,7 @@ import {
 import { useTransferStore } from "../state/transfer";
 import { useUploadSettingsStore } from "../state/uploadSettings";
 import { ensurePayloadCurrent } from "../lib/ensurePayloadCurrent";
+import { isHelperStopped, noteHelperAnswering } from "../state/helperStopped";
 import { guardElfldr } from "../lib/elfldrGuard";
 import { installPlayTimeAccumulator } from "../state/playTime";
 import { installRunningWatch } from "../state/runningWatch";
@@ -378,7 +382,7 @@ function useStatusPolling() {
         if (sent !== null && sent !== prevSent) {
           transferProgressRef.current[key] = sent;
           missCountRef.current[key] = 0;
-          setHostStatus(probedHost, { payloadStatus: "up" });
+          setHostStatus(probedHost, { payloadStatus: "up", power: "awake" });
           if (isActive(key)) setStatus({ payloadProbing: false });
           return;
         }
@@ -431,12 +435,32 @@ function useStatusPolling() {
         // unreachable one only flips to "down" after MISS_THRESHOLD misses in
         // a row, so one busy/jittery poll holds the last-known "up".
         let newStatus: "up" | "down";
+        // Awake, in rest mode or not answering, from the same reply (lib/consolePower).
+        const power = powerFromCheck(s) ?? prev.power;
+        if (power !== prev.power && (power === "rest" || prev.power === "rest")) {
+          log.info(
+            "connection",
+            power === "rest"
+              ? `${probedHost} is in rest mode`
+              : `${probedHost} is out of rest mode (${power})`,
+          );
+        }
         // A console that answers but wants pairing HAS a helper
         // running: calling it down would arm the auto-redeploy loop below against a live
         // console. Only the session state says what the person has to do about it.
         if (s.reachable || sessionNeedsAttention(s.session)) {
           missCountRef.current[key] = 0;
           newStatus = "up";
+          // A helper answering well after the user stopped it was started another way: the
+          // console is not "stopped by you" any more (state/helperStopped).
+          if (noteHelperAnswering(probedHost))
+            log.info("connection", `${probedHost}'s helper is running again — no longer marked stopped`);
+        } else if (power === "rest") {
+          // The console said it is asleep (DDP 620): that is not a dropped poll to ride
+          // out, and the helper died with the sleep. Down now, calmly (the screens say
+          // "in rest mode", not "helper isn't running").
+          missCountRef.current[key] = PROBE_MISS_THRESHOLD;
+          newStatus = "down";
         } else {
           const misses = (missCountRef.current[key] ?? 0) + 1;
           missCountRef.current[key] = misses;
@@ -583,6 +607,7 @@ function useStatusPolling() {
           // The one probe's verdict. Never carried over: a stale "connected" would
           // hide a console that needs pairing.
           session: s.session,
+          power,
         });
         // Clear the active console's "rechecking…" flag once its probe lands.
         if (isActive(key)) setStatus({ payloadProbing: false });
@@ -758,6 +783,11 @@ function useAutoRedeployDownHelpers() {
           );
           return;
         }
+        // Asleep (DDP 620): nothing to send to until it wakes, and no port probes either.
+        if (powerFromCheck(fresh) === "rest") {
+          useConnectionStore.getState().setHostStatus(host, { power: "rest" });
+          return;
+        }
         // ── A helper that still owns our ports is alive ─────────────────
         //
         // STATUS can fail while the helper runs (one listener down, a busy
@@ -866,6 +896,9 @@ function useAutoRedeployDownHelpers() {
           status: runtimeByHost[key]?.payloadStatus,
           busy: transferScreenBusy(h),
           delivered: deliveredRef.current[key] ?? 0,
+          // The user stopped this helper (Connection → Stop helper): it stays off (#471).
+          stopped: isHelperStopped(h),
+          power: runtimeByHost[key]?.power,
         });
         if (decision === "rearm") {
           liveHoldsRef.current[key] = 0;
@@ -990,7 +1023,8 @@ function useKeepPs5Awake() {
           if (rt.payloadStatus === "up" && h && h !== "_") hosts.add(h);
         }
       }
-      for (const h of hosts) {
+      const runtimes = useConnectionStore.getState().runtimeByHost;
+      for (const h of keepAwakeTargets(hosts, runtimes)) {
         void powerTick(mgmtAddr(h)).catch(() => {
           // best-effort — payload may be momentarily down during recovery
         });
@@ -1363,6 +1397,7 @@ export default function AppShell() {
   }, []);
   useStatusPolling();
   useAutoSaveBackup();
+  useConsoleHandoff();
   useAutoRedeployDownHelpers();
   useMovedConsoleWatch();
   useUpdateCheckOnMount();
@@ -1378,6 +1413,9 @@ export default function AppShell() {
   // call on every render because installActivityWiring is idempotent.
   useEffect(() => {
     installActivityWiring();
+    // The host's background watcher: job names, page visibility, notification
+    // texts, and its wake-ups for the queue (#457). Idempotent; no-op in a browser.
+    installBgWork();
     // Subscribe-once: wires the same per-feature stores into the
     // unified Task store (v5 §10). Idempotent — safe to call repeatedly.
     installTaskWiring();

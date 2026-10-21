@@ -412,6 +412,24 @@ impl SessionGate {
         })
     }
 
+    /// The failure of a job that made no durable progress for [`STALL_LIMIT`]: a console that
+    /// DDP says is in rest mode (620) is `console_rest_mode`, so the client waits for the wake
+    /// instead of spending a recovery attempt; anything else is the plain stall (`bare`).
+    /// Blocking for up to about 800 ms (one DDP probe), once, at the end of the job.
+    pub(crate) fn stalled(pool: &Pool, console: &str, bare: String) -> anyhow::Error {
+        if pool.ddp_code(console) == Some(ps5upload_core::ddp::CODE_STANDBY) {
+            let f = crate::console::console_rest_mode();
+            pool.note_verdict(
+                console,
+                &f.reason,
+                &f.detail,
+                Some(ps5upload_core::ddp::Power::Rest),
+            );
+            return f.into();
+        }
+        anyhow::anyhow!(bare)
+    }
+
     /// A session was opened.
     pub(crate) fn connected(&mut self) {
         self.terminal = 0;
@@ -606,6 +624,15 @@ fn source_for(cfg: &TransferConfig, root: &Path) -> Arc<dyn Source> {
     }
 }
 
+/// [`source_for`] a folder upload, with the config's renames applied.
+fn dir_source_for(cfg: &TransferConfig, root: &Path) -> Arc<dyn Source> {
+    let source = source_for(cfg, root);
+    if cfg.renames.is_empty() {
+        return source;
+    }
+    Arc::new(crate::source::RenamedSource::new(source, &cfg.renames))
+}
+
 /// One upload, retried across connection loss with the same `job_id`: the console's
 /// journal resumes the job, and durable progress bounds the retries.
 pub fn upload_with_in(
@@ -667,8 +694,10 @@ pub fn upload_with_seq_in(
             if durable > last_durable {
                 (last_at, last_durable) = (Instant::now(), durable);
             } else if last_at.elapsed() > STALL_LIMIT {
-                return Err(anyhow!(
-                    "no durable progress for {STALL_LIMIT:?}; giving up"
+                return Err(SessionGate::stalled(
+                    pool,
+                    console,
+                    format!("no durable progress for {STALL_LIMIT:?}; giving up"),
                 ));
             }
             let session = match pool.session(console).await {
@@ -898,7 +927,7 @@ pub fn upload_dir_in(
     dest_root: &str,
     src_dir: &Path,
 ) -> Result<TransferResult> {
-    let source = source_for(cfg, src_dir);
+    let source = dir_source_for(cfg, src_dir);
     let excludes = cfg.excludes.clone();
     // The same matcher the engine uses, so excludes behave identically.
     let manifest = manifest::walk(source.as_ref(), &|p: &str| {
@@ -925,7 +954,7 @@ pub fn upload_dir_skip_existing_in(
     src_dir: &Path,
     mode: SkipMode,
 ) -> Result<TransferResult> {
-    let source = source_for(cfg, src_dir);
+    let source = dir_source_for(cfg, src_dir);
     let excludes = cfg.excludes.clone();
     let mut manifest = manifest::walk(source.as_ref(), &|p: &str| {
         ps5upload_core::excludes::is_excluded_strings(Path::new(p), &excludes)
@@ -1645,6 +1674,34 @@ mod tests {
             assert!(g.failed(&e).is_none());
             assert!(g.failed(&e).is_none());
             assert_eq!(g.failed(&e).unwrap().reason, reason);
+        }
+    }
+
+    #[test]
+    fn a_stall_on_a_console_in_rest_mode_is_console_rest_mode() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        let pool = Pool::unavailable().with_power_probe(move |h| {
+            seen.lock().unwrap().push(h.to_string());
+            Some(620)
+        });
+        let e = SessionGate::stalled(&pool, "10.0.0.2", "no durable progress".into());
+        let f = e.downcast_ref::<UploadFailure>().expect("a typed failure");
+        assert_eq!(f.reason, "console_rest_mode");
+        assert_eq!(asked.lock().unwrap().as_slice(), ["10.0.0.2"]);
+        assert_eq!(
+            pool.recent_power("10.0.0.2"),
+            Some(ps5upload_core::ddp::Power::Rest)
+        );
+    }
+
+    #[test]
+    fn a_stall_on_an_awake_or_silent_console_stays_the_bare_stall() {
+        for code in [Some(200), None] {
+            let pool = Pool::unavailable().with_power_probe(move |_| code);
+            let e = SessionGate::stalled(&pool, "10.0.0.2", "no durable progress".into());
+            assert!(e.downcast_ref::<UploadFailure>().is_none(), "{code:?}");
+            assert_eq!(e.to_string(), "no durable progress");
         }
     }
 

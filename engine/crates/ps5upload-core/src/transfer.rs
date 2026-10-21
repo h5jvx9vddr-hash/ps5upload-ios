@@ -49,6 +49,10 @@ pub struct TransferConfig {
     /// its next checkpoint and returns a `transfer_cancelled` error instead of finishing.
     /// `None` = never cancel.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Folder uploads: files that land under another name, as (path in the source, path on
+    /// the console), both relative to the folder. Only the last component may differ. Used to
+    /// give a game's modules the letter case its eboot loads them by, which /data enforces.
+    pub renames: Vec<(String, String)>,
 }
 
 impl TransferConfig {
@@ -65,6 +69,7 @@ impl TransferConfig {
             bandwidth_cap_bps: None,
             cancel: None,
             source_fs: None,
+            renames: Vec::new(),
         }
     }
 
@@ -844,7 +849,10 @@ mod rar_support {
                 continue;
             }
             file_count += 1;
-            total_uncompressed += e.unpacked_size;
+            // An unknown-size entry reports a ~2^63 placeholder; summing it
+            // wrapped the total in release builds and broke the client's
+            // space check. Count it as 0, like the planner does.
+            total_uncompressed = add_rar_entry_size(total_uncompressed, e.unpacked_size);
             if let Some(rel) = sanitize_rar_entry(&e.filename) {
                 param_hit = better_param_hit(param_hit, &rel);
             }
@@ -1016,9 +1024,7 @@ mod rar_support {
             {
                 continue;
             }
-            if !rar_size_unknown(e.unpacked_size) {
-                total += e.unpacked_size;
-            }
+            total = add_rar_entry_size(total, e.unpacked_size);
             files.push((rel, e.unpacked_size));
         }
         Ok((total, files))
@@ -1291,6 +1297,17 @@ mod rar_support {
         size >= 1 << 62
     }
 
+    /// Add one entry's declared size to a running total: an unknown size
+    /// (the placeholder above) contributes nothing, and the sum saturates
+    /// rather than wrapping (release builds have no overflow checks).
+    pub(crate) fn add_rar_entry_size(total: u64, size: u64) -> u64 {
+        if rar_size_unknown(size) {
+            total
+        } else {
+            total.saturating_add(size)
+        }
+    }
+
     /// Learn the real size of every unknown-size entry by decoding it once (the
     /// stream's own end and CRC define it). Decodes the whole archive when it is
     /// solid; a non-solid archive only decodes the unknown entries.
@@ -1406,6 +1423,9 @@ mod rar_support {
         fn begin(&mut self, path: &str) -> std::io::Result<()>;
         fn data(&mut self, bytes: &[u8]) -> std::io::Result<()>;
         fn end(&mut self) -> std::io::Result<()>;
+        /// `n` more bytes were decoded only to be discarded (a solid archive's entry the
+        /// walk does not deliver). Lets a sender report a long skip as progress.
+        fn skipped(&mut self, _n: u64) {}
     }
 
     fn classify(e: &UnrarError, encrypted_with_password: bool) -> RarFailKind {
@@ -1528,7 +1548,10 @@ mod rar_support {
                 // Solid: the entry must be decoded to keep the stream aligned, and
                 // RAR_SKIP never calls back, so stop could not be polled. Decode it
                 // through a discarding callback that does.
-                let r = header.read_to_fn(&mut |_: &[u8]| !cancelled());
+                let r = header.read_to_fn(&mut |b: &[u8]| {
+                    sink.skipped(b.len() as u64);
+                    !cancelled()
+                });
                 if cancelled() {
                     return Err(RarWalkError::Cancelled);
                 }
@@ -1577,6 +1600,8 @@ mod rar_support {
                         sink_err = Some(e);
                         return false;
                     }
+                } else {
+                    sink.skipped(bytes.len() as u64);
                 }
                 true
             });
@@ -1624,6 +1649,20 @@ mod rar_support {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("testdata/rar")
                 .join(name)
+        }
+
+        #[test]
+        fn unknown_size_entries_do_not_wrap_the_total() {
+            // RAR5 "size unknown" comes back from UnRAR as INT64NDF.
+            let ndf = 0x7fff_ffff_7fff_ffffu64;
+            let sizes = [10u64, ndf, 20, ndf, ndf, u64::MAX];
+            let total = sizes.iter().fold(0, |t, &s| add_rar_entry_size(t, s));
+            assert_eq!(total, 30, "unknown sizes must be skipped, not summed");
+            assert_eq!(
+                add_rar_entry_size((1 << 62) - 1, (1 << 62) - 1),
+                (1 << 63) - 2
+            );
+            assert_eq!(add_rar_entry_size(u64::MAX - 1, 5), u64::MAX);
         }
 
         // crypted.rar: content-encrypted (names listable without a password),

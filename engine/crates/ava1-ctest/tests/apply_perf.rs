@@ -48,6 +48,20 @@ fn send_large(job: &CApplyJob, id: u32, d: &[u8]) {
     job.root(id, *blake3::hash(d).as_bytes());
 }
 
+/// send_large for the crash tests, as a sender does it: waits for credit, and gives up once
+/// the job takes no more -- it stopped itself at the crash point, or (after the restart) it
+/// committed the partial files on its own and finished. False when it gave up.
+fn send_large_until_over(r: &CRecv, id: u32, d: &[u8]) -> bool {
+    let over = || r.job_stopped() || r.events().lines().any(|l| l.starts_with("done "));
+    let g = GROUP as usize;
+    for o in (0..d.len()).step_by(g).rev() {
+        if r.chunk_when_credit(id, o as u64, &d[o..(o + g).min(d.len())], &over) != 0 {
+            return false;
+        }
+    }
+    r.try_root(id, *blake3::hash(d).as_bytes()) == 0 || over()
+}
+
 #[test]
 fn preallocation_happens_outside_the_job_mutex() {
     // Review 003 §2.1: a 4 GiB preallocation under j->mu stalled the feeder and every other
@@ -153,7 +167,9 @@ fn worker_commit_crash(tag: &str, crash_at: i32) {
     r.manifest(&m);
     r.wait_event("map status=0", 5000);
     for (i, d) in files.iter().enumerate() {
-        send_large(&r, i as u32, d);
+        if !send_large_until_over(&r, i as u32, d) {
+            break;
+        }
     }
     r.wait_stopped(10_000); // the first commit to reach the crash point stopped the job
     let r = r.restart(0);
@@ -163,7 +179,10 @@ fn worker_commit_crash(tag: &str, crash_at: i32) {
     for (i, d) in files.iter().enumerate() {
         if !done.contains(&(i as u32)) {
             // what the sender does for a file the map does not list as done: send it again
-            send_large(&r, i as u32, d);
+            if !send_large_until_over(&r, i as u32, d) {
+                assert!(r.events().contains("\ndone "), "{}", r.events());
+                break;
+            }
         }
     }
     assert_eq!(r.wait(15_000), 0, "{}", r.events());

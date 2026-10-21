@@ -1837,6 +1837,12 @@ async fn run_loop(
                         message: "the sender cancelled".into(),
                     });
                 }
+                // The sender is reading past data this job already holds (SPEC.md §12.8):
+                // progress, and nothing else.
+                gen::SkipProgress::TYPE => {
+                    f.decode::<gen::SkipProgress>().map_err(proto)?;
+                    last_progress = Instant::now();
+                }
                 _ => {}
             },
             Some(Inbound::LaneUp(_)) | Some(Inbound::LaneDown(_)) => {}

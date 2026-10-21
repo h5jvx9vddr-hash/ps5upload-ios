@@ -320,11 +320,23 @@ fn probe_app_pkg_at(addr: &str, app_dir: &str) -> PkgProbe {
 /// Whether app.db lists `title_id`. `Some(true/false)` only when the query
 /// actually returned a row set (`err == None`); `None` when the database
 /// could not be read at all, so an unreadable database never counts as
-/// "the title is absent".
+/// "the title is absent". Likewise a list the helper could only partly
+/// deliver (`truncated`, #473): finding the title there is proof, missing
+/// it is not.
 fn appdb_has_title(addr: &str, title_id: &str) -> Option<bool> {
     match crate::diagnostics::appdb_query(addr) {
-        Ok(list) if list.err.is_none() => Some(list.apps.iter().any(|a| a.title_id == title_id)),
+        Ok(list) if list.err.is_none() => appdb_list_has_title(&list, title_id),
         _ => None,
+    }
+}
+
+fn appdb_list_has_title(list: &crate::diagnostics::AppDbList, title_id: &str) -> Option<bool> {
+    if list.apps.iter().any(|a| a.title_id == title_id) {
+        Some(true)
+    } else if list.truncated {
+        None
+    } else {
+        Some(false)
     }
 }
 
@@ -496,5 +508,48 @@ mod tests {
         assert_eq!(s, "\"download\"");
         let p: InstallPhase = serde_json::from_str("\"done\"").unwrap();
         assert_eq!(p, InstallPhase::Done);
+    }
+}
+
+#[cfg(test)]
+mod appdb_list_has_title_tests {
+    use super::appdb_list_has_title;
+    use crate::diagnostics::{AppDbEntry, AppDbList};
+
+    fn list(ids: &[&str], truncated: bool) -> AppDbList {
+        AppDbList {
+            apps: ids
+                .iter()
+                .map(|t| AppDbEntry {
+                    title_id: t.to_string(),
+                    app_id: 1,
+                    name: String::new(),
+                })
+                .collect(),
+            err: None,
+            source: None,
+            offset: None,
+            next: None,
+            more: None,
+            total: None,
+            truncated,
+        }
+    }
+
+    /// #473: a title missing from a list the helper could not finish is unknown, not absent.
+    #[test]
+    fn a_truncated_list_never_proves_a_title_absent() {
+        assert_eq!(
+            appdb_list_has_title(&list(&["CUSA00001"], true), "CUSA00001"),
+            Some(true)
+        );
+        assert_eq!(
+            appdb_list_has_title(&list(&["CUSA00001"], true), "PPSA00002"),
+            None
+        );
+        assert_eq!(
+            appdb_list_has_title(&list(&["CUSA00001"], false), "PPSA00002"),
+            Some(false)
+        );
     }
 }

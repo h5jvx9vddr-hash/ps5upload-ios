@@ -253,11 +253,69 @@ pub(crate) fn is_transient(e: &RemoteError) -> bool {
     matches!(e, RemoteError::Io(_) | RemoteError::Unreachable(_))
 }
 
+/// `m` with `secret` replaced by "***", as typed and as it appears percent-encoded in a URL.
+/// A secret of four characters or more goes wherever it appears. A shorter one only where it
+/// stands as a whole token (`user:pw@`, `password=pw`, quoted, or right after a `%XX` escape
+/// such as `password%3Dpw`): replacing every "t" of a one-letter password turned "Connection"
+/// into "Connec***ion".
+pub(crate) fn redact(m: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return m.to_string();
+    }
+    let encoded = url_encode(secret);
+    let once = redact_form(m, secret);
+    if encoded == secret {
+        once
+    } else {
+        redact_form(&once, &encoded)
+    }
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn redact_form(m: &str, secret: &str) -> String {
+    if secret.chars().count() >= 4 {
+        return m.replace(secret, "***");
+    }
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    // `%3D` right before: the escape ends there, so the secret starts a token.
+    let after_escape = |i: usize| {
+        let b = m.as_bytes();
+        i >= 3 && b[i - 3] == b'%' && b[i - 2].is_ascii_hexdigit() && b[i - 1].is_ascii_hexdigit()
+    };
+    let mut out = String::with_capacity(m.len());
+    let mut last = 0;
+    for (i, _) in m.match_indices(secret) {
+        if i < last {
+            continue;
+        }
+        let before = m[..i].chars().next_back();
+        let after = m[i + secret.len()..].chars().next();
+        if (!word(before) || after_escape(i)) && !word(after) {
+            out.push_str(&m[last..i]);
+            out.push_str("***");
+            last = i + secret.len();
+        }
+    }
+    out.push_str(&m[last..]);
+    out
+}
+
 /// Replace any secret the server echoed back in an error with "***".
 pub fn scrub(e: RemoteError, secret: &Secret) -> RemoteError {
     let clean = |mut m: String| {
         for s in secret.sensitive() {
-            m = m.replace(s, "***");
+            m = redact(&m, s);
         }
         m
     };
@@ -268,6 +326,8 @@ pub fn scrub(e: RemoteError, secret: &Secret) -> RemoteError {
         RemoteError::Unreachable(m) => RemoteError::Unreachable(clean(m)),
         RemoteError::NotFound(m) => RemoteError::NotFound(clean(m)),
         RemoteError::Io(m) => RemoteError::Io(clean(m)),
+        RemoteError::Exists(m) => RemoteError::Exists(clean(m)),
+        RemoteError::Unsupported(m) => RemoteError::Unsupported(clean(m)),
         e @ RemoteError::HostKey { .. } => e,
     }
 }
@@ -337,6 +397,15 @@ pub(crate) mod testing {
         ) -> Result<Vec<(String, crate::remote::Entry)>, RemoteError> {
             self.0.walk(p, l).await
         }
+        async fn create_dir(&self, p: &str) -> Result<(), RemoteError> {
+            self.0.create_dir(p).await
+        }
+        async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteError> {
+            self.0.rename(from, to).await
+        }
+        async fn remove_dir(&self, p: &str) -> Result<(), RemoteError> {
+            self.0.remove_dir(p).await
+        }
     }
 
     /// A Remote over a fresh temp store and `fs`.
@@ -363,6 +432,35 @@ mod tests {
     use super::*;
     use crate::remote::store::conn;
     use crate::remote::MemFs;
+
+    #[test]
+    fn short_secrets_are_redacted_as_whole_tokens_only() {
+        let pw = |p: &str| Secret::Password { password: p.into() };
+        let e = scrub(
+            RemoteError::Io("Connection error: ftp://t:t@nas/ password=t 't'".into()),
+            &pw("t"),
+        );
+        assert_eq!(
+            e.to_string(),
+            "Connection error: ftp://***:***@nas/ password=*** '***'"
+        );
+        let e = scrub(
+            RemoteError::Auth("login hunter2x refused, bad pw hunter2x".into()),
+            &pw("hunter2x"),
+        );
+        assert_eq!(
+            e.to_string(),
+            "Sign-in failed: login *** refused, bad pw ***"
+        );
+        assert_eq!(redact("abcabc", "abc"), "abcabc");
+        assert_eq!(redact("x abc y", "abc"), "x *** y");
+        assert_eq!(redact("nothing here", ""), "nothing here");
+        // URL-encoded: after an escape, and the secret's own encoded form.
+        assert_eq!(redact("?password%3Dt&x=1", "t"), "?password%3D***&x=1");
+        assert_eq!(redact("ftp://me:a%40b@nas", "a@b"), "ftp://me:***@nas");
+        assert_eq!(redact("user=me&pass=p%26", "p&"), "user=me&pass=***");
+        assert_eq!(redact("Connection to host", "t"), "Connection to host");
+    }
 
     #[tokio::test]
     async fn reuses_a_session_and_drops_it_on_invalidate() {

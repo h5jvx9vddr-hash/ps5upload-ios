@@ -12,6 +12,7 @@ import {
   sendPayload,
 } from "../api/ps5";
 import { log } from "./logs";
+import { importedPlaylists, type PlaylistExport } from "../lib/playlistShare";
 import {
   appendStep,
   DEFAULT_AUTO_LOADER,
@@ -112,6 +113,9 @@ interface PlaylistState {
 
   /** Patch the auto-loader config (enable/disable, choose playlist). */
   setAutoLoader: (patch: Partial<AutoLoaderConfig>) => void;
+  /** Add an exported set's playlists beside these (new ids, names kept apart). Its auto-loader
+   *  choice is taken only when none is set here. Returns how many playlists were added. */
+  importPlaylists: (doc: PlaylistExport) => number;
 }
 
 const SAVE_DEBOUNCE_MS = 300;
@@ -448,6 +452,26 @@ export const usePayloadPlaylistsStore = create<PlaylistState>((set, get) => {
     setAutoLoader(patch) {
       set((s) => ({ autoLoader: { ...s.autoLoader, ...patch } }));
       scheduleSave();
+    },
+
+    importPlaylists(doc) {
+      const s = get();
+      const { playlists, idMap } = importedPlaylists(s.playlists, doc.playlists, newId, Date.now());
+      const here = s.autoLoader;
+      const there = doc.autoLoader;
+      const adopt = !!there && here.playlistId === null && here.bringUpPlaylistId === null;
+      set({
+        playlists: s.playlists.concat(playlists),
+        autoLoader: adopt
+          ? {
+              enabled: there.enabled,
+              playlistId: there.playlistId ? (idMap.get(there.playlistId) ?? null) : null,
+              bringUpPlaylistId: there.bringUpPlaylistId ? (idMap.get(there.bringUpPlaylistId) ?? null) : null,
+            }
+          : here,
+      });
+      scheduleSave();
+      return playlists.length;
     },
   };
 });

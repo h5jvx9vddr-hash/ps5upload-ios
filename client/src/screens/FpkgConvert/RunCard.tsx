@@ -8,7 +8,8 @@ import { CheckCircle2, Circle, ListPlus, Loader2, XCircle } from "lucide-react";
 
 import { Button, Card, Checkbox, ProgressBar, Toggle } from "../../components";
 import type { ConvertThen } from "../../state/convertQueue";
-import { makesImage } from "../../state/fpkgConversion";
+import type { MakeKind } from "../../state/convertPrefs";
+import { makesFolder, makesImage } from "../../state/fpkgConversion";
 import type { InstallMethod, Pipeline, PipelineStage } from "../../state/fpkgConversion";
 import { useTr } from "../../state/lang";
 import { formatBytes } from "../../lib/format";
@@ -76,6 +77,10 @@ export interface RunCardProps {
   onRun: () => void;
   /** The source is a game folder on this computer, so it can become an image here. */
   canImage?: boolean;
+  /** The source is a game image or a package, so it can become a plain folder. */
+  canFolder?: boolean;
+  /** The source is a folder already: there is nothing to unpack. */
+  isFolderSource?: boolean;
   /** One line saying what the run makes, of which game, where (from ① to ③). */
   summary?: string;
   /** Add the current game to the queue, with the same choice. */
@@ -136,8 +141,13 @@ export function RunCard(props: RunCardProps) {
   const rows = stageRows(p, installTask);
   // An image build plans, writes and verifies an image, not a package.
   const image = p.phase !== "idle" && makesImage(p.mode);
+  const folder = p.phase !== "idle" && makesFolder(p.mode);
   const label = (s: PipelineStage) =>
-    image && s === "plan"
+    folder && s === "write"
+      ? tr("fpkg.stage.write_folder", undefined, "Write folder")
+      : folder && s === "verify"
+        ? tr("fpkg.stage.verify_folder", undefined, "Read the folder back")
+        : image && s === "plan"
       ? tr("fpkg.stage.plan_image", undefined, "Plan image")
       : image && s === "write"
         ? tr("fpkg.stage.write_image", undefined, "Write image")
@@ -173,14 +183,18 @@ export function RunCard(props: RunCardProps) {
   if (p.phase === "idle") {
     const c = props.choice;
     const image = c.make === "image";
+    const folder = c.make === "folder";
     const packing = image && lz4Active(c.imageFormat, c.lz4);
     const sends = c.then !== "keep";
-    const canRun = props.canConvert !== false && (!image || !!props.canImage);
-    const runLabel = image
-      ? c.imageCompress && !packing
+    const canRun =
+      props.canConvert !== false && (folder ? !!props.canFolder : !image || !!props.canImage);
+    const runLabel = folder
+      ? tr("fpkg.folder.make", undefined, "Make game folder")
+      : image
+        ? c.imageCompress && !packing
         ? tr("fpkg.image.make_compressed", undefined, "Make compressed image")
-        : tr("fpkg.image.make", undefined, "Make game image")
-      : !sends
+          : tr("fpkg.image.make", undefined, "Make game image")
+        : !sends
         ? tr("fpkg.convertOnly", undefined, "Convert only")
         : props.replaces
           ? tr("fpkg.convertReplace", undefined, "Convert & replace")
@@ -219,6 +233,20 @@ export function RunCard(props: RunCardProps) {
               )}
             </div>
           )}
+          {folder && props.isFolderSource && (
+            <div className="text-xs text-[var(--color-muted)]" data-testid="folder-already">
+              {tr("fpkg.folder.already", undefined, "This is already a folder")}
+            </div>
+          )}
+          {folder && !props.isFolderSource && !props.canFolder && props.canConvert !== false && (
+            <div className="text-xs text-[var(--color-muted)]">
+              {tr(
+                "fpkg.folder.sourceOnly",
+                undefined,
+                "Only a game image or a package made with the debug key can become a folder; unpack an archive first.",
+              )}
+            </div>
+          )}
           {props.replaces && props.canInstall && !image && sends && (
             <div className="text-xs text-[var(--color-muted)]">
               {tr(
@@ -228,7 +256,7 @@ export function RunCard(props: RunCardProps) {
               )}
             </div>
           )}
-          {!props.canInstall && (
+          {!props.canInstall && !folder && (
             <div className="text-xs text-[var(--color-muted)]">
               {tr("fpkg.needConsole", undefined, "Connect to a PS5 to install.")}
             </div>
@@ -375,11 +403,13 @@ export function RunCard(props: RunCardProps) {
                     undefined,
                     "Game image written and read back. Copy it to a PS5 drive (Upload) and ShadowMount+ will mount it.",
                   )
-                : tr("fpkg.done", undefined, "Package written")}
+                : folder
+                  ? tr("fpkg.folder.done", undefined, "Game folder written and read back.")
+                  : tr("fpkg.done", undefined, "Package written")}
         </div>
         <div className="text-sm text-[var(--color-muted)]">
           {p.packageBytes > 0 && <span>{prettyBytes(p.packageBytes)}</span>}
-          {p.packageBytes > 0 && props.sourceBytes ? (
+          {p.packageBytes > 0 && props.sourceBytes && !folder ? (
             <span>
               {" "}
               {tr(
@@ -427,7 +457,7 @@ export function RunCard(props: RunCardProps) {
             </div>
           </div>
         )}
-        {!p.deleted && !makesImage(p.mode) && installChoice(!installed)}
+        {!p.deleted && !makesImage(p.mode) && !folder && installChoice(!installed)}
         {!p.deleted && makesImage(p.mode) && (
           <ImageUpload
             queued={!!p.uploadQueued}
@@ -445,10 +475,10 @@ export function RunCard(props: RunCardProps) {
           {!p.deleted && props.onShowFolder && (
             <Button onClick={props.onShowFolder}>{tr("fpkg.showFolder", undefined, "Show in folder")}</Button>
           )}
-          {!p.deleted && !makesImage(p.mode) && props.onViewPackage && (
+          {!p.deleted && !makesImage(p.mode) && !folder && props.onViewPackage && (
             <Button onClick={props.onViewPackage}>{tr("viewer_open", undefined, "View details")}</Button>
           )}
-          {!p.deleted && !makesImage(p.mode) && (
+          {!p.deleted && !makesImage(p.mode) && !folder && (
             <Button variant="danger" onClick={props.onDelete}>
               {props.deleteArmed
                 ? tr("fpkg.confirmDelete", undefined, deleteLabel(true))
@@ -525,8 +555,8 @@ function ImageUpload({
  *  the queue alike. What to make is chosen under ② and the image's own options under ③;
  *  this card asks what happens after, and runs. */
 export interface OutputChoiceProps {
-  make: "pkg" | "image";
-  onMake: (make: "pkg" | "image") => void;
+  make: MakeKind;
+  onMake: (make: MakeKind) => void;
   /** The image picked (format, compressed into a .ffpfsc). */
   imageFormat: ImageFormat;
   imageCompress: boolean;
@@ -556,7 +586,9 @@ function OutputChoice(c: OutputChoiceProps) {
             className="select w-auto!"
             data-testid="convert-then"
           >
-            {image ? (
+            {c.make === "folder" ? (
+              <option value="keep">{tr("cq_then_keep_folder", undefined, "Keep the folder")}</option>
+            ) : image ? (
               <>
                 <option value="keep">{tr("cq_then_keep_image", undefined, "Keep the image")}</option>
                 <option value="upload" disabled={!c.canInstall}>

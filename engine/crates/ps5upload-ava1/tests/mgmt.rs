@@ -719,6 +719,8 @@ async fn a_console_without_cap_mgmt_is_helper_not_ava1_without_a_request() {
     for m in [m::HW_INFO, m::FS_LIST, m::NODE_STATUS] {
         let e = call(&t, c, m, "X", b"{}", T).await.unwrap_err();
         assert!(e.to_string().contains("helper_not_ava1"), "{e}");
+        // The message says which: an older helper, not "not running or an old version".
+        assert!(e.to_string().contains("older ps5upload helper"), "{e}");
     }
     assert_eq!(
         n.load(Ordering::SeqCst),
@@ -770,6 +772,9 @@ async fn an_unreachable_console_is_helper_not_ava1() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("helper_not_ava1"), "{e}");
+    // Status checks say whether the loader is up, as a job does (#447), not the vague
+    // "not running or is an old version".
+    assert!(e.to_string().contains("port 9021"), "{e}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

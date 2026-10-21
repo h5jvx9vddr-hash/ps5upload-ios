@@ -22,6 +22,15 @@ function whenIdle(): Promise<void> {
 async function build(item: ConvertItem) {
   await whenIdle();
   const conv = useFpkgConversion.getState();
+  if (item.build?.kind === "folder") {
+    // A plain folder from an image or package: kept here, nothing to hand on.
+    await conv.buildFolder(item.source, item.outputDir);
+    await whenIdle();
+    const p = useFpkgConversion.getState().pipeline;
+    if (p.phase === "done") return { ok: true, packagePath: p.packagePath, installed: true };
+    if (p.phase === "failed") return { ok: false, message: p.message };
+    return { ok: false, message: "The build did not start." };
+  }
   if (item.build?.kind === "image") {
     // A game image, in the format picked; sent on to the Upload queue when asked.
     const send = item.then !== "keep" && !!item.host && !!item.imageDest;

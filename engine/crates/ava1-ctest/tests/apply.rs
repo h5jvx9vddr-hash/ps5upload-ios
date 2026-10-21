@@ -756,3 +756,63 @@ fn a_sync_batch_that_runs_out_of_memory_gives_its_pending_slots_back() {
         "the failed batch leaked its pending-fd reservations"
     );
 }
+
+/// Waits up to 5 s for `p` to exist.
+fn appears(p: &Path) -> bool {
+    let t = std::time::Instant::now();
+    while t.elapsed().as_secs() < 5 {
+        if p.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+/// A game's param.json is what makes a folder a game to ShadowMount+, which registered a folder
+/// whose eboot.bin was still arriving and then gave up on it. It appears only when the rest has.
+fn param_json_is_placed_last(merge: bool) {
+    let t = tmp(if merge { "held-merge" } else { "held-staged" });
+    let root = t.join("PPSA00001-app");
+    if merge {
+        std::fs::create_dir_all(&root).unwrap();
+    }
+    let base = if merge {
+        root.clone()
+    } else {
+        std::path::PathBuf::from(format!("{}.ava-part", root.display()))
+    };
+    let d = data(3 * GROUP as usize + 5, 7);
+    let m = Manifest {
+        entries: vec![
+            dir("sce_sys"),
+            file("sce_sys/param.json", 2),
+            file("eboot.bin", d.len() as u64),
+        ],
+    };
+    let job = CApplyJob::begin(&t.join("jobs"), &root, 0, &m, 0);
+    job.record(1, b"{}", *blake3::hash(b"{}").as_bytes());
+    assert!(appears(&base.join("sce_sys/param.json.ava-hold")));
+    assert!(
+        !base.join("sce_sys/param.json").exists(),
+        "not before eboot.bin"
+    );
+    send_large(&job, 2, &d, false);
+    assert_eq!(job.wait(10_000), 0, "{}", job.events());
+    assert_eq!(
+        std::fs::read(root.join("sce_sys/param.json")).unwrap(),
+        b"{}"
+    );
+    assert_eq!(std::fs::read(root.join("eboot.bin")).unwrap(), d);
+    assert!(!root.join("sce_sys/param.json.ava-hold").exists());
+}
+
+#[test]
+fn a_games_param_json_appears_only_when_the_staged_tree_lands() {
+    param_json_is_placed_last(false);
+}
+
+#[test]
+fn a_games_param_json_appears_last_in_a_merge_too() {
+    param_json_is_placed_last(true);
+}

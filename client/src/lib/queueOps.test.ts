@@ -96,6 +96,11 @@ describe("resetRunningToPending", () => {
     expect(next[1].bytesPerSec).toBe(0);
   });
 
+  it("marks a stopped running item interrupted, so it offers Resume", () => {
+    const next = resetRunningToPending([runItem("b", "running", 600, 1024, 1)]);
+    expect((next[0] as RunItem & { interrupted?: boolean }).interrupted).toBe(true);
+  });
+
   it("leaves done items untouched (counters preserved)", () => {
     const arr: RunItem[] = [runItem("a", "done", 1024, 1024, 0)];
     const next = resetRunningToPending(arr);

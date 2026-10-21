@@ -78,6 +78,44 @@ describe("MakeCard", () => {
     expect(none).not.toContain("Recommended");
     expect(none).toContain("Check a game under");
   });
+
+  it("offers a game folder as a third choice, never marked as recommended", () => {
+    const out = renderToStaticMarkup(
+      <MakeCard make="folder" onMake={() => {}} kernel="r229358/releases/9.60" contentId="UP9000-PPSA03671_00-X" checked />,
+    );
+    expect((out.match(/role="radio"/g) ?? []).length).toBe(3);
+    expect(out).toContain("A game folder");
+    expect(out).toContain("from a game image or a package made with the debug key");
+    expect(out).toMatch(/aria-checked="true"[^>]*>[\s\S]*?A game folder/);
+    // The one badge is on the package, not the folder.
+    expect(out.match(/Recommended/g)).toHaveLength(1);
+    expect(out).not.toMatch(/A game folder<\/span><span[^>]*>Recommended/);
+  });
+});
+
+describe("OptionsCard for a folder", () => {
+  it("has no compression, image or language choice, only the folder line and verification", () => {
+    const out = renderToStaticMarkup(
+      <OptionsCard
+        outputDir="/out"
+        onChangeOutput={() => {}}
+        onOutputTyped={() => {}}
+        canBrowse
+        compression="balanced"
+        onCompression={() => {}}
+        estimates={undefined}
+        locked={false}
+        make="folder"
+        language=""
+        onLanguage={() => {}}
+      />,
+    );
+    expect(out).toContain("options-folder");
+    expect(out).not.toContain("fpkg-language");
+    expect(out).not.toContain("Balanced");
+    expect(out).not.toContain("options-image");
+    expect(out).toContain("Full verification");
+  });
 });
 
 describe("OptionsCard for an image", () => {
@@ -107,6 +145,26 @@ describe("OptionsCard for an image", () => {
     expect(out).not.toContain("Balanced");
     const pkg = renderToStaticMarkup(<OptionsCard {...props} make="pkg" language="" onLanguage={() => {}} />);
     expect(pkg).toContain("fpkg-language");
+  });
+});
+
+describe("OptionsCard verification", () => {
+  const props = {
+    outputDir: "/out",
+    onChangeOutput: () => {},
+    onOutputTyped: () => {},
+    canBrowse: true,
+    compression: "balanced" as const,
+    onCompression: () => {},
+    estimates: undefined,
+    locked: false,
+  };
+  it("offers full verification, off by default, for a package and for an image", () => {
+    for (const make of ["pkg", "image"] as const) {
+      const out = renderToStaticMarkup(<OptionsCard {...props} make={make} />);
+      expect(out).toContain("Full verification");
+      expect(out).toMatch(/role="switch"[^>]*aria-checked="false"/);
+    }
   });
 });
 
@@ -150,6 +208,12 @@ describe("GameCard firmware line", () => {
   it("names the backport's firmware when the modules allow lower", () => {
     expect(firmwareLine({ ...base, required_firmware: "10.20", min_firmware: "4.00" }, tr)).toBe(
       "Runs on FW 4.00 and later (backported)",
+    );
+  });
+
+  it("does not call an older SDK than declared a backport", () => {
+    expect(firmwareLine({ ...base, required_firmware: "10.20", min_firmware: "9.00" }, tr)).toBe(
+      "Runs on FW 9.00 and later (its modules allow it; it declares 10.20)",
     );
   });
 
@@ -259,7 +323,7 @@ describe("QueueCard adding", () => {
     const html = card();
     expect(html).toContain("Add games from a folder…");
     expect(html).toContain("Pick game folders…");
-    expect(html).toContain("Pick images or archives…");
+    expect(html).toContain("Pick packages, images or archives…");
   });
 
   it("takes what to make and what to do after from ③, with no second set of choices", () => {
@@ -282,9 +346,11 @@ describe("QueueCard adding", () => {
       item("old"),
       item("small", { kind: "image", format: "ffpfs", compress: true }),
       item("plain", { kind: "image", format: "exfat", compress: false }),
+      item("back", { kind: "folder" }),
     ]);
     expect(html).toContain(".pkg");
     expect(html).toContain(".ffpfsc");
     expect(html).toContain(".exfat");
+    expect(html).toMatch(/data-testid="cq-ext"[^>]*>folder</);
   });
 });

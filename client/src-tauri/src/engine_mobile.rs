@@ -37,6 +37,13 @@ const BIND: &str = "0.0.0.0:19113";
 /// The renderer's engine-status tick tolerates the brief startup race
 /// (it retries), matching how the desktop readiness probe is advisory.
 pub async fn start(app: &AppHandle) -> Result<&'static str> {
+    // Android can run setup again when its Activity is recreated while the process lives on;
+    // the engine from the first run still holds the port, and a second bind would only fail
+    // and tell the renderer the engine did not start.
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return Ok(DEFAULT_ENGINE_URL);
+    }
     point_engine_at_app_data(app);
     let app = app.clone();
     tokio::spawn(async move {

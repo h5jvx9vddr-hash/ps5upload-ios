@@ -14,7 +14,10 @@ use ava1::Ava1Error;
 use crate::pool::{pool, Pool};
 use crate::upload::{terminal_connection_reason, UploadFailure};
 
+pub use ps5upload_core::ddp::Power;
+use ps5upload_core::ddp::{CODE_AWAKE, CODE_STANDBY};
 pub use ps5upload_core::mgmt::{
+    AVA1_UNREACHABLE, CONSOLE_NOT_ANSWERING_MESSAGE, CONSOLE_REST_MODE, CONSOLE_REST_MODE_MESSAGE,
     HELPER_NOT_AVA1, HELPER_NOT_AVA1_MESSAGE, NOT_PAIRED, NOT_PAIRED_MESSAGE,
 };
 
@@ -112,28 +115,108 @@ pub fn require_in(pool: &Pool, console: &str, cap: u64) -> Result<(), UploadFail
     }
     let session =
         crate::block_on(async { tokio::time::timeout(PROBE_TIMEOUT, pool.session(console)).await });
-    let failure = match session {
-        Err(_) => UploadFailure {
-            reason: "ava1_unreachable".into(),
-            detail: "the console did not answer on the AVA1 port in time".into(),
-        },
+    let (failure, power) = match session {
+        // Nothing answered in time: rest mode with DDP up, or off / another network.
+        Err(_) => silent(
+            pool,
+            console,
+            "the console did not answer on the AVA1 port in time",
+        ),
+        Ok(Err(e)) if no_tcp_answer(&e) => {
+            silent(pool, console, &format!("could not reach the console: {e}"))
+        }
         // Nothing on the helper's port: say whether the loader is up, which decides what the
         // person does next (#447: "not running or an old version" sent people in circles).
         Ok(Err(Ava1Error::Io(io))) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
             if loader_listening(&pool.addr_for(console)) {
-                helper_not_ava1_because(HELPER_DOWN_LOADER_UP_MESSAGE)
+                (
+                    helper_not_ava1_because(HELPER_DOWN_LOADER_UP_MESSAGE),
+                    Some(Power::Awake),
+                )
             } else {
-                helper_not_ava1_because(HELPER_DOWN_LOADER_DOWN_MESSAGE)
+                // Both refused: a console in rest mode refuses every port. DDP tells it from
+                // an awake console with no loader up.
+                match pool.ddp_code(console) {
+                    Some(CODE_STANDBY) => (console_rest_mode(), Some(Power::Rest)),
+                    Some(CODE_AWAKE) => (
+                        helper_not_ava1_because(HELPER_DOWN_LOADER_DOWN_MESSAGE),
+                        Some(Power::Awake),
+                    ),
+                    _ => (
+                        helper_not_ava1_because(HELPER_DOWN_LOADER_DOWN_MESSAGE),
+                        None,
+                    ),
+                }
             }
         }
-        Ok(Err(e)) => classify(&e),
+        Ok(Err(e)) => (classify(&e), None),
         Ok(Ok(s)) if s.peer_caps() & cap == cap => return Ok(()),
         // It answered but does not serve what this app needs: an older helper. Not cached:
         // the session is live and asking again costs nothing.
         Ok(Ok(_)) => return Err(helper_not_ava1_because(HELPER_TOO_OLD_MESSAGE)),
     };
-    pool.note_refusal(console, &failure.reason, &failure.detail);
+    pool.note_verdict(console, &failure.reason, &failure.detail, power);
     Err(failure)
+}
+
+/// A session attempt that got no TCP answer at all (as opposed to a refusal): a timeout, or
+/// no route to the host. The console is off, elsewhere, or asleep.
+fn no_tcp_answer(e: &Ava1Error) -> bool {
+    use std::io::ErrorKind::{HostUnreachable, NetworkDown, NetworkUnreachable, TimedOut};
+    match e {
+        Ava1Error::Timeout => true,
+        Ava1Error::Io(io) => {
+            matches!(
+                io.kind(),
+                TimedOut | HostUnreachable | NetworkUnreachable | NetworkDown
+            ) || ps5upload_core::ddp::host_is_down(io)
+        }
+        _ => false,
+    }
+}
+
+/// The failure for a console that gave no TCP answer, explained by DDP: rest mode on 620,
+/// "not answering" on silence, and the plain `ava1_unreachable` (with `detail`) when DDP says
+/// it is awake (something else is wrong on the way).
+fn silent(pool: &Pool, console: &str, detail: &str) -> (UploadFailure, Option<Power>) {
+    match pool.ddp_code(console) {
+        Some(CODE_STANDBY) => (console_rest_mode(), Some(Power::Rest)),
+        Some(CODE_AWAKE) => (
+            UploadFailure {
+                reason: AVA1_UNREACHABLE.into(),
+                detail: detail.into(),
+            },
+            Some(Power::Awake),
+        ),
+        Some(_) => (
+            UploadFailure {
+                reason: AVA1_UNREACHABLE.into(),
+                detail: detail.into(),
+            },
+            None,
+        ),
+        None => (
+            UploadFailure {
+                reason: AVA1_UNREACHABLE.into(),
+                detail: CONSOLE_NOT_ANSWERING_MESSAGE.into(),
+            },
+            Some(Power::Unreachable),
+        ),
+    }
+}
+
+/// The console is in rest mode (DDP answered 620): not a fault, waking it is the fix.
+pub fn console_rest_mode() -> UploadFailure {
+    UploadFailure {
+        reason: CONSOLE_REST_MODE.into(),
+        detail: CONSOLE_REST_MODE_MESSAGE.into(),
+    }
+}
+
+/// What DDP said about `console`'s power when its last session attempt on the process's pool
+/// failed, while that failure is remembered (`None`: not asked, or no fresh failure).
+pub fn recent_power(console: &str) -> Option<Power> {
+    pool().recent_power(console)
 }
 
 /// [`require_in`] on the process's pool, for the data plane (uploads and downloads).
@@ -144,6 +227,15 @@ pub fn require_ava1(console: &str) -> Result<(), UploadFailure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn host_is_down_counts_as_no_tcp_answer() {
+        let e = Ava1Error::Io(std::io::Error::from_raw_os_error(libc::EHOSTDOWN));
+        assert!(no_tcp_answer(&e));
+        let refused = Ava1Error::Io(std::io::ErrorKind::ConnectionRefused.into());
+        assert!(!no_tcp_answer(&refused));
+    }
 
     #[test]
     fn nothing_listening_is_helper_not_ava1_with_the_exact_message() {
@@ -180,5 +272,138 @@ mod tests {
     fn a_missing_identity_is_unreachable_not_a_pairing_prompt() {
         let f = require_in(&Pool::unavailable(), "c", gen::CAP_DATA_PLANE).unwrap_err();
         assert_eq!(f.reason, "ava1_unreachable");
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A pool whose every console refuses at once (port 1) and whose DDP answers `code`;
+    /// the counter is how many times DDP was asked.
+    fn refusing(tag: &str, code: Option<u16>) -> (Pool, Arc<AtomicUsize>, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("p5a-rest-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let n = asked.clone();
+        let p = Pool::new(d.join("ava"))
+            .with_addr("127.0.0.1:1")
+            .with_power_probe(move |_| {
+                n.fetch_add(1, Ordering::SeqCst);
+                code
+            });
+        (p, asked, d)
+    }
+
+    /// A listener that never accepts: the TCP connect completes from the backlog and the
+    /// handshake is never answered, so the session attempt times out (`PROBE_TIMEOUT`).
+    fn silent_listener() -> (std::net::TcpListener, String) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = l.local_addr().unwrap().to_string();
+        (l, a)
+    }
+
+    #[test]
+    fn refused_everywhere_and_ddp_620_is_rest_mode() {
+        let (p, asked, d) = refusing("620", Some(620));
+        // A loader on this machine's 9021 would make it the "send the helper" answer instead.
+        if loader_listening("127.0.0.1:1") {
+            return;
+        }
+        let f = require_in(&p, "c", gen::CAP_DATA_PLANE).unwrap_err();
+        assert_eq!(f.reason, "console_rest_mode");
+        assert_eq!(
+            f.detail,
+            "The PS5 is in rest mode. Wake it, and the helper can be sent again."
+        );
+        assert_eq!(p.recent_power("c"), Some(Power::Rest));
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ddp_200_or_silence_keeps_the_old_refusal() {
+        if loader_listening("127.0.0.1:1") {
+            return;
+        }
+        for (tag, code, power) in [("200", Some(200), Some(Power::Awake)), ("none", None, None)] {
+            let (p, _, d) = refusing(tag, code);
+            let f = require_in(&p, "c", gen::CAP_DATA_PLANE).unwrap_err();
+            assert_eq!(f.reason, "helper_not_ava1", "{tag}");
+            assert_eq!(f.detail, HELPER_DOWN_LOADER_DOWN_MESSAGE, "{tag}");
+            assert_eq!(p.recent_power("c"), power, "{tag}");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn a_timeout_with_no_ddp_reply_is_unreachable_in_plain_words() {
+        let (_l, addr) = silent_listener();
+        let d = std::env::temp_dir().join(format!("p5a-rest-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let p = Pool::new(d.join("ava"))
+            .with_addr(addr)
+            .with_power_probe(|_| None);
+        let f = require_in(&p, "c", gen::CAP_DATA_PLANE).unwrap_err();
+        assert_eq!(f.reason, "ava1_unreachable");
+        assert_eq!(
+            f.detail,
+            "The PS5 isn't answering: it's off, on another network, or in rest mode with its network features off."
+        );
+        assert_eq!(p.recent_power("c"), Some(Power::Unreachable));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn no_tcp_answer_is_explained_by_ddp() {
+        let (p, _, d) = refusing("silent", Some(620));
+        assert_eq!(
+            silent(&p, "c", "x").0.reason,
+            "console_rest_mode",
+            "a 620 is rest mode"
+        );
+        let (p, _, d2) = refusing("silent200", Some(200));
+        let (f, power) = silent(&p, "c", "the console did not answer in time");
+        assert_eq!(f.reason, "ava1_unreachable");
+        assert_eq!(f.detail, "the console did not answer in time", "old text");
+        assert_eq!(power, Some(Power::Awake));
+        assert!(no_tcp_answer(&Ava1Error::Timeout));
+        assert!(no_tcp_answer(&Ava1Error::Io(std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        ))));
+        assert!(!no_tcp_answer(&Ava1Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        ))));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn a_rest_verdict_is_remembered_past_the_client_poll() {
+        if loader_listening("127.0.0.1:1") {
+            return;
+        }
+        assert_eq!(crate::pool::PROBED_REFUSAL_TTL, Duration::from_secs(12));
+        assert!(crate::pool::PROBED_REFUSAL_TTL > Duration::from_secs(10));
+        // The plain refusal TTL is zero here: only the probed TTL can hold the answer.
+        let (p, asked, d) = refusing("cache", Some(620));
+        let p = p.with_refusal_ttl(Duration::ZERO);
+        for _ in 0..10 {
+            let f = require_in(&p, "c", gen::CAP_DATA_PLANE).unwrap_err();
+            assert_eq!(f.reason, "console_rest_mode");
+        }
+        assert_eq!(p.attempts(), 1, "ten calls, one dial");
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "ten calls, one DDP probe");
+        // Once the probed TTL is over, the console is asked again.
+        let p = p.with_probed_refusal_ttl(Duration::ZERO);
+        require_in(&p, "c", gen::CAP_DATA_PLANE).unwrap_err();
+        assert_eq!(p.attempts(), 2);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        // A refusal DDP did not explain keeps the plain TTL.
+        let (q, _, d2) = refusing("cache-none", None);
+        let q = q.with_refusal_ttl(Duration::ZERO);
+        require_in(&q, "c", gen::CAP_DATA_PLANE).unwrap_err();
+        require_in(&q, "c", gen::CAP_DATA_PLANE).unwrap_err();
+        assert_eq!(q.attempts(), 2, "an unexplained refusal is not held longer");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
     }
 }

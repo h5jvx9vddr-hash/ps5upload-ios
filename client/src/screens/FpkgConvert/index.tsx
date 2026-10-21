@@ -26,7 +26,13 @@ import { profileNameForHost, useRosterStore } from "../../state/roster";
 import { useWebviewDrop } from "../../lib/useWebviewDrop";
 import { useConnectionStore } from "../../state/connection";
 import { useConvertPrefs } from "../../state/convertPrefs";
-import { isArchiveSource, makesImage, useFpkgConversion } from "../../state/fpkgConversion";
+import {
+  isArchiveSource,
+  isFolderableSource,
+  makesFolder,
+  makesImage,
+  useFpkgConversion,
+} from "../../state/fpkgConversion";
 import { useUploadStore } from "../../state/upload";
 import { DEFAULT_IMAGE_SUBPATH } from "../../lib/imageUpload";
 import { useLocation, useNavigate } from "react-router";
@@ -73,6 +79,7 @@ export default function FpkgConvertScreen() {
   const start = useFpkgConversion((s) => s.start);
   const compress = useFpkgConversion((s) => s.compress);
   const buildImage = useFpkgConversion((s) => s.buildImage);
+  const buildFolder = useFpkgConversion((s) => s.buildFolder);
   const retryInstall = useFpkgConversion((s) => s.retryInstall);
   const cancel = useFpkgConversion((s) => s.cancel);
   const reset = useFpkgConversion((s) => s.reset);
@@ -96,7 +103,7 @@ export default function FpkgConvertScreen() {
   const setImageChoice = useConvertPrefs((s) => s.setImageChoice);
   useEffect(() => {
     if (pipeline.phase === "running") {
-      const building = makesImage(pipeline.mode) ? "image" : "pkg";
+      const building = makesFolder(pipeline.mode) ? "folder" : makesImage(pipeline.mode) ? "image" : "pkg";
       if (building !== make) setMake(building);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -108,15 +115,21 @@ export default function FpkgConvertScreen() {
   const [lz4Profile, setLz4Profile] = useState<{ name: string; text: string } | null>(null);
   const [lz4InstallRuntime, setLz4InstallRuntime] = useState(false);
   const build: ConvertBuild =
-    make === "image" ? { kind: "image", format: imageFormat, compress: imageCompress } : { kind: "pkg" };
+    make === "image"
+      ? { kind: "image", format: imageFormat, compress: imageCompress }
+      : make === "folder"
+        ? { kind: "folder" }
+        : { kind: "pkg" };
   const then = thenFor(build.kind, thenChoice, canInstall);
-  /** "skipped": an image was asked for a source that is not a game folder here. */
+  /** "skipped": an image was asked for a source that is not a game folder here, or a folder
+   *  for one that is not an image or package. */
   const queueAdd = (
     src: string,
     isFolder: boolean,
     lz4?: AmprLz4Options,
   ): boolean | "skipped" => {
-    if (build.kind === "image" && !isFolder) return "skipped";
+    if (build.kind === "image" && !isFolder && !isFolderableSource(src)) return "skipped";
+    if (build.kind === "folder" && !isFolderableSource(src)) return "skipped";
     const u = useUploadStore.getState();
     return useConvertQueue.getState().add({
       source: src,
@@ -142,25 +155,13 @@ export default function FpkgConvertScreen() {
         tr("cq_not_games", { count: notGames }, "{count} folder(s) were not games and were skipped."),
       );
     const skipped = results.filter((r) => r === "skipped").length;
-    if (skipped)
-      notes.push(
-        tr(
-          "cq_image_folders_only",
-          { count: skipped },
-          "Only a game folder on this computer can become a game image: {count} skipped.",
-        ),
-      );
+    if (skipped) notes.push(skippedText(skipped));
     if (results.some((r) => r === false)) notes.push(tr("cq_already", undefined, "This game is already in the queue."));
     setError(notes.length ? notes.join(" ") : null);
   };
-  const skippedNote = (n: number) =>
-    setError(
-      tr(
-        "cq_image_folders_only",
-        { count: n },
-        "Only a game folder on this computer can become a game image: {count} skipped.",
-      ),
-    );
+  const skippedText = (n: number) =>
+    `${tr("upload_skipped", undefined, "Skipped")}: ${n}`;
+  const skippedNote = (n: number) => setError(skippedText(n));
   // The console's swap journals are read through these; one set per console.
   const swapDeps = useMemo(() => (canInstall ? consoleSwapDeps(host) : null), [canInstall, host]);
   const installTaskId = pipeline.phase === "running" ? pipeline.installTaskId : null;
@@ -274,7 +275,7 @@ export default function FpkgConvertScreen() {
               mode,
               title,
               filters:
-                mode === "file" ? [{ name: "Game image or archive", extensions: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "zip", "7z", "rar"] }] : undefined,
+                mode === "file" ? [{ name: "Game image, package or archive", extensions: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg", "zip", "7z", "rar"] }] : undefined,
             });
         if (picked) chooseSource(picked);
       } catch {
@@ -295,7 +296,7 @@ export default function FpkgConvertScreen() {
     const picked = await pickPath({
       mode: "any",
       title: tr("fpkg.pickConsole", undefined, "Choose a game folder or image on the PS5"),
-      filters: [{ name: "Game image", extensions: ["exfat", "ffpkg", "ffpfsc"] }],
+      filters: [{ name: "Game image or package", extensions: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg"] }],
       source: { console: host },
     });
     if (picked) chooseSource(picked);
@@ -316,6 +317,10 @@ export default function FpkgConvertScreen() {
   const run = () => {
     if (!source.trim()) return;
     setError(null);
+    if (build.kind === "folder") {
+      void buildFolder(src, outputDir.trim() || undefined);
+      return;
+    }
     if (build.kind === "image") {
       const u = useUploadStore.getState();
       void buildImage(
@@ -400,6 +405,10 @@ export default function FpkgConvertScreen() {
   // package build reads it). An archive cannot from here: unpack it first.
   const src = source.trim();
   const isLocalFolder = inspection !== null && !noFiles && !isArchiveSource(src);
+  // A game image or a package can be unpacked into a plain folder, wherever it is; a folder is
+  // one already, and an archive is unpacked first.
+  const canFolder = src !== "" && isFolderableSource(src);
+  const isFolderSource = src !== "" && !canFolder && !isArchiveSource(src);
   // A profile measured from play (the game page's Measure how it plays) is the LZ4 default
   // for this title; a file picked by hand replaces it.
   const measuredFor = titleIdOf(inspection?.content_id);
@@ -498,6 +507,7 @@ export default function FpkgConvertScreen() {
             onMake={(m) => {
               setMake(m);
               if (m === "image" && then === "stream") setThen("upload");
+              if (m === "folder") setThen("keep");
             }}
             kernel={kernel}
             contentId={inspection?.content_id}
@@ -566,6 +576,8 @@ export default function FpkgConvertScreen() {
             }}
             onRun={run}
             canImage={isLocalFolder}
+            canFolder={canFolder}
+            isFolderSource={isFolderSource}
             summary={
               inspection
                 ? tr(
@@ -574,7 +586,9 @@ export default function FpkgConvertScreen() {
                       what:
                         build.kind === "image"
                           ? tr("fpkg.run.what_image", { ext: buildExtension(build) }, "a {ext} game image")
-                          : tr("fpkg.run.what_pkg", undefined, "a package (.pkg)"),
+                          : build.kind === "folder"
+                            ? tr("fpkg.run.what_folder", undefined, "a game folder")
+                            : tr("fpkg.run.what_pkg", undefined, "a package (.pkg)"),
                       title: inspection.title || inspection.content_id || source.trim(),
                       dir: outputDir.trim() || "~/Downloads/fpkgs",
                     },
@@ -608,7 +622,8 @@ export default function FpkgConvertScreen() {
               isTauriEnv() && engineIsOnThisDevice()
                 ? () => {
                     if (pipeline.phase !== "done") return;
-                    const dir = dirOf(pipeline.packagePath);
+                    // A folder build's result is the folder itself: open it.
+                    const dir = makesFolder(pipeline.mode) ? pipeline.packagePath : dirOf(pipeline.packagePath);
                     void openLocalPath(dir).then((ok) => {
                       if (!ok)
                         setError(
@@ -681,7 +696,7 @@ export default function FpkgConvertScreen() {
           void (async () => {
             const picked = await pickPaths({
               title: tr("fpkg.pickImage", undefined, "Choose a game image or archive"),
-              filters: [{ name: "Game image or archive", extensions: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "zip", "7z", "rar"] }],
+              filters: [{ name: "Game image, package or archive", extensions: ["exfat", "ffpkg", "ffpfs", "ffpfsc", "pkg", "zip", "7z", "rar"] }],
             }).catch(() => [] as string[]);
             queueAll(
               picked.map((path) => ({ path, isDir: false })),

@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ava1::gen;
 use ava1::manifest::{self, Entry, Manifest};
@@ -115,6 +116,51 @@ fn read_error(e: io::Error) -> io::Error {
         fault(SevenzFault::Corrupt(format!("an entry is damaged: {e}")))
     } else {
         e
+    }
+}
+
+/// The first failed read of the archive file during a pass. The LZMA decoder (lzma-rust2) does
+/// not pass a read error on: its range coder reads a failed byte as 1 and the stream then fails
+/// as "dist overflow", exactly like a damaged archive (#446: a 70 GB archive on a phone was
+/// reported corrupt, and corruption is never retried). With this, the read error wins.
+#[derive(Clone, Default)]
+struct ReadFailure(Arc<Mutex<Option<(io::ErrorKind, String)>>>);
+
+impl ReadFailure {
+    /// , or the read error behind it when the decoder turned one into "corruption".
+    fn explain(&self, e: io::Error) -> io::Error {
+        let seen = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+        match (seen, fault_of(&e)) {
+            (Some((kind, why)), Some(SevenzFault::Corrupt(_))) => {
+                io::Error::new(kind, format!("reading the archive failed: {why}"))
+            }
+            _ => e,
+        }
+    }
+}
+
+/// The archive file, noting the first read error for [`ReadFailure`].
+struct Tapped {
+    file: File,
+    failure: ReadFailure,
+}
+
+impl Read for Tapped {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let r = self.file.read(buf);
+        if let Err(e) = &r {
+            if e.kind() != io::ErrorKind::Interrupted {
+                let mut seen = self.failure.0.lock().unwrap_or_else(|p| p.into_inner());
+                seen.get_or_insert_with(|| (e.kind(), e.to_string()));
+            }
+        }
+        r
+    }
+}
+
+impl Seek for Tapped {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
     }
 }
 
@@ -416,7 +462,14 @@ impl SeqSource for SevenzSource {
         cancel: &AtomicBool,
     ) -> io::Result<()> {
         let stopped = || io::Error::new(io::ErrorKind::Interrupted, "stopped");
-        let mut src = BufReader::with_capacity(256 << 10, File::open(&self.path)?);
+        let failure = ReadFailure::default();
+        let mut src = BufReader::with_capacity(
+            256 << 10,
+            Tapped {
+                file: File::open(&self.path)?,
+                failure: failure.clone(),
+            },
+        );
         let pw = Password::empty();
         let mut buf = vec![0u8; 256 << 10];
         let first = usize::try_from(restart.0).unwrap_or(usize::MAX);
@@ -438,7 +491,7 @@ impl SeqSource for SevenzSource {
             self.folders_opened.fetch_add(1, Ordering::Relaxed);
             let dec = BlockDecoder::new(self.threads, b, &self.archive, &pw, &mut src);
             let mut j = 0usize;
-            let mut failure: Option<io::Error> = None;
+            let mut failed: Option<io::Error> = None;
             let mut reached_last = false;
             let res = dec.for_each_entries(&mut |entry, rd| {
                 if !entry.has_stream() {
@@ -447,13 +500,13 @@ impl SeqSource for SevenzSource {
                 let i = j;
                 j += 1;
                 let (Some(m), Some(k)) = (members.get(i), keeps.get(i)) else {
-                    failure = Some(fault(SevenzFault::Corrupt(
+                    failed = Some(fault(SevenzFault::Corrupt(
                         "a folder holds more entries than its header lists".into(),
                     )));
                     return Ok(false);
                 };
                 if entry.name() != m.raw {
-                    failure = Some(fault(SevenzFault::Corrupt(format!(
+                    failed = Some(fault(SevenzFault::Corrupt(format!(
                         "the decoder yielded {:?} where the header lists {:?}",
                         entry.name(),
                         m.raw
@@ -461,18 +514,18 @@ impl SeqSource for SevenzSource {
                     return Ok(false);
                 }
                 if let Err(e) = self.feed(m, k, rd, sink, cancel, &mut buf) {
-                    failure = Some(e);
+                    failed = Some(e);
                     return Ok(false);
                 }
                 // Nothing wanted after `last`: do not decode the rest of the folder.
                 reached_last = i >= last;
                 Ok(i < last)
             });
-            if let Some(e) = failure {
-                return Err(e);
+            if let Some(e) = failed {
+                return Err(failure.explain(e));
             }
             if let Err(e) = res {
-                return Err(map_pass_error(e));
+                return Err(failure.explain(map_pass_error(e)));
             }
             if !reached_last {
                 // Stream-less entries inside a folder were refused at open, so this is a
@@ -494,6 +547,10 @@ impl SeqSource for SevenzSource {
 
     fn restart_for(&self, file_id: u32) -> Restart {
         Restart(self.restarts.get(file_id as usize).copied().unwrap_or(0))
+    }
+
+    fn bytes_skipped(&self) -> u64 {
+        SevenzSource::bytes_skipped(self)
     }
 }
 
@@ -557,6 +614,59 @@ mod tests {
             "bcj2 decode error",
         ));
         assert!(matches!(fault_of(&e), Some(SevenzFault::Corrupt(_))));
+    }
+
+    #[test]
+    fn a_failed_archive_read_is_reported_as_itself_not_as_corruption() {
+        // #446: the decoder turns a failed read into "dist overflow"; the job must see the read
+        // error (retryable), not a corrupt archive (terminal).
+        let failure = ReadFailure::default();
+        *failure.0.lock().unwrap() = Some((
+            io::ErrorKind::Other,
+            "Input/output error (os error 5)".into(),
+        ));
+        let e = failure.explain(entry_read_error(
+            io::Error::other("dist overflow"),
+            "a.pak",
+            7,
+        ));
+        assert!(fault_of(&e).is_none(), "{e}");
+        assert!(e.to_string().contains("os error 5"), "{e}");
+        // Without a failed read, a damaged stream is still corruption.
+        let e = ReadFailure::default().explain(entry_read_error(
+            io::Error::other("dist overflow"),
+            "a.pak",
+            7,
+        ));
+        assert!(matches!(fault_of(&e), Some(SevenzFault::Corrupt(_))));
+    }
+
+    #[test]
+    fn the_tap_records_a_real_read_error_and_ignores_interrupts() {
+        struct Fails(io::ErrorKind);
+        impl Read for Fails {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "boom"))
+            }
+        }
+        // Same recording rule as `Tapped::read`, over a reader that can fail.
+        let failure = ReadFailure::default();
+        for kind in [io::ErrorKind::Interrupted, io::ErrorKind::Other] {
+            let r = Fails(kind).read(&mut [0u8; 4]);
+            if let Err(e) = &r {
+                if e.kind() != io::ErrorKind::Interrupted {
+                    failure
+                        .0
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(|| (e.kind(), e.to_string()));
+                }
+            }
+        }
+        assert_eq!(
+            failure.0.lock().unwrap().as_ref().map(|s| s.0),
+            Some(io::ErrorKind::Other)
+        );
     }
 
     #[test]

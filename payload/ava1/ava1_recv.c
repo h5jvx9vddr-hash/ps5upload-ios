@@ -577,8 +577,15 @@ ava1_job_t *ava1_recv_open(const ava1_recv_spec_t *s, ava1_job_open_ack_t *ack, 
         return refuse(ack, AVA1_ERR_BUSY, msg, cap, "the console is finishing this job's files; try again");
     }
     if (j && memcmp(j->owner, s->owner, 32) != 0) {
-        ava1_job_put(j);
-        return refuse(ack, AVA1_ERR_UNKNOWN_JOB, msg, cap, "this job belongs to another device");
+        /* Another device's upload that no session drives (its device paused, lost the link or
+         * handed it over, #444): the journal is keyed by the job alone, so it moves to this
+         * device, reopened below from disk. One a session still drives stays its owner's. */
+        int rc = -1;
+        if (j->kind == AVA1_JOB_UPLOAD) rc = ava1_job_retire_parked(j);
+        else ava1_job_put(j);
+        if (rc == -1) return refuse(ack, AVA1_ERR_UNKNOWN_JOB, msg, cap, "this job belongs to another device");
+        if (rc != 0) return refuse(ack, AVA1_ERR_BUSY, msg, cap, "the job's previous session is still closing; try again");
+        j = NULL;
     }
     if (j) {
         int dead, other;

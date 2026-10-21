@@ -64,6 +64,8 @@ import { useInstallSettingsStore } from "./installSettings";
 import { useConnectionStore } from "./connection";
 import { log } from "./logs";
 import { pushNotification } from "./notifications";
+import { sleep as wakeableSleep } from "../lib/wakeableSleep";
+import { labelEngineJob } from "../lib/bgWork";
 import { installErrorLink } from "../lib/installErrorDoc";
 import { useActivityHistoryStore } from "./activityHistory";
 import {
@@ -1069,6 +1071,8 @@ interface PkgLibraryState {
       onTask?: (taskId: string) => void;
       /** What the queue row is called instead of the file's own name. */
       displayName?: string;
+      category?: string;
+      contentId?: string;
     },
   ) => Promise<{
     ok: boolean;
@@ -1191,7 +1195,8 @@ function mergeListing(prev: PkgEntry[], listed: PkgEntry[]): PkgEntry[] {
   );
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Ended by the host's clock while the window is hidden (see lib/wakeableSleep).
+const sleep = wakeableSleep;
 
 /** Delete a staged pkg with a few retries on a transient payload failure. Right
  *  after an install the staged file can be momentarily busy (Sony's installer
@@ -1664,6 +1669,7 @@ export async function finalizePkgInstallSuccess(args: {
   // play). Surfaces in the bell even if the user navigated away while a
   // large title finished, which is exactly when a heads-up is wanted.
   pushNotification(mayNotLaunch ? "warning" : "success", `${label} installed`, {
+    jobOutcome: true,
     body: mayNotLaunch
       ? PKG_MAY_NOT_LAUNCH_MESSAGE
       : "Installed on the PS5 and ready to play.",
@@ -1928,6 +1934,8 @@ async function driveUnifiedInstall(
   host: string,
   source: InstallSource,
   meta: {
+    /** The game's name for the host's notifications (#457). */
+    label?: string;
     contentId?: string | null;
     titleId?: string | null;
     packageAppVer?: string | null;
@@ -1969,6 +1977,7 @@ async function driveUnifiedInstall(
   }
   const job = start.job;
   reportInstallJob(host, job);
+  labelEngineJob(job, "install", meta.label || meta.titleId || meta.contentId || "");
   // Poll until the engine's state machine is terminal. There is NO client-side
   // deadline: a large install writes for as long as it needs, and the engine
   // reports "done" only when its own verify agrees (the size-blind client timer
@@ -1991,7 +2000,7 @@ async function driveUnifiedInstall(
     const line = describeInstallSample(sample).detail;
     if (line) onStatus?.(line);
     if (st.phase === "done" || st.phase === "failed") return st;
-    await sleep(PKG_VERIFY_POLL_MS);
+    await sleep(PKG_VERIFY_POLL_MS, { poll: true });
   }
 }
 
@@ -2100,6 +2109,7 @@ export async function runPkgInstall(
       host,
       { console_path: localPs5Path },
       {
+        label: name,
         contentId,
         titleId: titleIdFromContentId(contentId ?? "") ?? null,
         packageAppVer: packageAppVer ?? null,
@@ -2821,6 +2831,7 @@ const makePkgLibraryStore = () =>
           // Without this a failed item — an update or DLC especially — was silent
           // if the user navigated away from the Library tab mid-install.
           pushNotification("error", `${label} install failed`, {
+            jobOutcome: true,
             body: mainErr || "The PS5 didn’t confirm the install. Try again.",
             link: installErrorLink(mainErr),
           });
@@ -3204,6 +3215,7 @@ const makePkgLibraryStore = () =>
         });
         try {
           const terminal = await driveUnifiedInstall(host, { url: trimmed }, {
+            label: name,
             contentId: "",
             options: {},
           });
@@ -3471,6 +3483,7 @@ const makePkgLibraryStore = () =>
             host,
             installSource,
             {
+              label,
               contentId: contentId || "",
               titleId: titleIdFromContentId(contentId ?? "") ?? null,
               // The probe's package_type/category; ends in gd/gp/ac like a
@@ -3554,6 +3567,7 @@ const makePkgLibraryStore = () =>
         const outcome = statusToOutcome(terminal);
         if (outcome.installed) {
           pushNotification("success", `Installed ${label}`, {
+            jobOutcome: true,
             body: remoteUrl
               ? "Link install complete. The package was downloaded from the link and fed straight to the console — nothing was staged."
               : "Stream-install complete. The pkg was fetched over HTTP — nothing was staged on the PS5.",
@@ -3604,7 +3618,7 @@ const makePkgLibraryStore = () =>
       const owns = !!onTask && !streamTaskCallbacks.has(key);
       if (owns) streamTaskCallbacks.set(key, onTask);
       try {
-        return await enqueueInstall({ host, request, displayName: name }).done;
+        return await enqueueInstall({ host, request, displayName: name, category: opts?.category, contentId: opts?.contentId }).done;
       } finally {
         // Removed without running (Stop, Clear, refused): don't leak it.
         if (owns && streamTaskCallbacks.get(key) === onTask) streamTaskCallbacks.delete(key);

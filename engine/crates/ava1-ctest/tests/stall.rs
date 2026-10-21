@@ -270,3 +270,74 @@ async fn a_resumed_job_gets_the_resume_limit() {
     srv.knob("progress_ms", 0);
     srv.knob("resume_progress_ms", 0);
 }
+
+/// SkipProgress (SPEC.md §12.8): a resumed sender that is reading past data the receiver already
+/// holds (a solid archive decoded from its start) sends no data frame for a long time, only
+/// SkipProgress. That is progress: the job outlives its progress limit many times over and then
+/// finishes normally. Without the frames the same job is cut (`a_resumed_job_gets_the_resume_limit`).
+#[tokio::test(flavor = "multi_thread")]
+async fn skip_progress_keeps_a_resumed_job_alive_past_its_limit() {
+    let (srv, d, ids) = server("stall-skip", 0);
+    srv.knob("progress_ms", 800);
+    srv.knob("resume_progress_ms", 1500);
+    let job = [0x66; 16];
+    {
+        let (mut link, s) = opened(&srv, &d, ids.clone(), job, 3).await;
+        let lane = link.opener().unwrap().open().await.unwrap();
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, 1, bundle(job, 0, b"one!"))
+            .await
+            .unwrap();
+        loop {
+            if next_control(&mut link).await.ty == Durable::TYPE {
+                break;
+            }
+        }
+        drop(link);
+        s.close().await;
+    }
+    let (mut link, _s) = opened(&srv, &d, ids.clone(), job, 3).await;
+    let lane = link.opener().unwrap().open().await.unwrap();
+    // 4.8 s of nothing but SkipProgress, 3x the resume limit.
+    let t0 = Instant::now();
+    let mut skipped = 0u64;
+    while t0.elapsed() < Duration::from_millis(4800) {
+        skipped += 64 << 20;
+        link.control
+            .send(&gen::SkipProgress {
+                job_id: job,
+                bytes_skipped: skipped,
+            })
+            .await
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(400);
+        while let Ok(ev) = tokio::time::timeout_at(until.into(), link.rx.recv()).await {
+            if let Some(Inbound::Control(f)) = ev {
+                if f.ty == JobDone::TYPE {
+                    let done: JobDone = f.decode().unwrap();
+                    panic!(
+                        "the job ended after {:?} of SkipProgress: {} {:?}",
+                        t0.elapsed(),
+                        done.status,
+                        done.message
+                    );
+                }
+            }
+        }
+    }
+    for (seq, id) in [(1u32, 1u32), (2, 2)] {
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, seq, bundle(job, id, b"more"))
+            .await
+            .unwrap();
+    }
+    let done = job_done(&mut link, Duration::from_secs(30)).await;
+    assert_eq!(done.status, 0, "{:?}", done.message);
+    assert_eq!(std::fs::read(d.join("dest/f2")).unwrap(), b"more");
+    srv.knob("progress_ms", 0);
+    srv.knob("resume_progress_ms", 0);
+}

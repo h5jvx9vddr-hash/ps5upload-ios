@@ -41,6 +41,7 @@ import {
 import { GameIcon } from "../../components/GameIcon";
 import { useTr } from "../../state/lang";
 import { useLibraryStore, libraryForHost } from "../../state/library";
+import { shownGamePath } from "./gamePath";
 import { useConnectionStore } from "../../state/connection";
 import { usePlayTimeStore } from "../../state/playTime";
 import { usePkgLibrary, type PkgEntry } from "../../state/pkgLibrary";
@@ -97,6 +98,7 @@ export default function GameHubScreen() {
   const host = useConnectionStore((s) => s.host);
   const payloadStatus = useConnectionStore((s) => s.payloadStatus);
   const entries = useLibraryStore((s) => libraryForHost(s, host).entries);
+  const mountMap = useLibraryStore((s) => libraryForHost(s, host).mountMap);
   const playTimeState = usePlayTimeStore();
   const [installedTitles, setInstalledTitles] = useState<InstalledTitle[]>([]);
   const gv = useGameView(title_id ?? "");
@@ -140,24 +142,25 @@ export default function GameHubScreen() {
   // Find the game in the library or installed apps
   const game = useMemo(() => {
     if (!title_id) return null;
+    const app = installedTitles.find((a) => a.titleId === title_id);
     // Check library entries first (games on disk)
     const libEntry = entries?.find((e) => e.titleId === title_id);
     if (libEntry) {
       return {
         titleId: title_id,
         name: libEntry.name,
-        path: libEntry.path,
+        // Where the console runs it from, when it is registered (#452).
+        path: shownGamePath(libEntry.path, app, entries, mountMap),
         size: libEntry.size,
         source: "library" as const,
       };
     }
     // Check installed apps (fetched inline from the engine)
-    const app = installedTitles.find((a) => a.titleId === title_id);
     if (app) {
       return {
         titleId: title_id,
         name: app.titleName ?? title_id,
-        path: app.source || "",
+        path: shownGamePath(undefined, app, entries, mountMap),
         size: 0,
         source: "installed" as const,
       };
@@ -173,7 +176,7 @@ export default function GameHubScreen() {
       };
     }
     return null;
-  }, [title_id, entries, installedTitles, gv.view]);
+  }, [title_id, entries, mountMap, installedTitles, gv.view]);
 
   // Same numbers as Game Activity's Tracked tab; the app's own count only when
   // the helper has no tracker to ask.
@@ -903,11 +906,18 @@ function PackagesTab({
       confirmWithoutBase: () =>
         confirm({
           title: tr("pkglib.baseMissing.title", undefined, "Base game isn't installed"),
-          message: tr(
-            "pkglib.baseMissing.body",
-            { kind: what, id: titleId },
-            `This ${what} is for ${titleId}, but its base game isn't installed on the PS5. Sony's installer will accept it, but nothing installs until the base game is on the console — install the base first.`,
-          ),
+          message:
+            e.platform === "ps5"
+              ? tr(
+                  "pkglib.baseMissing.bodyPs5",
+                  { kind: what, id: titleId },
+                  `This ${what} is for ${titleId}, but its base game isn't installed on the PS5. Some PS5 updates carry the whole app and install on their own; if this one can't, the PS5 will say so.`,
+                )
+              : tr(
+                  "pkglib.baseMissing.body",
+                  { kind: what, id: titleId },
+                  `This ${what} is for ${titleId}, but its base game isn't installed on the PS5. Sony's installer will accept it, but nothing installs until the base game is on the console — install the base first.`,
+                ),
           confirmLabel: tr("pkglib.baseMissing.installAnyway", undefined, "Install anyway"),
         }),
     });

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ps5upload_core::payload_lifecycle::{self as pl, join_host_port, LoaderImage};
@@ -106,6 +106,24 @@ pub fn took_over(before: &[i32], now: &[i32], health: Health) -> Option<i32> {
         [pid] if !before.contains(pid) && health == Health::Healthy => Some(*pid),
         _ => None,
     }
+}
+
+/// One loader operation per console at a time. Swapping elfldr leaves :9021 closed while the
+/// new one kills the old and binds, and the app starts that swap in the background right as an
+/// install begins: the install's installer send landed in the gap and failed with "nothing
+/// answered on the ELF loader port", then worked on a retry. Everything this engine sends to
+/// a console's loader holds this lock, so an install waits for a running swap to finish.
+pub fn loader_lock(host: &str) -> Arc<Mutex<()>> {
+    static M: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = crate::pkg_install::strip_host_port(host.trim())
+        .trim()
+        .to_ascii_lowercase();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_default()
+        .clone()
 }
 
 /// The elfldr each console is running that this engine put there, by host.
@@ -223,6 +241,8 @@ pub struct Outcome {
 
 /// Make sure `host` runs the patched elfldr. Needs the helper up (it reads the process list).
 pub fn ensure(host: &str) -> Result<Outcome, String> {
+    let lock = loader_lock(host);
+    let _loader = lock.lock().unwrap_or_else(|e| e.into_inner());
     let mgmt = crate::console_addr(host);
     let before = elfldr_pids(&mgmt)?;
     let mine = installed()
@@ -405,6 +425,14 @@ mod tests {
         // Nothing remembered, or the console cannot say when it booted: as before.
         assert_eq!(remembered_pid(None, Some(1_000_000)), None);
         assert_eq!(remembered_pid(r, None), None);
+    }
+
+    #[test]
+    fn one_loader_lock_per_console_whatever_the_spelling() {
+        let a = loader_lock("192.0.2.7");
+        assert!(Arc::ptr_eq(&a, &loader_lock("192.0.2.7:9120")));
+        assert!(Arc::ptr_eq(&a, &loader_lock(" 192.0.2.7 ")));
+        assert!(!Arc::ptr_eq(&a, &loader_lock("192.0.2.8")));
     }
 
     #[test]

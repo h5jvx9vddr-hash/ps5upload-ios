@@ -499,7 +499,18 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-async fn pkg_upload_handler(mut form: axum::extract::Multipart) -> Response<Body> {
+async fn pkg_upload_handler(form: axum::extract::Multipart) -> Response<Body> {
+    stage_browser_upload(form, true).await
+}
+
+async fn file_upload_handler(form: axum::extract::Multipart) -> Response<Body> {
+    stage_browser_upload(form, false).await
+}
+
+async fn stage_browser_upload(
+    mut form: axum::extract::Multipart,
+    packages_only: bool,
+) -> Response<Body> {
     use tokio::io::AsyncWriteExt;
 
     cleanup_stale_pkg_uploads();
@@ -529,7 +540,7 @@ async fn pkg_upload_handler(mut form: axum::extract::Multipart) -> Response<Body
         };
         let filename = sanitize_pkg_filename(field.file_name().unwrap_or("package.pkg"));
         // The parser validates CNT/FIH magic; the suffix is only a picker hint.
-        if !is_install_package_filename(&filename) {
+        if packages_only && !is_install_package_filename(&filename) {
             continue;
         }
         let dest = dir.join(&filename);
@@ -593,7 +604,7 @@ async fn pkg_upload_handler(mut form: axum::extract::Multipart) -> Response<Body
     let _ = tokio::fs::remove_dir_all(&dir).await;
     json_response(
         StatusCode::BAD_REQUEST,
-        serde_json::json!({ "error": "no .pkg or .fpkg file in the upload" }),
+        serde_json::json!({ "error": if packages_only { "no .pkg or .fpkg file in the upload" } else { "no file in the upload" } }),
     )
 }
 
@@ -697,6 +708,8 @@ async fn payload_restore_handler(Json(req): Json<PayloadRestoreRequest>) -> Resp
     }
     let res = tokio::task::spawn_blocking(move || {
         use ps5upload_core::payload_lifecycle as pl;
+        let lock = crate::elfldr_guard::loader_lock(&ps5_ip);
+        let _loader = lock.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = payload_restore_bytes(
             || crate::bundled_payload::image_bytes(crate::bundled_payload::Image::Payload),
             crate::ava1_api::stamped_helper,
@@ -742,7 +755,13 @@ fn payload_restore_bytes(
     Ok(stamp(&image))
 }
 
+#[cfg(test)]
 pub fn router(state: PkgInstallStateHandle) -> Router {
+    api_router(state.clone()).merge(host_router(state))
+}
+
+/// Browser APIs follow the configured URL prefix; console download URLs do not.
+pub fn api_router(state: PkgInstallStateHandle) -> Router {
     Router::new()
         // Packages routinely exceed the app-wide 64 MiB JSON/form limit.
         // Multipart is consumed incrementally above, so disabling buffering's
@@ -752,6 +771,11 @@ pub fn router(state: PkgInstallStateHandle) -> Router {
             post(pkg_upload_handler).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/pkg/upload/{id}", delete(pkg_upload_delete_handler))
+        .route(
+            "/api/files/upload",
+            post(file_upload_handler).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/files/upload/{id}", delete(pkg_upload_delete_handler))
         .route("/api/pkg/parse-split", post(parse_split_handler))
         // Read-only UFS2 image inspector for .ffpkg / .ufs files.
         // Lets the renderer surface "what's in this image?" before
@@ -800,6 +824,11 @@ pub fn router(state: PkgInstallStateHandle) -> Router {
         // disagree. Read-only; safe to poll from the package list.
         .route("/api/pkg/install/preflight", get(install_preflight_handler))
         .route("/api/pkg/payload-restore", post(payload_restore_handler))
+        .with_state(state)
+}
+
+pub fn host_router(state: PkgInstallStateHandle) -> Router {
+    Router::new()
         // The session UUID is the lookup key. We allow ANY {filename} so the
         // URL can carry the pkg's canonical `<ContentID>.pkg` name that
         // Sony's installer cross-checks against the pkg header. Without
@@ -1202,6 +1231,11 @@ fn artifact_identity_matches(
     expected_fingerprint.is_empty()
 }
 
+/// Whether any installed artifact has exactly `fingerprint` (the package's sampled identity).
+fn exact_bytes_installed(artifacts: &[InstalledPkgArtifact], fingerprint: &str) -> bool {
+    !fingerprint.is_empty() && artifacts.iter().any(|a| a.fingerprint == fingerprint)
+}
+
 /// Verify the exact install target, not merely the shared base title.
 ///
 /// A patch install used to call `verify_launchable(content_id)`, which sees the
@@ -1230,6 +1264,12 @@ fn verify_installed_artifact(
     };
     let wanted_kind = package_kind_for_type(package_type);
     let inventory = installed_pkg_inventory(addr, &title_id);
+    // These exact bytes anywhere for the title are this package, whatever its category says:
+    // a PS5 update that carries the whole app lands as the app (`/user/app/<id>/app.pkg`).
+    // Measured with a YouTube update package (PS5DP) on 13.60.
+    if exact_bytes_installed(&inventory.artifacts, expected_fingerprint) {
+        return InstalledArtifactCheck::Match;
+    }
     let candidates: Vec<_> = inventory
         .artifacts
         .iter()
@@ -1403,8 +1443,12 @@ fn install_preflight(
         let base_present = inventory.artifacts.iter().any(|a| a.kind == "base");
         if !base_present {
             resp.state = "base_missing";
-            resp.detail =
-                "the base game isn't installed, so this can't be applied (Sony accepts the request and then writes nothing)".into();
+            resp.detail = if package_type.starts_with("PS5") {
+                // Not refused (see the install handler): some PS5 updates carry the whole app.
+                "the base game isn't installed; the PS5 may still accept this if it carries the whole app".into()
+            } else {
+                "the base game isn't installed, so this can't be applied (Sony accepts the request and then writes nothing)".into()
+            };
             return resp;
         }
     }
@@ -1898,7 +1942,12 @@ pub(crate) async fn install_start_handler(
     } else {
         "gd"
     };
-    if !req.link_only {
+    // PS4 only. A PS5 update can carry the whole app: a YouTube update package (PS5DP, 101 MB)
+    // installed on a 13.60 console without YouTube through the debug settings' Package
+    // Installer, while this check refused it. The PS5 is left to decide, and its own refusal
+    // (0x80A30004, "the base game is not installed") still reaches the person. Letting it try
+    // is safe: with no base installed there is nothing for an install to replace.
+    if !req.link_only && !package_type.starts_with("PS5") {
         let addr = req.ps5_addr.clone();
         let content_id = head_meta.content_id.clone();
         let cat = category;
@@ -2251,11 +2300,6 @@ fn pkg_session_max_age_sec() -> u64 {
 // advancing install never false-fails; only a genuine flatline trips it, and
 // only when both signals are flat (we track `max(free-drop, dir-size)`).
 
-/// How many granules a package is divided into for transfer progress. Fixed, so
-/// the bitmap stays 8 KiB per session whatever the package size — accuracy far
-/// beyond what a progress bar needs (1/65536 of the package).
-const COVERAGE_GRANULES: u64 = 1 << 16;
-
 /// How much of a package the console has actually received.
 ///
 /// Neither obvious metric works, and both were measured on hardware:
@@ -2268,54 +2312,51 @@ const COVERAGE_GRANULES: u64 = 1 << 16;
 ///     Sony reads the tail (and the header) before the bulk. That made progress
 ///     read 100% at 7% transferred, which is how this was caught.
 ///
-/// A bitmap of granules answers the question that is actually being asked —
-/// "how much of this file has arrived" — and is immune to both out-of-order
-/// ranges and duplicate fetches.
+/// Exact received byte ranges answer the question that is actually being
+/// asked — "how much of this file has arrived" — and are immune to both
+/// out-of-order ranges and duplicate fetches. They must be exact, not a
+/// granule bitmap: completion releases the session, and a lossy bitmap counted
+/// a partly fetched granule as whole, hiding a gap the console still needed.
+/// Sony fetches mostly contiguously, so the span list stays a handful long.
 #[derive(Debug, Clone)]
 pub struct TransferCoverage {
-    /// Bytes per granule: `total / COVERAGE_GRANULES`, rounded up (min 1).
-    granule: u64,
-    words: Vec<u64>,
+    /// Sorted, disjoint, non-adjacent half-open `[start, end)` byte spans.
+    spans: Vec<(u64, u64)>,
     covered: u64,
     total: u64,
 }
 
 impl TransferCoverage {
     pub fn new(total: u64) -> Self {
-        let granule = total.div_ceil(COVERAGE_GRANULES).max(1);
-        let granules = total.div_ceil(granule);
         Self {
-            granule,
-            words: vec![0u64; granules.div_ceil(64) as usize],
+            spans: Vec::new(),
             covered: 0,
             total,
         }
     }
 
     /// Record that `[start, end]` (inclusive) has been received. Re-marking
-    /// already-covered granules is free, which is what makes a re-fetch
-    /// harmless.
+    /// already-covered bytes is free, which is what makes a re-fetch harmless.
     pub fn mark(&mut self, start: u64, end: u64) {
-        if self.total == 0 {
+        if self.total == 0 || start >= self.total {
             return;
         }
-        let last = end.min(self.total - 1);
-        if start > last {
+        let (mut lo, mut hi) = (start, end.min(self.total - 1) + 1);
+        if lo >= hi {
             return;
         }
-        // At most COVERAGE_GRANULES iterations: a response body is capped at
-        // 16 MiB, and the granule size is chosen so the whole package spans
-        // exactly that many granules.
-        for idx in (start / self.granule)..=(last / self.granule) {
-            let Some(word) = self.words.get_mut((idx / 64) as usize) else {
-                break;
-            };
-            let bit = 1u64 << (idx % 64);
-            if *word & bit == 0 {
-                *word |= bit;
-                self.covered = self.covered.saturating_add(self.granule);
-            }
+        // Spans that overlap or touch [lo, hi) are absorbed into it.
+        let first = self.spans.partition_point(|&(_, e)| e < lo);
+        let mut last = first;
+        while last < self.spans.len() && self.spans[last].0 <= hi {
+            let (s, e) = self.spans[last];
+            lo = lo.min(s);
+            hi = hi.max(e);
+            self.covered -= e - s;
+            last += 1;
         }
+        self.spans.splice(first..last, [(lo, hi)]);
+        self.covered += hi - lo;
     }
 
     /// Bytes covered, never more than the package size.
@@ -5052,6 +5093,22 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
         ));
     }
 
+    #[test]
+    fn a_ps5_update_that_landed_as_the_app_is_installed() {
+        // YouTube's update package (PS5DP) installs on its own; Sony writes it as app.pkg.
+        let fp = "8f864cc3d9350b05b0be0eecd80f6493ed4fedfa54d033630788763217f0569f";
+        let app = sample_artifact(
+            "base",
+            101_515_264,
+            fp,
+            "UP4381-PPSA01650_00-YOUTUBESIEA00000",
+        );
+        assert!(exact_bytes_installed(std::slice::from_ref(&app), fp));
+        assert!(!exact_bytes_installed(std::slice::from_ref(&app), "other"));
+        // No fingerprint is no proof.
+        assert!(!exact_bytes_installed(std::slice::from_ref(&app), ""));
+    }
+
     /// Coverage is what makes the stream progress bar honest. Both of the
     /// obvious alternatives were wrong on hardware, in opposite directions.
     #[test]
@@ -5098,19 +5155,64 @@ Marvel's%20Spider-Man%202%20-%20PPSA03016%20-%20v1.4.3%20-%20US%20-%20BASE.pkg";
         assert_eq!(empty.bytes(), 0);
     }
 
+    /// The exact request log of a 37.6 MB PS5 package (InternetBrowser-PS5,
+    /// FW 13.60). Ten repeated 64 KiB header reads made the raw sum equal the
+    /// package size while bytes 65536..720895 had never been asked for; the
+    /// session was released, the console's request for them got 410, and the
+    /// PS5 download failed after the install was reported done.
     #[test]
-    fn coverage_is_bounded_whatever_the_package_size() {
-        // The bitmap is what keeps this per-session state small: 8 KiB whether
-        // the package is 100 MB or 200 GB.
-        for total in [1u64 << 20, 1 << 30, 200 << 30] {
-            let c = TransferCoverage::new(total);
-            assert!(
-                c.words.len() <= 1024,
-                "{} bytes → {} words",
-                total,
-                c.words.len()
-            );
+    fn coverage_is_short_while_a_range_is_missing_despite_refetches() {
+        let total = 37_633_692u64;
+        let mut c = TransferCoverage::new(total);
+        let mut summed = 0u64;
+        let mut serve = |c: &mut TransferCoverage, s: u64, e: u64| {
+            c.mark(s, e);
+            summed += e - s + 1;
+        };
+        for _ in 0..5 {
+            serve(&mut c, 0, 65_535);
         }
+        for _ in 0..7 {
+            serve(&mut c, 720_896, 786_431);
+        }
+        serve(&mut c, 37_617_664, 37_633_691);
+        serve(&mut c, 19_660_800, 33_816_575);
+        serve(&mut c, 786_432, 19_660_799);
+        serve(&mut c, 33_816_576, 37_617_663);
+        assert_eq!(summed, total, "the raw sum reads as complete");
+        assert_eq!(c.bytes(), total - 655_360);
+        assert!(c.bytes() < c.total);
+        c.mark(65_536, 720_895);
+        assert_eq!(c.bytes(), c.total);
+    }
+
+    #[test]
+    fn coverage_sees_a_small_hole_in_a_huge_package() {
+        // One missing 64 KiB range in 200 GiB must still read as incomplete.
+        let total = 200u64 << 30;
+        let hole = 100u64 << 30;
+        let mut c = TransferCoverage::new(total);
+        c.mark(hole + 65_536, total - 1);
+        c.mark(0, hole - 1);
+        assert_eq!(c.bytes(), total - 65_536);
+        assert!(c.bytes() < c.total);
+        c.mark(hole, hole + 65_535);
+        assert_eq!(c.bytes(), c.total);
+    }
+
+    #[test]
+    fn coverage_merges_overlapping_and_adjacent_ranges() {
+        let mut c = TransferCoverage::new(1000);
+        c.mark(100, 199);
+        c.mark(300, 399);
+        c.mark(150, 349);
+        c.mark(400, 499);
+        assert_eq!(c.bytes(), 400);
+        assert_eq!(c.spans.len(), 1);
+        c.mark(0, 99);
+        c.mark(500, 999);
+        assert_eq!(c.bytes(), c.total);
+        assert_eq!(c.spans.len(), 1);
     }
 }
 
@@ -5195,5 +5297,33 @@ mod host_net_tests {
         let r: AllowFirewallRequest = serde_json::from_str(r#"{"profile":"Public"}"#).unwrap();
         assert!(!r.confirm, "a missing flag is a no");
         assert!(allow_firewall_decision(&r).is_err());
+    }
+}
+
+#[cfg(test)]
+mod browser_file_intake_tests {
+    use super::*;
+    #[tokio::test]
+    async fn a_browser_can_stage_a_non_package_file_and_remove_only_its_upload() {
+        let state = Arc::new(PkgInstallState::restored());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let result = tokio::task::spawn_blocking(move || {
+            let body = "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"../notes.txt\"\r\nContent-Type: application/octet-stream\r\n\r\nhello from browser\r\n--boundary--\r\n";
+            let mut response = ureq::post(format!("http://{address}/api/files/upload"))
+                .header("content-type", "multipart/form-data; boundary=boundary")
+                .send(body.as_bytes()).expect("stage browser file");
+            let result: serde_json::Value = serde_json::from_str(&response.body_mut().read_to_string().unwrap()).unwrap();
+            assert_eq!(result["filename"], "notes.txt");
+            let path = result["path"].as_str().unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), b"hello from browser");
+            let id = result["upload_id"].as_str().unwrap();
+            ureq::delete(format!("http://{address}/api/files/upload/{id}")).call().unwrap();
+            assert!(!std::path::Path::new(path).exists());
+        }).await;
+        server.abort();
+        result.unwrap();
     }
 }

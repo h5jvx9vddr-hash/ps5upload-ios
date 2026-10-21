@@ -16,7 +16,7 @@
 //! Note for anyone reaching for Wake-on-LAN: a PS5 does not wake from a magic
 //! packet, on any port or broadcast address. DDP is the only network path.
 
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -100,23 +100,208 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
 /// may depend on it, so it is preserved rather than tidied.
 pub fn probe(host: &str, timeout: Duration) -> Result<DdpStatus> {
     let addr = resolve(host, DDP_PORT)?;
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| anyhow!("binding a socket: {e}"))?;
-    socket.set_read_timeout(Some(timeout))?;
-    socket.set_broadcast(true)?;
-
     let pkt = format!("SRCH * HTTP/1.1\ndevice-discovery-protocol-version:{DDP_VERSION}\n\0");
-    socket
-        .send_to(pkt.as_bytes(), addr)
-        .map_err(|e| anyhow!("sending SRCH to {addr}: {e}"))?;
-
-    let mut buf = [0u8; 4096];
-    let (n, _from) = socket.recv_from(&mut buf).map_err(|e| {
+    let sockets = send_every_way(pkt.as_bytes(), addr, true);
+    if sockets.is_empty() {
+        return Err(anyhow!("could not send SRCH to {addr} on any network"));
+    }
+    first_reply(&sockets, addr, timeout).ok_or_else(|| {
         anyhow!(
-            "no reply from {addr}: {e}. A console only answers when \
+            "no reply from {addr}. A console only answers when \
              Remote Play is enabled in its settings."
         )
-    })?;
-    parse_reply(&String::from_utf8_lossy(&buf[..n]))
+    })
+}
+
+/// Sends `pkt` to `addr` every way this machine can reach it: from the default route, and
+/// from each local interface on the console's subnet (unicast, plus that subnet's broadcast
+/// when `broadcast` or the unicast send failed). Returns the sockets that sent something.
+///
+/// Why: a machine on Wi-Fi and Ethernet at once routes by its default interface, and a PS5 in
+/// rest mode was measured not answering over Wi-Fi at all ("Host is down", no ARP reply) while
+/// answering 620 on the same LAN over Ethernet. Sending only by the default route made both
+/// consoles look switched off.
+fn send_every_way(pkt: &[u8], addr: SocketAddr, broadcast: bool) -> Vec<UdpSocket> {
+    let mut out = Vec::new();
+    if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+        if s.send_to(pkt, addr).is_ok() {
+            out.push(s);
+        }
+    }
+    if let SocketAddr::V4(v4) = addr {
+        for (local, bcast) in local_ipv4_on_subnet_of(*v4.ip()) {
+            let Ok(s) = UdpSocket::bind((local, 0)) else {
+                continue;
+            };
+            let unicast = s.send_to(pkt, addr).is_ok();
+            let mut sent = unicast;
+            if broadcast || !unicast {
+                let _ = s.set_broadcast(true);
+                sent |= s.send_to(pkt, (bcast, DDP_PORT)).is_ok();
+            }
+            if sent {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// Waits up to `timeout` for the console at `addr` to answer on any of `sockets`, and parses
+/// the first reply. Only the console's own reply counts, not another console's answer to a
+/// broadcast or a stray datagram.
+fn first_reply(sockets: &[UdpSocket], addr: SocketAddr, timeout: Duration) -> Option<DdpStatus> {
+    let until = std::time::Instant::now() + timeout;
+    for s in sockets {
+        s.set_nonblocking(true).ok()?;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        for s in sockets {
+            while let Ok((n, from)) = s.recv_from(&mut buf) {
+                if from.ip() == addr.ip() {
+                    if let Ok(st) = parse_reply(&String::from_utf8_lossy(&buf[..n])) {
+                        return Some(st);
+                    }
+                }
+            }
+        }
+        if std::time::Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// This machine's IPv4 addresses on the same subnet as `dst`, with that subnet's broadcast
+/// address, one per interface that is up. Empty where interfaces cannot be listed (Windows):
+/// the default route alone is then used, as before.
+#[cfg(unix)]
+fn local_ipv4_on_subnet_of(dst: Ipv4Addr) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let mut out = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `head` with a list we only read and then free once.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return out;
+    }
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list getifaddrs returned, not yet freed.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        let up = ifa.ifa_flags & (libc::IFF_UP as libc::c_uint) != 0;
+        let loopback = ifa.ifa_flags & (libc::IFF_LOOPBACK as libc::c_uint) != 0;
+        if !up || loopback || ifa.ifa_addr.is_null() || ifa.ifa_netmask.is_null() {
+            continue;
+        }
+        // SAFETY: both pointers are non-null and point at sockaddrs owned by the list.
+        let (fam, addr, mask) = unsafe {
+            (
+                (*ifa.ifa_addr).sa_family as i32,
+                std::ptr::read_unaligned(ifa.ifa_addr as *const libc::sockaddr_in),
+                std::ptr::read_unaligned(ifa.ifa_netmask as *const libc::sockaddr_in),
+            )
+        };
+        if fam != libc::AF_INET {
+            continue;
+        }
+        let local = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+        let mask = Ipv4Addr::from(u32::from_be(mask.sin_addr.s_addr));
+        if let Some(b) = same_subnet_broadcast(local, mask, dst) {
+            if !out.iter().any(|(l, _)| *l == local) {
+                out.push((local, b));
+            }
+        }
+    }
+    // SAFETY: `head` came from a successful getifaddrs and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    out
+}
+
+#[cfg(not(unix))]
+fn local_ipv4_on_subnet_of(_dst: Ipv4Addr) -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    Vec::new()
+}
+
+/// The broadcast address of `local`/`mask` when `dst` is on that subnet; `None` otherwise, or
+/// for a mask too wide or too narrow to be a LAN (/0, /31, /32).
+fn same_subnet_broadcast(local: Ipv4Addr, mask: Ipv4Addr, dst: Ipv4Addr) -> Option<Ipv4Addr> {
+    let (l, m, d) = (u32::from(local), u32::from(mask), u32::from(dst));
+    if m == 0 || m.count_zeros() < 2 || (l & m) != (d & m) || l == d {
+        return None;
+    }
+    Some(Ipv4Addr::from(l | !m))
+}
+
+/// `EHOSTDOWN` ("Host is down"): the console gave no ARP reply. std has no `ErrorKind` for it.
+/// Seen on a Mac whose default route was Wi-Fi while both consoles slept, so callers treat it
+/// like a timeout (ask DDP why), not as a broken helper.
+pub fn host_is_down(io: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        io.raw_os_error() == Some(libc::EHOSTDOWN)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = io;
+        false
+    }
+}
+
+/// The DDP code of a console in rest mode (`HTTP/1.1 620 Server Standby`).
+pub const CODE_STANDBY: u16 = 620;
+/// The DDP code of an awake console (`HTTP/1.1 200 Ok`).
+pub const CODE_AWAKE: u16 = 200;
+
+/// Where a console stands, power-wise, as the engine reports it (`power` in a status failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Power {
+    /// DDP answered 200.
+    Awake,
+    /// DDP answered 620: rest mode with its network features on.
+    Rest,
+    /// Nothing answered, neither DDP nor TCP: off, on another network, or in rest mode with
+    /// its network features off (the three look the same from here).
+    Unreachable,
+}
+
+impl Power {
+    /// The wire spelling: `"awake"`, `"rest"`, `"unreachable"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Power::Awake => "awake",
+            Power::Rest => "rest",
+            Power::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// The budget of [`standby_probe`] on a failure path: short, because it only runs after a
+/// connection already failed, and a sleeping console must not slow the answer much.
+pub const STANDBY_PROBE_BUDGET: Duration = Duration::from_millis(800);
+/// How many SRCH datagrams [`standby_probe`] sends within its budget (UDP can drop one).
+pub const STANDBY_PROBE_SENDS: u32 = 2;
+
+/// Asks a console for its DDP status with `sends` SRCH datagrams spread over `budget`.
+/// `Some(code)` is the first reply's code (200 awake, 620 rest mode); `None` is no reply at
+/// all, or a host that does not resolve. Never an error: callers use it only to explain a
+/// failure they already have. Blocking.
+pub fn standby_probe(host: &str, budget: Duration, sends: u32) -> Option<u16> {
+    let addr = resolve(host, DDP_PORT).ok()?;
+    let pkt = format!("SRCH * HTTP/1.1\ndevice-discovery-protocol-version:{DDP_VERSION}\n\0");
+    let sends = sends.max(1);
+    let slice = (budget / sends).max(Duration::from_millis(1));
+    for _ in 0..sends {
+        let sockets = send_every_way(pkt.as_bytes(), addr, true);
+        if sockets.is_empty() {
+            return None;
+        }
+        if let Some(s) = first_reply(&sockets, addr, slice) {
+            return Some(s.code);
+        }
+    }
+    None
 }
 
 /// Wake a console in standby.
@@ -134,8 +319,6 @@ pub fn wake(host: &str, credential: &str) -> Result<()> {
         ));
     }
     let addr = resolve(host, DDP_PORT)?;
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| anyhow!("binding a socket: {e}"))?;
-    socket.set_broadcast(true)?;
 
     // Byte-for-byte what chiaki-ng sends, which is the client verified to
     // wake these consoles. Two details matter and both were wrong before:
@@ -148,9 +331,14 @@ pub fn wake(host: &str, credential: &str) -> Result<()> {
          user-credential:{}\ndevice-discovery-protocol-version:{DDP_VERSION}\n\0",
         credential.trim()
     );
-    socket
-        .send_to(pkt.as_bytes(), addr)
-        .map_err(|e| anyhow!("sending WAKEUP to {addr}: {e}"))?;
+    // Every way the console can be reached, like a SRCH (see `send_every_way`). The
+    // credential goes to the subnet's broadcast only from an interface whose unicast send
+    // failed: it stays off the rest of the LAN whenever it can.
+    if send_every_way(pkt.as_bytes(), addr, false).is_empty() {
+        return Err(anyhow!(
+            "could not send WAKEUP to {addr}: no network on this computer reaches it"
+        ));
+    }
     Ok(())
 }
 
@@ -214,6 +402,54 @@ device-discovery-protocol-version:00030010\nsystem-version:09600004\n";
     fn refuses_garbage_instead_of_inventing_a_status() {
         assert!(parse_reply("").is_err());
         assert!(parse_reply("hello there\n").is_err());
+    }
+
+    #[test]
+    fn the_console_subnet_picks_the_interface_and_its_broadcast() {
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let m24 = ip("255.255.255.0");
+        assert_eq!(
+            same_subnet_broadcast(ip("192.168.86.199"), m24, ip("192.168.86.99")),
+            Some(ip("192.168.86.255"))
+        );
+        // Another subnet, the console itself, and point-to-point masks are not routes to it.
+        assert_eq!(
+            same_subnet_broadcast(ip("10.0.0.2"), m24, ip("192.168.86.99")),
+            None
+        );
+        assert_eq!(
+            same_subnet_broadcast(ip("192.168.86.99"), m24, ip("192.168.86.99")),
+            None
+        );
+        for m in ["255.255.255.255", "255.255.255.254", "0.0.0.0"] {
+            assert_eq!(
+                same_subnet_broadcast(ip("192.168.86.1"), ip(m), ip("192.168.86.99")),
+                None
+            );
+        }
+        assert_eq!(
+            same_subnet_broadcast(ip("10.1.2.3"), ip("255.255.0.0"), ip("10.1.200.4")),
+            Some(ip("10.1.255.255"))
+        );
+    }
+
+    #[test]
+    fn a_srch_reaches_a_local_responder_and_only_its_reply_counts() {
+        // A fake console on loopback answers like a sleeping PS5.
+        let console = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = console.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let mut b = [0u8; 512];
+            let (_, from) = console.recv_from(&mut b).unwrap();
+            console
+                .send_to(b"HTTP/1.1 620 Server Standby\nhost-type:PS5\n", from)
+                .unwrap();
+        });
+        let socks = send_every_way(b"SRCH * HTTP/1.1\n\0", addr, true);
+        assert!(!socks.is_empty());
+        let st = first_reply(&socks, addr, Duration::from_secs(2)).unwrap();
+        assert_eq!(st.code, CODE_STANDBY);
+        t.join().unwrap();
     }
 
     #[test]

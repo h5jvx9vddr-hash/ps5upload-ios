@@ -59,8 +59,6 @@ pub enum Fsys {
     Local,
     Remote {
         fs: std::sync::Arc<crate::remote::source_fs::RemoteSourceFs>,
-        /// `remote://<connection-id>`.
-        base: String,
     },
 }
 
@@ -76,14 +74,11 @@ impl Fsys {
             };
         }
         let rt = rt.ok_or_else(|| format!("{root}: no runtime to reach the server from"))?;
-        let p = crate::remote::path::parse(root).map_err(|e| e.to_string())?;
+        crate::remote::path::parse(root).map_err(|e| e.to_string())?;
         let (fs, _) = rt
             .block_on(crate::remote::source_fs::RemoteSourceFs::for_path(root))
             .map_err(|e| format!("{root}: {e}"))?;
-        let f = Fsys::Remote {
-            fs,
-            base: format!("remote://{}", p.connection_id),
-        };
+        let f = Fsys::Remote { fs };
         if f.try_list(root).is_none() {
             return Err(format!("{root} could not be listed on the server"));
         }
@@ -91,7 +86,6 @@ impl Fsys {
     }
 
     fn try_list(&self, dir: &str) -> Option<Vec<Ent>> {
-        use ps5upload_core::source_fs::SourceFs;
         match self {
             Fsys::Local => {
                 let rd = std::fs::read_dir(dir).ok()?;
@@ -123,25 +117,23 @@ impl Fsys {
                         .collect(),
                 )
             }
-            Fsys::Remote { fs, base } => {
+            Fsys::Remote { fs, .. } => {
                 let server = crate::remote::path::parse(dir).ok()?.path;
-                let children = fs.read_dir(Path::new(&server)).ok()?;
+                let children = fs.entries(&server).ok()?;
+                // Each name encoded into the `remote://` path, so that reading it back gives
+                // this name ("a%20b.pkg" stays itself, a backslash stays a name character).
+                let at = dir.trim_end_matches('/');
                 Some(
                     children
                         .into_iter()
-                        .map(|(child, is_dir)| {
-                            let size = fs.metadata(&child).map(|m| m.len).unwrap_or(0);
-                            let mtime = fs.mtime(&child).unwrap_or(0) as i64;
-                            let sp = child.to_string_lossy().replace('\\', "/");
-                            Ent {
-                                name: sp.rsplit('/').next().unwrap_or(&sp).to_string(),
-                                path: format!("{base}{sp}"),
-                                is_dir,
-                                is_symlink: false,
-                                size,
-                                mtime,
-                                created: 0,
-                            }
+                        .map(|e| Ent {
+                            path: format!("{at}/{}", crate::remote::path::encode_segment(&e.name)),
+                            name: e.name,
+                            is_dir: e.is_dir,
+                            is_symlink: false,
+                            size: e.size,
+                            mtime: e.mtime.filter(|t| *t > 0).unwrap_or(0),
+                            created: 0,
                         })
                         .collect(),
                 )
@@ -184,11 +176,13 @@ fn rar_parts(entries: &[Ent]) -> Vec<&Ent> {
 /// multipart RAR set; otherwise it is only a place to look further. Symlinks are not followed.
 pub fn discover(fs: &Fsys, root: &str, cancel: &AtomicBool) -> Vec<Found> {
     let mut found = Vec::new();
-    fn rel_of(root: &str, full: &str) -> String {
-        full.strip_prefix(root)
-            .unwrap_or(full)
-            .trim_start_matches(['/', '\\'])
-            .replace('\\', "/")
+    fn rel_of(fs: &Fsys, root: &str, full: &str) -> String {
+        let rest = full.strip_prefix(root).unwrap_or(full);
+        match fs {
+            // Server paths are `/`-separated, their names encoded: the relative path is names.
+            Fsys::Remote { .. } => crate::remote::path::decode_rel(rest.trim_start_matches('/')),
+            Fsys::Local => rest.trim_start_matches(['/', '\\']).replace('\\', "/"),
+        }
     }
     fn walk(
         fs: &Fsys,
@@ -205,7 +199,7 @@ pub fn discover(fs: &Fsys, root: &str, cancel: &AtomicBool) -> Vec<Found> {
             if e.is_symlink {
                 continue;
             }
-            let rel = rel_of(root, &e.path);
+            let rel = rel_of(fs, root, &e.path);
             if e.is_dir {
                 let inner = fs.list(&e.path);
                 let stat = (e.size, e.mtime, e.created);
@@ -377,7 +371,27 @@ pub fn scan(
     for root in roots {
         progress.phase.store(PHASE_FINDING, Ordering::Relaxed);
         progress.set_current(root);
-        let fs = Fsys::for_root(root, rt)?;
+        let fs = match Fsys::for_root(root, rt) {
+            Ok(fs) => fs,
+            Err(e) => {
+                crate::log_warn!("collection: skipping {root}: {e}");
+                let mine = format!("{root}|");
+                for (k, v) in prev.folder_cache.range(mine.clone()..) {
+                    if !k.starts_with(&mine) {
+                        break;
+                    }
+                    lib.folder_cache.insert(k.clone(), v.clone());
+                }
+                for (k, v) in prev.pkg_cache.range(mine.clone()..) {
+                    if !k.starts_with(&mine) {
+                        break;
+                    }
+                    lib.pkg_cache.insert(k.clone(), v.clone());
+                }
+                lib.missing_roots.push(root.clone());
+                continue;
+            }
+        };
         let items = discover(&fs, root, cancel);
         progress
             .found
@@ -604,6 +618,41 @@ mod tests {
     }
 
     #[test]
+    fn a_root_that_is_gone_is_skipped_and_its_caches_kept() {
+        // #461: a deleted folder failed every scan, so the others were never read either.
+        let root = tmp("gone-live");
+        app(
+            &root.join("PPSA01234-app"),
+            "PPSA01234",
+            "Game",
+            "01.000.000",
+        );
+        let gone = s(&std::env::temp_dir().join("ps5upload-coll-never-there-461"));
+        let mut prev = Library::default();
+        let kept = PkgCacheEntry::default();
+        prev.pkg_cache.insert(format!("{gone}|a.pkg"), kept.clone());
+        let (cancel, p) = (AtomicBool::new(false), Progress::default());
+        let lib = scan(
+            &[gone.clone(), s(&root)],
+            Some(&prev),
+            false,
+            None,
+            false,
+            &cancel,
+            &p,
+            None,
+        )
+        .unwrap();
+        assert!(
+            lib.games.contains_key("PPSA01234"),
+            "the other root is read"
+        );
+        assert_eq!(lib.missing_roots, vec![gone.clone()]);
+        assert_eq!(lib.pkg_cache.get(&format!("{gone}|a.pkg")), Some(&kept));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_scan_groups_copies_reads_identity_and_reuses_its_caches() {
         let root = tmp("scan");
         app(
@@ -757,7 +806,6 @@ mod tests {
         let root = format!("remote://{id}/games");
         let fsys = Fsys::Remote {
             fs: std::sync::Arc::new(fs),
-            base: format!("remote://{id}"),
         };
         let (found, sizes) = tokio::task::spawn_blocking(move || {
             let found = discover(&fsys, &root, &AtomicBool::new(false));
@@ -795,6 +843,69 @@ mod tests {
             .iter()
             .all(|f| f.abs.starts_with(&format!("remote://{id}/games/"))));
         assert_eq!(sizes, (102, 5));
+    }
+
+    /// Server names that look like escapes or separators are found, and read back, as
+    /// themselves: "a%20b.pkg" is not "a b.pkg", and a backslash is part of the name.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn odd_server_names_resolve_to_themselves() {
+        use crate::remote::pool::testing::remote_with_shared;
+        use crate::remote::store::{conn, Protocol, Secret};
+        use crate::remote::MemFs;
+        use ps5upload_core::source_fs::SourceFs;
+        let files: [(&str, &[u8]); 4] = [
+            ("/games/a%20b.pkg", b"percent"),
+            ("/games/a b.pkg", b"space"),
+            ("/games/100% Orange.pkg", b"orange"),
+            ("/games/a\\b.pkg", b"backslash"),
+        ];
+        let r = remote_with_shared(std::sync::Arc::new(MemFs::new(&files)), None);
+        let id = r
+            .store
+            .add(conn("NAS", Protocol::Smb), Secret::None)
+            .unwrap()
+            .conn
+            .id;
+        let fs = std::sync::Arc::new(
+            crate::remote::source_fs::RemoteSourceFs::new(
+                std::sync::Arc::clone(&r.pool),
+                std::sync::Arc::clone(&r.store),
+                &id,
+            )
+            .await
+            .unwrap(),
+        );
+        let root = format!("remote://{id}/games");
+        let fsys = Fsys::Remote {
+            fs: std::sync::Arc::clone(&fs),
+        };
+        let found = tokio::task::spawn_blocking(move || {
+            let found = discover(&fsys, &root, &AtomicBool::new(false));
+            found
+                .into_iter()
+                .map(|f| {
+                    let server = crate::remote::path::parse(&f.abs).unwrap().path;
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(
+                        &mut fs.open(Path::new(&server)).unwrap(),
+                        &mut bytes,
+                    )
+                    .unwrap();
+                    (f.rel, server, bytes)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(found.len(), 4);
+        for (name, bytes) in files {
+            let rel = name.trim_start_matches("/games/");
+            let hit = found.iter().find(|(r, _, _)| r == rel).unwrap_or_else(|| {
+                panic!("{rel} not found as itself: {found:?}");
+            });
+            assert_eq!(hit.1, name, "{rel} read back as another path");
+            assert_eq!(hit.2, bytes, "{rel} read another file");
+        }
     }
 
     #[test]

@@ -72,15 +72,57 @@ static int in_the_way(int e) { return e == EEXIST || e == ENOTEMPTY || e == ENOT
 #define parent_of ava1_parent_of
 #define mkparents ava1_mkparents
 
+/* A game's metadata (sce_sys/param.json, a PS4 game's sce_sys/param.sfo) is what makes a folder a
+ * game to ShadowMount+ and the other scanners, which register it as soon as sce_sys has sat still
+ * for a few seconds. Arriving first (it is small) it let them register a folder whose eboot.bin
+ * was still on its way: the mount failed, and ShadowMount+ gives up on a title after two failures,
+ * so the finished game never showed up. These files are written as <name>.ava-hold and renamed
+ * into place by release_held() once everything else in the job is. */
+int ava1_apply_held_rel(const char *rel) {
+    static const char *const names[] = {"sce_sys/param.json", "sce_sys/param.sfo"};
+    size_t n, k, i;
+    if (!rel) return 0;
+    n = strlen(rel);
+    for (i = 0; i < sizeof names / sizeof names[0]; i++) {
+        k = strlen(names[i]);
+        if (n >= k && strcmp(rel + n - k, names[i]) == 0 && (n == k || rel[n - k - 1] == '/')) return 1;
+    }
+    return 0;
+}
+
 /* A path that does not fit comes back empty (open() then fails) rather than truncated
- * (which would name some other file). */
+ * (which would name some other file). The "final" path of a held file is its .ava-hold name. */
 void ava1_apply_path(const ava1_job_t *j, uint32_t id, int part, char *out, size_t cap) {
     const char *rel = ava1_mstore_path(&j->m, id);
     int n;
     if (j->flags & AVA1_JF_SINGLE_FILE) n = snprintf(out, cap, "%s%s", j->root, part ? ".ava-part" : "");
-    else if (rel) n = snprintf(out, cap, "%s/%s%s", j->base, rel, part && !j->staged ? ".ava-part" : "");
+    else if (rel)
+        n = snprintf(out, cap, "%s/%s%s%s", j->base, rel, ava1_apply_held_rel(rel) ? ".ava-hold" : "",
+                     part && !j->staged ? ".ava-part" : "");
     else n = -1;
     if (cap && (n < 0 || (size_t)n >= cap)) out[0] = 0;
+}
+
+/* Renames each held file of the finished tree at `tree` into place (same folder, so never across
+ * drives). A missing .ava-hold is one already released, or a file this job did not write. */
+static int release_held(ava1_job_t *j, const char *tree) {
+    char hold[PATH_CAP], fin[PATH_CAP], parent[PATH_CAP];
+    uint32_t i;
+    struct stat st;
+    int e;
+    if (j->flags & AVA1_JF_SINGLE_FILE) return 0;
+    for (i = 0; i < j->m.n; i++) {
+        const char *rel = ava1_mstore_path(&j->m, i);
+        if (j->m.e[i].kind != AVA1_ENTRY_FILE || !ava1_apply_held_rel(rel)) continue;
+        if (snprintf(fin, sizeof fin, "%s/%s", tree, rel) >= (int)sizeof fin ||
+            snprintf(hold, sizeof hold, "%s.ava-hold", fin) >= (int)sizeof hold)
+            return ENAMETOOLONG;
+        if (lstat(hold, &st) != 0) continue;
+        if (rename(hold, fin) != 0) return errno;
+        parent_of(fin, parent, sizeof parent);
+        if ((e = sync_dir(parent)) != 0) return e;
+    }
+    return 0;
 }
 
 static void ob_path(const ava1_job_t *j, uint32_t id, char *out, size_t cap) {
@@ -482,6 +524,7 @@ void ava1_apply_fail(ava1_job_t *j, uint16_t status, const char *what, int err, 
     }
     pthread_mutex_unlock(&j->mu);
     emit_done(j);
+    __atomic_store_n(&j->concluded_ms, ava1_mono_ms() | 1u, __ATOMIC_RELEASE); /* the table may now let it go (ava1_job.c) */
 }
 
 void ava1_apply_done_again(ava1_job_t *j) {
@@ -3055,6 +3098,12 @@ static void finish(ava1_job_t *j) {
             return;
         }
     }
+    /* Last, with every other file in place: the game's metadata (see ava1_apply_held_rel). A staged
+     * tree has just been renamed to the root; a merge wrote into it all along. */
+    if ((e = release_held(j, j->staged ? j->root : j->base)) != 0) {
+        ava1_apply_fail(j, AVA1_ERR_IO, "placing the game's param file failed", e, 1);
+        return;
+    }
     ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1); /* the success path: see ava1_apply_fail */
 }
 
@@ -3062,6 +3111,11 @@ void ava1_apply_finish_landed(ava1_job_t *j) {
     char parent[PATH_CAP];
     int err;
     parent_of(j->root, parent, sizeof parent);
+    err = release_held(j, j->root); /* stopped after the staging rename, before the release */
+    if (err) {
+        ava1_apply_fail(j, AVA1_ERR_IO, "placing the game's param file failed", err, 1);
+        return;
+    }
     err = sync_dir(parent);
     if (err) ava1_apply_fail(j, AVA1_ERR_IO, "syncing the landed folder failed", err, 1);
     else ava1_apply_fail(j, AVA1_STATUS_OK, "", 0, 1);

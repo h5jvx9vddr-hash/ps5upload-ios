@@ -31,6 +31,18 @@ import { isUploadItem, useUploadQueueStore } from "./uploadQueue";
 import { useTaskStore, type TaskKind } from "./tasks";
 import { hostOf } from "../lib/addr";
 
+/** The speed and time left a transfer row shows, for its task too: the Tasks view had the bar
+ *  but no speed or ETA, which only the Files queue row showed (#444). */
+export function speedAndEta(
+  sent: number,
+  total: number,
+  bytesPerSec: number | undefined,
+): { rate?: { bytesPerSec: number }; eta?: number } {
+  if (!bytesPerSec || bytesPerSec <= 0) return {};
+  const left = total > sent ? total - sent : 0;
+  return { rate: { bytesPerSec }, ...(total > 0 ? { eta: left / bytesPerSec } : {}) };
+}
+
 let installed = false;
 
 export function installTaskWiring() {
@@ -89,6 +101,7 @@ export function installTaskWiring() {
             total: phase.totalBytes,
             unit: "bytes",
           },
+          ...speedAndEta(phase.bytesSent, phase.totalBytes, phase.bytesPerSec),
           engineJobId: phase.jobId,
         });
         continue;
@@ -195,6 +208,7 @@ export function installTaskWiring() {
               total: item.totalBytes,
               unit: "bytes",
             },
+            ...speedAndEta(item.bytesSent, item.totalBytes, item.bytesPerSec),
           });
         }
         continue;

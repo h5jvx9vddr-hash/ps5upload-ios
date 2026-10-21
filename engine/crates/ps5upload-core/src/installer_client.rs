@@ -29,6 +29,9 @@ const ENSURE_POLL: Duration = Duration::from_millis(500);
 /// How long a port that is open but answers no hello may stay that way (a
 /// daemon still exiting) before it is reported as not coming up.
 const MUTE_WAIT: Duration = Duration::from_secs(10);
+/// How long a refused loader port is retried before the loader counts as absent: past
+/// elfldr's 3 s re-listen and the swap's kill-sleep-bind gap.
+const LOADER_RETRY_WINDOW: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone)]
 pub struct Hello {
@@ -210,6 +213,30 @@ fn needs_upgrade(current: &str, running: &str) -> bool {
     triple(running) < triple(current)
 }
 
+/// Send `bytes` to the loader on `ip:port` as a companion image, retrying for up to `window`
+/// while nothing is listening. elfldr leaves :9021 closed for a moment whenever it is replaced
+/// (the new one kills the old by name, sleeps a second, then binds) and for 3 s after a failed
+/// accept, and the app swaps in its patched elfldr right as an install starts: one refused
+/// connect is not a missing loader. No bare probe first — a loader handed a connection and no
+/// bytes waits on it. Any failure after connecting is returned at once, never resent.
+pub fn send_to_loader_retrying(
+    ip: &str,
+    port: u16,
+    bytes: &[u8],
+    window: Duration,
+    poll: Duration,
+) -> Result<u64, String> {
+    let deadline = Instant::now() + window;
+    loop {
+        match send_elf_to_loader(ip, port, bytes, LoaderImage::Companion) {
+            Err(e) if e.starts_with("connect ") && Instant::now() < deadline => {
+                std::thread::sleep(poll);
+            }
+            r => return r,
+        }
+    }
+}
+
 fn ensure_at(ip: &str, port: u16, elf: Option<&[u8]>, protect_running: bool) -> Ensure {
     ensure_with(ip, port, elf, protect_running, MUTE_WAIT)
 }
@@ -296,13 +323,21 @@ fn ensure_with(
     // WebKit Autoloader, :9021 is often dead while Payload Manager is up, and
     // every install used to stop here (#344, #345).
     let loader_port = crate::ports::loader_port();
-    let loader = join_host_port(ip, loader_port);
-    let loader_open = port_is_open(&loader, PROBE_TIMEOUT);
-    let loader_result = if loader_open {
-        send_elf_to_loader(ip, loader_port, bytes, LoaderImage::Companion)
-    } else {
-        Err(format!("nothing answered on the ELF loader port :{loader_port}"))
-    };
+    let loader_result =
+        send_to_loader_retrying(ip, loader_port, bytes, LOADER_RETRY_WINDOW, ENSURE_POLL);
+    // A connect failure means nothing was listening; anything later means a loader took
+    // the connection and the send itself failed.
+    let loader_open = loader_result
+        .as_ref()
+        .err()
+        .is_none_or(|e| !e.starts_with("connect "));
+    let loader_result = loader_result.map_err(|e| {
+        if loader_open {
+            e
+        } else {
+            format!("nothing answered on the ELF loader port :{loader_port} ({e})")
+        }
+    });
     let mut via_payload_manager = false;
     if let Err(loader_err) = loader_result {
         match crate::payload_manager::launch_elf(ip, INSTALLER_ELF_NAME, bytes) {
@@ -677,5 +712,78 @@ mod tests {
         assert_eq!(e.reason, Some("upgrade_skipped_serving"));
         let got = reqs.lock().unwrap();
         assert!(!got.iter().any(|r| r.contains("\"stop\"")));
+    }
+
+    /// A free loopback port nothing listens on yet.
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn tiny_elf() -> Vec<u8> {
+        let mut image = b"\x7FELF".to_vec();
+        image.extend_from_slice(&[0x5Au8; 256]);
+        image
+    }
+
+    /// elfldr drops :9021 for a moment whenever it is replaced (the new one kills the old,
+    /// sleeps, then binds) and for 3 s after a failed accept. An install that arrived in that
+    /// gap used to fail at once with "nothing answered on the ELF loader port"; it must wait
+    /// the gap out and deliver to the loader that comes back.
+    #[test]
+    fn a_loader_that_comes_back_within_the_window_gets_the_image() {
+        let port = free_port();
+        let h = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1200));
+            let l = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let (mut s, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).unwrap();
+            got
+        });
+        let image = tiny_elf();
+        let r = send_to_loader_retrying(
+            "127.0.0.1",
+            port,
+            &image,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        );
+        assert_eq!(r, Ok(image.len() as u64));
+        assert_eq!(h.join().unwrap(), image);
+    }
+
+    #[test]
+    fn a_loader_that_stays_down_fails_with_the_connect_error() {
+        let port = free_port();
+        let started = Instant::now();
+        let r = send_to_loader_retrying(
+            "127.0.0.1",
+            port,
+            &tiny_elf(),
+            Duration::from_millis(600),
+            Duration::from_millis(100),
+        );
+        let err = r.expect_err("nothing listens");
+        assert!(err.starts_with("connect "), "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(600));
+    }
+
+    #[test]
+    fn a_send_that_fails_after_connecting_is_not_retried() {
+        // Not an ELF: refused before any connection, and never retried.
+        let started = Instant::now();
+        let r = send_to_loader_retrying(
+            "127.0.0.1",
+            free_port(),
+            b"text",
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        );
+        assert!(r.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

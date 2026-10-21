@@ -38,11 +38,15 @@ export type PipelineStage =
   | "install";
 
 /** What a run does: a package, a package then its install, an install of a kept package, a
- *  compressed .ffpfsc image from an image, or a game image (.exfat) from a folder. */
-export type PipelineMode = "convert" | "convert-install" | "install" | "ffpfsc" | "image";
+ *  compressed .ffpfsc image from an image, a game image (.exfat) from a folder, or a plain
+ *  folder from an image or a debug-key package. */
+export type PipelineMode = "convert" | "convert-install" | "install" | "ffpfsc" | "image" | "folder";
 
 /** A run whose result is a game image to mount, not a package to install. */
 export const makesImage = (mode: PipelineMode) => mode === "ffpfsc" || mode === "image";
+
+/** A run whose result is a plain game folder on this computer. */
+export const makesFolder = (mode: PipelineMode) => mode === "folder";
 
 /** How a built package reaches the console: streamed from this computer over HTTP (nothing
  *  staged), or uploaded to PS5 staging and installed from there (never needs the console to
@@ -136,6 +140,8 @@ export interface ConversionState {
     /** Pack the game's files into AMPR LZ4 asset packs first (an .exfat image). */
     lz4?: AmprLz4Options,
   ) => Promise<void>;
+  /** Unpack a game image or a debug-key package into a plain folder in `outputDir`. */
+  buildFolder: (source: string, outputDir: string | undefined) => Promise<void>;
   /** Put the finished image in the Upload queue. */
   uploadImage: (plan: ImageUploadPlan) => void;
   /** Install the kept package again: after a failed install, or Install again on a result. */
@@ -233,7 +239,9 @@ function fail(stage: PipelineStage, message: string, packagePath: string | null)
       ? "Compression"
       : p.mode === "image"
         ? "Making the game image"
-        : p.mode === "convert"
+        : p.mode === "folder"
+          ? "Making the game folder"
+          : p.mode === "convert"
           ? "FPKG conversion"
           : "Convert & install";
   useFpkgConversion.setState({
@@ -252,6 +260,8 @@ function fail(stage: PipelineStage, message: string, packagePath: string | null)
   // An install-stage failure links to the install-route matrix entry for its
   // error; a build failure has no such page, so it goes back to Convert.
   pushNotification("error", `${what} failed`, {
+    // The install stage's failure is an engine job's ending, which the host announces.
+    jobOutcome: stage === "install",
     body: message,
     link: stage === "install" ? installErrorLink(message) : "/convert",
   });
@@ -374,7 +384,11 @@ async function runInstall(packagePath: string, host: string | null, method: Inst
     const cur = running()!;
     const convertMs = cur.mode === "install" ? 0 : startedMs - cur.startedMs;
     installDone(packagePath, convertMs, Date.now() - startedMs);
-    pushNotification("success", "Installed on the PS5", { body: packagePath, link: "/convert" });
+    pushNotification("success", "Installed on the PS5", {
+      body: packagePath,
+      link: "/convert",
+      jobOutcome: true,
+    });
   } else {
     fail("install", r.message ?? "The install did not finish.", packagePath);
   }
@@ -498,7 +512,9 @@ function poll(jobId: string, install: InstallMethod | null, failures = 0) {
             ? "Compression complete"
             : cur.mode === "image"
               ? "Game image ready"
-              : "FPKG conversion complete",
+              : cur.mode === "folder"
+                ? "Game folder ready"
+                : "FPKG conversion complete",
           { body: path, link: "/convert" },
         );
       }
@@ -517,7 +533,7 @@ function beginRun(mode: PipelineMode, source: string, host: string | null, stage
       : useTaskStore.getState().registerTask({
           kind: mode === "ffpfsc" ? "ffpfsc-compress" : "fpkg-convert",
           origin: "convert",
-          label: `${mode === "ffpfsc" ? "Compress" : mode === "image" ? "Make image of" : "Convert"} ${baseName(source)}`,
+          label: `${mode === "ffpfsc" ? "Compress" : mode === "image" ? "Make image of" : mode === "folder" ? "Make folder of" : "Convert"} ${baseName(source)}`,
           detail: source,
           consoleId: host ?? "",
           control: { owner: "fpkg-convert" },
@@ -549,6 +565,13 @@ function beginRun(mode: PipelineMode, source: string, host: string | null, stage
 /** `.zip`, `.7z` or `.rar` (a multi-part set starts at its first `.partN.rar`). */
 export function isArchiveSource(path: string): boolean {
   return /\.(zip|7z|rar)$/i.test(path.trim());
+}
+
+/** A game image (`.exfat`, `.ffpkg`/`.ufs2`, `.ffpfs`, `.ffpfsc`) or a package (`.pkg`): what
+ *  can be unpacked into a plain folder. A package has to be made with the debug key; the
+ *  engine says so when it is not. */
+export function isFolderableSource(path: string): boolean {
+  return /\.(exfat|ffpkg|ufs2|ffpfs|ffpfsc|pkg)$/i.test(path.trim());
 }
 
 /** The engine's archive errors, said for a person. */
@@ -682,6 +705,7 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
   start: async (req, { install, host, method = "stream", password, deleteAfter }) => {
     const then = install ? method : null;
     if (get().pipeline.phase === "running") return;
+    const fullVerify = useConvertPrefs.getState().fullVerify;
     deleteAfterInstall = install && !!deleteAfter;
     if (needsPrep(req.source)) {
       beginRun(
@@ -693,7 +717,7 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
       void prepareThenStart(
         req.source,
         req.outputDir,
-        (local) => fpkg.build({ ...req, source: local }),
+        (local) => fpkg.build({ ...req, source: local, fullVerify }),
         then,
         password,
       );
@@ -701,7 +725,7 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
     }
     beginRun(install ? "convert-install" : "convert", req.source, host, "check");
     try {
-      const { job_id } = await fpkg.build(req);
+      const { job_id } = await fpkg.build({ ...req, fullVerify });
       update({ jobId: job_id });
       poll(job_id, then);
     } catch (error) {
@@ -711,16 +735,17 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
 
   compress: async (source, outputDir) => {
     if (get().pipeline.phase === "running") return;
+    const fullVerify = useConvertPrefs.getState().fullVerify;
     // Compressing reads the image from this machine's disk, so a server image is copied
     // first (unlike a build, which reads it in place).
     if (isRemotePath(source) || isArchiveSource(source)) {
       beginRun("ffpfsc", source, null, isRemotePath(source) ? "copy" : "extract");
-      void prepareThenStart(source, outputDir, (local) => fpkg.compress(local, outputDir), null);
+      void prepareThenStart(source, outputDir, (local) => fpkg.compress(local, outputDir, fullVerify), null);
       return;
     }
     beginRun("ffpfsc", source, null, "compress");
     try {
-      const { job_id } = await fpkg.compress(source, outputDir);
+      const { job_id } = await fpkg.compress(source, outputDir, fullVerify);
       update({ jobId: job_id });
       poll(job_id, null);
     } catch (error) {
@@ -744,6 +769,7 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
         thenCompress,
         lz4,
         useConvertPrefs.getState().verifyChunkKib,
+        useConvertPrefs.getState().fullVerify,
       );
       update({ jobId: job_id });
       poll(job_id, null);
@@ -752,12 +778,25 @@ export const useFpkgConversion = create<ConversionState>((set, get) => ({
     }
   },
 
+  buildFolder: async (source, outputDir) => {
+    if (get().pipeline.phase === "running") return;
+    pendingImageUpload = null;
+    beginRun("folder", source, null, "write");
+    try {
+      const { job_id } = await fpkg.buildFolder(source, outputDir, undefined, useConvertPrefs.getState().fullVerify);
+      update({ jobId: job_id });
+      poll(job_id, null);
+    } catch (error) {
+      fail("write", error instanceof Error ? error.message : String(error), null);
+    }
+  },
+
   retryInstall: async (host, method = "stream") => {
     const p = get().pipeline;
     const path =
       p.phase === "failed" ? p.packagePath : p.phase === "done" && !p.deleted ? p.packagePath : null;
     if (!path || (p.phase !== "failed" && p.phase !== "done")) return;
-    if (p.phase === "done" && makesImage(p.mode)) return;
+    if (makesFolder(p.mode) || (p.phase === "done" && makesImage(p.mode))) return;
     deleteAfterInstall = false;
     beginRun("install", p.source, host, "send");
     update({ packagePath: path, titleId: p.titleId });

@@ -642,9 +642,275 @@ pub fn cheats_repo_download(
     }
 }
 
+/// Validate a local JSON trainer and strip persisted activation before writing it.
+/// Filename selects the title on the helper; an embedded ID must agree.
+pub fn prepare_local_cheat(filename: &str, bytes: &[u8]) -> Result<(String, Vec<u8>)> {
+    use anyhow::ensure;
+    ensure!(
+        bytes.len() <= 256 * 1024,
+        "Cheat files must be at most 256 KiB"
+    );
+    ensure!(
+        filename.len() <= 160
+            && filename
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            && !filename.contains(".."),
+        "Use a plain cheat filename without directories"
+    );
+    ensure!(
+        filename.ends_with(".json"),
+        "Local import supports JSON trainers; convert SHN/MC4 to JSON first"
+    );
+    let title = filename.get(..9).unwrap_or("");
+    ensure!(
+        (title.starts_with("PPSA") || title.starts_with("CUSA"))
+            && title[4..].bytes().all(|b| b.is_ascii_digit())
+            && matches!(filename.as_bytes().get(9), Some(b'.' | b'_')),
+        "Filename must start with its title ID, e.g. PPSA13197_01.000.json"
+    );
+    let mut v: serde_json::Value = serde_json::from_slice(bytes)?;
+    if let Some(id) = v.get("id") {
+        ensure!(id.as_str() == Some(title), "Embedded title ID must match the filename; renaming does not make a trainer compatible");
+    }
+    let mods = v
+        .get_mut("mods")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("JSON trainer needs a mods array"))?;
+    ensure!(
+        !mods.is_empty() && mods.len() <= 64,
+        "Trainer must contain 1–64 mods"
+    );
+    for m in mods {
+        ensure!(
+            m.get("name")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty() && s.len() < 128),
+            "Each mod needs a name under 128 bytes"
+        );
+        let memory = m
+            .get("memory")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Each mod needs a memory array"))?;
+        ensure!(
+            !memory.is_empty() && memory.len() <= 32,
+            "Each mod must contain 1–32 memory patches"
+        );
+        for patch in memory {
+            let offset = patch
+                .get("offset")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let offset = offset
+                .strip_prefix("0x")
+                .or_else(|| offset.strip_prefix("0X"))
+                .unwrap_or(offset);
+            ensure!(
+                !offset.is_empty() && offset.len() <= 16 && u64::from_str_radix(offset, 16).is_ok(),
+                "Invalid patch offset"
+            );
+            let mut lengths = Vec::new();
+            for field in ["on", "off"] {
+                let text = patch.get(field).and_then(|v| v.as_str()).unwrap_or("");
+                ensure!(text.len() < 256, "Patch bytes exceed helper limit");
+                let hex: String = text
+                    .chars()
+                    .filter(|c| !" , -:\t\r\n".contains(*c))
+                    .collect();
+                ensure!(
+                    !hex.is_empty()
+                        && hex.len().is_multiple_of(2)
+                        && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "Invalid {field} patch bytes"
+                );
+                lengths.push(hex.len());
+            }
+            ensure!(
+                lengths[0] == lengths[1],
+                "On/off patches must be the same length"
+            );
+        }
+        m["_sonic_enabled"] = false.into();
+        // The helper's scanner uses a bounded temporary buffer for each mod.
+        ensure!(
+            serde_json::to_vec(m)?.len() < 8192,
+            "A mod exceeds the helper's parser limit"
+        );
+    }
+    let bytes = serde_json::to_vec(&v)?;
+    ensure!(
+        bytes.len() <= 256 * 1024,
+        "Cheat files must be at most 256 KiB"
+    );
+    Ok((format!("/data/ps5upload/cheats/json/{filename}"), bytes))
+}
+
+/// Import without replacing files or inheriting index-based toggle state.
+pub fn cheats_import_local(addr: &str, source: &std::path::Path) -> Result<CheatDownloadResponse> {
+    use anyhow::ensure;
+    let filename = source
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(source)?
+        .take(256 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    let (path, bytes) = prepare_local_cheat(filename, &bytes)?;
+    let title = &filename[..9];
+    ensure!(
+        !cheats_status(addr)?.enabled,
+        "Turn off the cheat engine before importing"
+    );
+    let list = cheats_list(addr)?;
+    ensure!(
+        !list.truncated && !list.titles.iter().any(|t| t.title_id == title),
+        "Remove existing cheats for this title before importing (this clears saved toggle state)"
+    );
+    let state = format!("/data/ps5upload/cheats/state/{title}.json");
+    match crate::fs_ops::fs_stat(addr, &state) {
+        Err(e) if crate::fs_ops::is_not_found(&format!("{e:#}")) => {}
+        Err(e) => return Err(e),
+        Ok(_) => anyhow::bail!(
+            "Saved toggle state exists for this title. Remove its cheats before importing"
+        ),
+    }
+    // Directory normally exists after cheat-engine initialization; don't suppress unexpected errors.
+    let dir = "/data/ps5upload/cheats/json";
+    if let Err(e) = crate::fs_ops::fs_stat(addr, dir) {
+        if crate::fs_ops::is_not_found(&format!("{e:#}")) {
+            crate::fs_ops::fs_mkdir(addr, dir)?;
+        } else {
+            return Err(e);
+        }
+    }
+    let r = crate::diagnostics::fs_write_bytes(addr, &path, &bytes, true)?;
+    Ok(CheatDownloadResponse {
+        ok: true,
+        path: Some(path),
+        size: r.size.or(Some(bytes.len() as u64)),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_import_never_overwrites_or_enables_and_refuses_saved_state() {
+        use crate::mgmt::{MgmtError, MgmtTransport};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        struct Fake {
+            active: bool,
+            existing: bool,
+            state: bool,
+            writes: Mutex<Vec<serde_json::Value>>,
+        }
+        impl MgmtTransport for Fake {
+            fn call(
+                &self,
+                _: &str,
+                method: Method,
+                _: &str,
+                body: &[u8],
+                _: Duration,
+            ) -> Result<Option<Vec<u8>>> {
+                let v = if method == m::CHEATS_STATUS {
+                    serde_json::json!({"enabled":self.active})
+                } else if method == m::CHEATS_LIST {
+                    serde_json::json!({"titles": if self.existing { vec![serde_json::json!({"title_id":"PPSA13197"})] } else { vec![] }})
+                } else if method == m::FS_STAT {
+                    let b: serde_json::Value = serde_json::from_slice(body)?;
+                    if b["path"].as_str().unwrap().contains("/state/") && !self.state {
+                        return Err(MgmtError {
+                            label: "FS_STAT".into(),
+                            status: 1,
+                            cause: "fs_stat_failed_errno_2".into(),
+                        }
+                        .into());
+                    }
+                    serde_json::json!({"kind":"dir","size":0,"mtime":0,"mode":493})
+                } else if method == m::FS_WRITE {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(body)?);
+                    serde_json::json!({"ok":true,"size":100})
+                } else {
+                    panic!("unexpected mutation or RPC: {}", method.label);
+                };
+                Ok(Some(serde_json::to_vec(&v)?))
+            }
+        }
+        let dir =
+            std::env::temp_dir().join(format!("ps5upload-local-cheat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("PPSA13197.json");
+        std::fs::write(
+            &source,
+            br#"{"mods":[{"name":"HP","memory":[{"offset":"A0","on":"90","off":"80"}]}]}"#,
+        )
+        .unwrap();
+        for (active, existing, state, allowed) in [
+            (false, false, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+        ] {
+            let f = Arc::new(Fake {
+                active,
+                existing,
+                state,
+                writes: Mutex::new(vec![]),
+            });
+            let _g = mgmt::scoped_transport(f.clone());
+            let result = cheats_import_local("h", &source);
+            assert_eq!(result.is_ok(), allowed, "{result:?}");
+            let writes = f.writes.lock().unwrap();
+            assert_eq!(writes.len(), usize::from(allowed));
+            if allowed {
+                assert_eq!(writes[0]["mode"], "create");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_import_validates_title_and_disables_persisted_toggles() {
+        let src = br#"{"id":"PPSA13197","mods":[{"name":"HP","_sonic_enabled":true,"memory":[{"offset":"A0","on":"90","off":"80"}]}]}"#;
+        let (path, bytes) = prepare_local_cheat("PPSA13197_01.000.json", src).unwrap();
+        assert_eq!(path, "/data/ps5upload/cheats/json/PPSA13197_01.000.json");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["mods"][0]["_sonic_enabled"], false);
+        assert!(prepare_local_cheat("PPSA13195.json", src).is_err());
+        assert!(prepare_local_cheat("../PPSA13197.json", src).is_err());
+        assert!(prepare_local_cheat("PPSA13197.json", b"{}").is_err());
+        assert!(prepare_local_cheat("PPSA13197.json", &vec![b' '; 256 * 1024 + 1]).is_err());
+    }
+
+    #[test]
+    fn local_import_refuses_patch_strings_that_the_helper_would_truncate() {
+        let src = serde_json::json!({"mods":[{"name":"HP","memory":[{"offset":"A0","on":"90".repeat(128),"off":"80".repeat(128)}]}]});
+        assert!(prepare_local_cheat("PPSA13197.json", &serde_json::to_vec(&src).unwrap()).is_err());
+    }
+
+    #[test]
+    fn local_import_rejects_unsupported_formats_and_broken_patch_bytes() {
+        assert!(prepare_local_cheat("PPSA13197.mc4", b"encrypted").is_err());
+        assert!(prepare_local_cheat(
+            "PPSA13197.json",
+            br#"{"mods":[{"name":"HP","memory":[{"offset":"A0","on":"ZZ"}]}]}"#
+        )
+        .is_err());
+        assert!(prepare_local_cheat(
+            "CUSA00001.json",
+            br#"{"mods":[{"name":"HP","memory":[{"offset":"A0","on":"90","off":"80"}]}]}"#
+        )
+        .is_ok());
+    }
 
     #[test]
     fn deserialize_cheats_list_response() {

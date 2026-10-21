@@ -706,7 +706,9 @@ fn i7_reattach_gives_the_free_credit_and_checks_the_owner() {
     assert!(c >= 8 << 20, "{c}");
     r.reserve(1 << 20); // a frame in memory, not yet freed
     r.set_owner(2);
-    assert_eq!(r.reopen(false), gen::ERR_UNKNOWN_JOB as i32);
+    // Another device: this job has no session (parked), so it could move to that device
+    // (SPEC.md §18.5), but not while it is still held here: busy, try again.
+    assert_eq!(r.reopen(false), gen::ERR_BUSY as i32);
     r.set_owner(1);
     assert_eq!(r.reopen(false), 0); // the same job, a new session
     assert_eq!(r.ack_credit(), c - (1 << 20));

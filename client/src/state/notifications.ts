@@ -1,6 +1,7 @@
 import { create } from "zustand";
 
 import { appIsForeground, sendOsNotification } from "../lib/osNotify";
+import { nativeJobNotify } from "../lib/bgNotify";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { recordAppEvent } from "../lib/appJournal";
 
@@ -40,13 +41,19 @@ export interface Notification {
   read: boolean;
 }
 
+/** Optional parts of a notification. */
+export interface NotificationExtras {
+  body?: string;
+  link?: string;
+  /** The outcome of an engine job (an upload, download or install finishing or
+   *  failing). The desktop / Android host notifies those itself when it watches the
+   *  engine (lib/bgNotify.ts), so the OS mirror skips them there. */
+  jobOutcome?: boolean;
+}
+
 interface NotificationsState {
   entries: Notification[];
-  push: (
-    level: NotificationLevel,
-    title: string,
-    extras?: { body?: string; link?: string },
-  ) => string;
+  push: (level: NotificationLevel, title: string, extras?: NotificationExtras) => string;
   markAllRead: () => void;
   clear: () => void;
   remove: (id: string) => void;
@@ -125,8 +132,15 @@ export const useNotificationsStore = create<NotificationsState>((set, get) => ({
     // when the app isn't in the foreground, so the user doesn't get a
     // redundant system banner while looking at the in-app inbox.
     // Fire-and-forget: osNotify no-ops outside Tauri and swallows errors.
+    // A job's outcome is left to the host when it posts those itself.
     if (get().osNotifyEnabled && !appIsForeground()) {
-      void sendOsNotification(level, title, extras?.body);
+      if (extras?.jobOutcome) {
+        void nativeJobNotify().then((native) => {
+          if (!native) void sendOsNotification(level, title, extras?.body);
+        });
+      } else {
+        void sendOsNotification(level, title, extras?.body);
+      }
     }
     return entry.id;
   },
@@ -168,7 +182,7 @@ export const useNotificationsStore = create<NotificationsState>((set, get) => ({
 export function pushNotification(
   level: NotificationLevel,
   title: string,
-  extras?: { body?: string; link?: string },
+  extras?: NotificationExtras,
 ): string {
   // What the user was told went wrong is in the bug-report journal, and an error's "Jump to"
   // opens the report with that event pinned (unless the caller links somewhere already).

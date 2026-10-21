@@ -37,6 +37,12 @@ int path_contains_protected(const char *p);
  * (source and destination), after their own allowlist. Trade-off, deliberate: a whole-/data or / root
  * is refused; per-entry filtering inside the walkers would be needed to allow it. */
 int path_tree_op_refused(const char *p);
+/* For a walker that tests many entries of one canonical root (no symlink below it is followed): the
+ * trust store's lexical and canonical forms, resolved once (PATH_MAX buffers), then
+ * path_under_forms(entry, lex, canon) per entry: no realpath per entry. 1 = the entry is the store or
+ * below it (case-insensitive, component boundary). */
+void path_protected_forms(char *lex, char *canon);
+int path_under_forms(const char *p, const char *lex, const char *canon);
 /* Test hook: the protected directory (NULL restores /data/ps5upload/ava). */
 void path_policy_set_protected(const char *dir);
 

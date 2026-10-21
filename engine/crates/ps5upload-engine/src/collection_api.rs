@@ -268,12 +268,13 @@ pub async fn put_settings(Json(s): Json<store::Settings>) -> Response {
     };
     let before = settings().roots;
     for r in &s.roots {
+        // Only a folder being added is checked. One already in the list may have been deleted or
+        // be on an unplugged drive; checking it again made every save fail, removing that very
+        // folder included (#461). The scan skips it and says so instead.
+        if before.contains(r) {
+            continue;
+        }
         if crate::remote::path::is_remote(r) {
-            // A folder on a saved server: checked when it is added (signing in and listing it),
-            // not on every save of the other settings.
-            if before.contains(r) {
-                continue;
-            }
             let (root, rt) = (r.clone(), tokio::runtime::Handle::current());
             let checked = tokio::task::spawn_blocking(move || {
                 scan::Fsys::for_root(&root, Some(&rt)).map(|_| ())
@@ -456,12 +457,13 @@ fn with_app_folders(
 ) -> std::collections::HashMap<String, Option<String>> {
     let mut out: std::collections::HashMap<String, Option<String>> = registered
         .into_iter()
+        .filter(|(id, _)| !crate::is_console_webui_tile(id))
         .map(|(id, from)| (id.to_ascii_uppercase(), from))
         .collect();
     for f in folders {
         let id = f.to_ascii_uppercase();
         // By bytes: a folder name with a multi-byte character must not be sliced mid-char.
-        if crate::collection::is_game_id(&id) {
+        if crate::collection::is_game_id(&id) && !crate::is_console_webui_tile(&id) {
             out.entry(id).or_insert(None);
         }
     }

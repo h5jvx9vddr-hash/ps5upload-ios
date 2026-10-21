@@ -24,6 +24,7 @@
 #include "ava1_manifest.h"
 #include "ava1_noise.h"
 #include "ava1_platform.h"
+#include "ava1_rpc_gate.h"
 #include "ava1_store.h"
 #include "monocypher.h"
 
@@ -154,6 +155,7 @@ static struct {
 } tickets[TICKETS];
 
 const uint8_t *ava1_server_rpc_peer(void) { return rpc_peer; }
+void ava1_server_set_rpc_peer(const uint8_t peer[32]) { memcpy(rpc_peer, peer, sizeof rpc_peer); }
 /* Serialises peers-file writes. Taken before mu, and held across the write so two
  * pairings land in order; mu itself is never held during file I/O. */
 static pthread_mutex_t store_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -787,6 +789,9 @@ typedef struct {
 /* Detached RPC workers running, whatever became of their session (a session's own rpc_inflight is
  * dropped with the session while its worker still runs): what the exit waits for. */
 static int g_rpc_running;
+/* Set when the exit begins (once per process: a stop is final for in-process callers):
+ * ava1_server_local_rpc_enter refuses from then on. */
+static int g_local_closed;
 
 static void *rpc_worker(void *arg) {
     rpc_job_t *j = arg;
@@ -1138,7 +1143,7 @@ static void run_control(conn_t *k, uint8_t *buf, size_t len) {
     si.caps = S.cfg.caps;
     /* A server without data hooks cannot serve the data plane, whatever the caller asked
      * for: the caps are what a client is entitled to rely on. */
-    if (!S.cfg.data) si.caps &= ~AVA1_CAP_DATA_PLANE;
+    if (!S.cfg.data) si.caps &= ~(AVA1_CAP_DATA_PLANE | AVA1_CAP_SHARED_JOBS);
     memcpy(si.session_id, sid, 16);
     /* Commit to the pairing nonce before the client has shown its own (SPEC.md 4.6). */
     ava1_pair_commit(nonce_s, si.pair_commit);
@@ -1564,6 +1569,9 @@ int ava1_server_pairing_open(void) {
 
 int ava1_server_rpc_inflight(void) { return __atomic_load_n(&g_rpc_running, __ATOMIC_SEQ_CST); }
 
+int ava1_server_local_rpc_enter(void) { return ava1_gate_enter(&g_rpc_running, &g_local_closed); }
+void ava1_server_local_rpc_leave(void) { ava1_gate_leave(&g_rpc_running); }
+
 int ava1_server_conns(void) {
     int n;
     pthread_mutex_lock(&mu);
@@ -1574,6 +1582,9 @@ int ava1_server_conns(void) {
 
 void ava1_server_stop(void) {
     int started;
+    /* First, whether or not the server ever started: the exit now waits on every in-process
+     * caller already inside (they are counted in g_rpc_running) and refuses new ones. */
+    ava1_gate_close(&g_local_closed);
     pthread_mutex_lock(&mu);
     started = S.accept_started;
     pthread_mutex_unlock(&mu);

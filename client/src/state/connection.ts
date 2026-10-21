@@ -2,6 +2,7 @@ import { createContext, createElement, useContext, type ReactNode } from "react"
 import { create } from "zustand";
 import { hostOf } from "../lib/addr";
 import type { SessionState } from "../lib/consoleSession";
+import type { HostPower } from "../lib/consolePower";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
 /** TCP port of the PS5 ELF loader. Constant — every common PS5
@@ -92,6 +93,10 @@ export interface HostRuntime {
    *  is one listener, so there is no second liveness flag to disagree
    *  with it. null = host not yet probed. */
   session: SessionState | null;
+  /** Awake, in rest mode, not answering at all, or not known (lib/consolePower). Set by
+   *  the status poller from the same probe. `payloadStatus` still reads "down" while the
+   *  console sleeps; this says why. */
+  power: HostPower;
 }
 
 export const EMPTY_HOST_RUNTIME: HostRuntime = {
@@ -101,6 +106,7 @@ export const EMPTY_HOST_RUNTIME: HostRuntime = {
   ucredElevated: null,
   priorInstance: null,
   session: null,
+  power: "unknown",
 };
 
 export interface ConnectionState {
@@ -144,6 +150,8 @@ export interface ConnectionState {
   /** Mirror of the active console's AVA1 session state (see
    *  HostRuntime.session). */
   session: SessionState | null;
+  /** Mirror of the active console's power state (see HostRuntime.power). */
+  power: HostPower;
   /** True when a fresh payload-info probe is in flight and the
    *  currently-displayed payloadVersion / ps5Kernel may be stale.
    *  Set by Connection's handleSend on entry (the user just kicked
@@ -176,6 +184,7 @@ export interface ConnectionState {
         | "priorInstance"
         | "payloadProbing"
         | "session"
+        | "power"
       >
     >
   ) => void;
@@ -201,6 +210,7 @@ function mirrorRuntime(host: string, rt: HostRuntime) {
     ucredElevated: rt.ucredElevated,
     priorInstance: rt.priorInstance,
     session: rt.session,
+    power: rt.power,
   };
 }
 
@@ -216,6 +226,7 @@ const useLiveConnectionStore = create<ConnectionState>((set) => ({
   ucredElevated: null,
   priorInstance: null,
   session: null,
+  power: "unknown",
   payloadProbing: false,
   step1: "idle",
   step1Msg: "Enter your PS5's address and check",

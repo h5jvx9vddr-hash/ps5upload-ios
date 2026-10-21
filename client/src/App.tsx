@@ -6,6 +6,7 @@ import {
   useConnectionStore,
 } from "./state/connection";
 import { Navigate, Route, Routes, useLocation, type Location } from "react-router";
+import { payloadCardLink } from "./screens/Payloads/payloadTabs";
 
 import { lazyWithReload } from "./lib/lazyWithReload";
 import AppShell from "./layout/AppShell";
@@ -396,16 +397,25 @@ function AppRoutes({ location }: { location: Location }) {
         <Route
           path="/payloads"
           element={
-            // The browser build gets the ShadowMount+ and nanoDNS tabs only
+            // The browser build gets the "On your PS5" tab only
             // (screens/Payloads/payloadTabs.ts).
             <Suspense fallback={<ScreenLoader />}>
               <PayloadsScreen />
             </Suspense>
           }
         />
-        <Route path="/nanodns" element={<Navigate to="/payloads?tab=nanodns" replace />} />
-        <Route path="/nano-dns" element={<Navigate to="/payloads?tab=nanodns" replace />} />
-        <Route path="/shadowmount" element={<Navigate to="/payloads?tab=shadowmount" replace />} />
+        {/* Integrations were tabs (and before that screens); they are cards on "On your
+            PS5" now, and Ports sits with Processes. Old links open the card. */}
+        <Route path="/nanodns" element={<Navigate to={payloadCardLink("nanodns")} replace />} />
+        <Route path="/nano-dns" element={<Navigate to={payloadCardLink("nanodns")} replace />} />
+        <Route path="/shadowmount" element={<Navigate to={payloadCardLink("shadowmountplus")} replace />} />
+        <Route path="/hearbridge" element={<Navigate to={payloadCardLink("hearbridge")} replace />} />
+        <Route path="/payloads/manager" element={<Navigate to={payloadCardLink("payload-manager")} replace />} />
+        <Route path="/payloads/shadowmount" element={<Navigate to={payloadCardLink("shadowmountplus")} replace />} />
+        <Route path="/payloads/nanodns" element={<Navigate to={payloadCardLink("nanodns")} replace />} />
+        <Route path="/payloads/hearbridge" element={<Navigate to={payloadCardLink("hearbridge")} replace />} />
+        <Route path="/payloads/ports" element={<Navigate to="/processes?tab=ports" replace />} />
+        <Route path="/ports" element={<Navigate to="/processes?tab=ports" replace />} />
         {/* The wizard's whole point is step 2: download the payload ELFs to
             this machine and send them to the console over a raw socket.
             Neither is possible from a browser (the Payloads screen there has

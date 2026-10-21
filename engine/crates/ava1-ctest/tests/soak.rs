@@ -294,10 +294,18 @@ async fn soak(tag: &str, rounds: u32, deadline: Option<Duration>) -> u32 {
         cancels += env.round(n).await as u32;
         // let detached threads (lane joins, the tokio blocking pool) settle before counting
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let (fds, rss) = (open_fds(), rss_mb());
+        let (mut fds, rss) = (open_fds(), rss_mb());
         if n == 0 {
             (fds0, rss0) = (fds, rss);
         } else {
+            // A connection's teardown can still be finishing after the settle above (seen once
+            // under ASan at round 582: 14 -> 16 for one poll). A leak never comes back down, so
+            // wait for the count to settle like the job and pack checks, then compare.
+            let t0 = Instant::now();
+            while fds != fds0 && t0.elapsed() < Duration::from_secs(10) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                fds = open_fds();
+            }
             assert_eq!(
                 fds, fds0,
                 "round {n}: open descriptors drifted ({fds0} -> {fds})"

@@ -45,6 +45,10 @@
 #    is handled in-app by the user-adjustable "Text size" setting
 #    (client/src/state/uiScale.ts), which rescales the rem root and so resizes
 #    the entire UI. The two fixes are complementary.
+#
+# 6) TransferService, the foreground service that keeps a transfer running
+#    with the app in the background (#457), its manifest entry, permissions
+#    and R8 keep rules. See step (6) below.
 
 set -euo pipefail
 
@@ -343,5 +347,272 @@ open(path, "w", encoding="utf-8").write(src)
 print("patched MainActivity.kt to request ACCESS_LOCAL_NETWORK (PS5UploadNet)")
 PY
 fi
+
+# --- (6) background transfers: TransferService (#457) ------------------
+# Android freezes a backgrounded app's process, and the engine runs inside it,
+# so a long upload stopped when the person switched apps. A foreground service
+# keeps the process running while a job is active; the Rust watcher
+# (src-tauri/src/bg_activity.rs → android_bg.rs) starts, updates and stops it
+# through the static methods below and posts complete / failed notifications
+# through it. Type connectedDevice (the PS5 is a device on the network; Android
+# 15 caps dataSync at 6 h a day), dataSync declared as the fallback. The class is
+# rewritten on every run so a change here always reaches the build.
+if [ -n "$mainactivity" ]; then
+  cat >"$(dirname "$mainactivity")/TransferService.kt" <<'KT'
+package com.phantomptr.ps5upload
+
+// Written by scripts/release/android-postinit-patch.sh; edit it there.
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
+
+/** Keeps the app (and the engine inside it) running while a transfer goes on in the
+ *  background. Driven from Rust (android_bg.rs); never started by anything else. */
+class TransferService : Service() {
+  private var wakeLock: PowerManager.WakeLock? = null
+  private var wifiLock: WifiManager.WifiLock? = null
+
+  override fun onBind(intent: Intent?): IBinder? = null
+
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    if (!promote()) {
+      stopSelf()
+      return START_NOT_STICKY
+    }
+    instance = this
+    refreshLocks()
+    // Not sticky: a restarted process has a fresh engine with nothing to finish.
+    return START_NOT_STICKY
+  }
+
+  private fun promote(): Boolean {
+    val n = progressNotification(this)
+    val types = if (Build.VERSION.SDK_INT >= 29) {
+      intArrayOf(
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+      )
+    } else {
+      intArrayOf(0)
+    }
+    for (type in types) {
+      try {
+        ServiceCompat.startForeground(this, PROGRESS_ID, n, type)
+        return true
+      } catch (e: Exception) {
+        Log.w(TAG, "startForeground type=$type: $e")
+      }
+    }
+    return false
+  }
+
+  // Held with a timeout and refreshed by every progress update, so a watcher that
+  // died without saying stop cannot keep the phone awake for long.
+  private fun refreshLocks() {
+    try {
+      val wl = wakeLock ?: (getSystemService(Context.POWER_SERVICE) as PowerManager)
+        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ps5upload:transfer")
+        .also { it.setReferenceCounted(false); wakeLock = it }
+      wl.acquire(LOCK_MS)
+      val wf = wifiLock ?: (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
+        .let {
+          @Suppress("DEPRECATION")
+          it.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "ps5upload:transfer")
+        }
+        .also { it.setReferenceCounted(false); wifiLock = it }
+      if (!wf.isHeld) wf.acquire()
+    } catch (e: Exception) {
+      Log.w(TAG, "locks: $e")
+    }
+  }
+
+  // Android 15+: the time limit for this service type ran out; stop rather than be killed.
+  override fun onTimeout(startId: Int, fgsType: Int) {
+    Log.w(TAG, "foreground time limit reached (type=$fgsType)")
+    stopSelf()
+  }
+
+  override fun onDestroy() {
+    instance = null
+    try { wakeLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
+    try { wifiLock?.takeIf { it.isHeld }?.release() } catch (_: Exception) {}
+    wakeLock = null
+    wifiLock = null
+    ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+    super.onDestroy()
+  }
+
+  companion object {
+    private const val TAG = "PS5UploadTransfer"
+    private const val PROGRESS_ID = 1
+    private const val CH_PROGRESS = "ps5upload_transfers"
+    private const val CH_RESULTS = "ps5upload_results"
+    private const val LOCK_MS = 10 * 60 * 1000L
+
+    @Volatile private var title = ""
+    @Volatile private var text = ""
+    @Volatile private var percent = -1
+    @Volatile private var instance: TransferService? = null
+
+    @JvmStatic
+    fun start(ctx: Context, title: String, text: String, percent: Int, channelName: String) {
+      set(title, text, percent)
+      channel(ctx, CH_PROGRESS, channelName, NotificationManager.IMPORTANCE_LOW)
+      try {
+        ContextCompat.startForegroundService(ctx, Intent(ctx, TransferService::class.java))
+      } catch (e: Exception) {
+        // Android 12+ refuses a start from the background
+        // (ForegroundServiceStartNotAllowedException): show the progress anyway.
+        Log.w(TAG, "start: $e")
+        post(ctx, PROGRESS_ID, progressNotification(ctx))
+      }
+    }
+
+    @JvmStatic
+    fun update(ctx: Context, title: String, text: String, percent: Int) {
+      set(title, text, percent)
+      post(ctx, PROGRESS_ID, progressNotification(ctx))
+      instance?.refreshLocks()
+    }
+
+    @JvmStatic
+    fun finished(ctx: Context, id: Int, title: String, text: String, ok: Boolean, channelName: String) {
+      channel(ctx, CH_RESULTS, channelName, NotificationManager.IMPORTANCE_DEFAULT)
+      val n = NotificationCompat.Builder(ctx, CH_RESULTS)
+        .setSmallIcon(if (ok) android.R.drawable.stat_sys_upload_done else android.R.drawable.stat_notify_error)
+        .setContentTitle(title)
+        .setContentText(text.lineSequence().firstOrNull() ?: "")
+        .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+        .setCategory(if (ok) NotificationCompat.CATEGORY_STATUS else NotificationCompat.CATEGORY_ERROR)
+        .setContentIntent(openApp(ctx))
+        .setAutoCancel(true)
+        .build()
+      post(ctx, id, n)
+    }
+
+    @JvmStatic
+    fun stop(ctx: Context) {
+      try {
+        ctx.stopService(Intent(ctx, TransferService::class.java))
+      } catch (e: Exception) {
+        Log.w(TAG, "stop: $e")
+      }
+      NotificationManagerCompat.from(ctx).cancel(PROGRESS_ID)
+    }
+
+    private fun set(t: String, x: String, p: Int) {
+      title = t
+      text = x
+      percent = p
+    }
+
+    private fun progressNotification(ctx: Context): Notification {
+      val b = NotificationCompat.Builder(ctx, CH_PROGRESS)
+        .setSmallIcon(android.R.drawable.stat_sys_upload)
+        .setContentTitle(title)
+        .setContentText(text)
+        .setOngoing(true)
+        .setOnlyAlertOnce(true)
+        .setSilent(true)
+        .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+        .setContentIntent(openApp(ctx))
+        .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+      if (percent >= 0) b.setProgress(100, percent, false) else b.setProgress(0, 0, true)
+      return b.build()
+    }
+
+    // A tap brings the running app forward, as its launcher icon would.
+    private fun openApp(ctx: Context): PendingIntent {
+      val i = Intent(ctx, MainActivity::class.java)
+        .setAction(Intent.ACTION_MAIN)
+        .addCategory(Intent.CATEGORY_LAUNCHER)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      return PendingIntent.getActivity(
+        ctx, 0, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+      )
+    }
+
+    private fun channel(ctx: Context, id: String, name: String, importance: Int) {
+      if (Build.VERSION.SDK_INT < 26) return
+      // Creating an existing channel only renames it (the language may have changed).
+      ctx.getSystemService(NotificationManager::class.java)
+        ?.createNotificationChannel(NotificationChannel(id, name, importance))
+    }
+
+    // Without POST_NOTIFICATIONS (Android 13+, refused) the service still runs; only the
+    // notification is hidden.
+    private fun post(ctx: Context, id: Int, n: Notification) {
+      if (Build.VERSION.SDK_INT >= 33 &&
+        ctx.checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED
+      ) return
+      try {
+        NotificationManagerCompat.from(ctx).notify(id, n)
+      } catch (e: SecurityException) {
+        Log.w(TAG, "notify: $e")
+      }
+    }
+  }
+}
+KT
+  echo "wrote TransferService.kt"
+fi
+
+# R8 would rename or drop the static methods only JNI calls.
+cat >"$root/client/src-tauri/gen/android/app/ps5upload-transfer.pro" <<'PRO'
+# TransferService is driven from Rust over JNI (android_bg.rs); keep its names.
+-keep class com.phantomptr.ps5upload.TransferService { *; }
+-keep class com.phantomptr.ps5upload.TransferService$Companion { *; }
+PRO
+echo "wrote ps5upload-transfer.pro"
+
+python3 - "$manifest" <<'PY'
+import re, sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+perms = [
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE",
+    "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+    "android.permission.WAKE_LOCK",
+]
+# Exact attribute match: FOREGROUND_SERVICE is a prefix of the typed ones.
+missing = [p for p in perms if f'android:name="{p}"' not in src]
+if missing:
+    block = "".join(f'\n    <uses-permission android:name="{p}" />' for p in missing)
+    new = re.sub(r"(<manifest\b[^>]*>)", r"\1" + block, src, count=1)
+    if new == src:
+        sys.exit("::error::could not find <manifest> tag to add the service permissions")
+    src = new
+    print("added permissions:", ", ".join(missing))
+else:
+    print("service permissions already present — skipping")
+if ".TransferService" in src:
+    print("TransferService already declared — skipping")
+else:
+    service = ('        <service android:name=".TransferService" android:exported="false"\n'
+               '            android:foregroundServiceType="connectedDevice|dataSync" />\n')
+    new = src.replace("    </application>", service + "    </application>", 1)
+    if new == src:
+        sys.exit("::error::could not find </application> to declare TransferService")
+    src = new
+    print("declared TransferService")
+open(path, "w", encoding="utf-8").write(src)
+PY
 
 echo "android post-init patches applied"

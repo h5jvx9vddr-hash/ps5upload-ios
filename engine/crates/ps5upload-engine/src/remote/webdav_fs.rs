@@ -1,10 +1,11 @@
-//! WebDAV (RFC 4918) over plain HTTP or HTTPS, read-only: PROPFIND for listings and stat,
-//! ranged GET for reads. Basic auth only, which is what NAS boxes, Nextcloud, Alist and
+//! WebDAV (RFC 4918) over plain HTTP or HTTPS: PROPFIND for listings and stat, ranged GET
+//! for reads, and for the organizer's few writes MKCOL, MOVE (`Overwrite: F`) and DELETE of an
+//! empty collection. Basic auth only, which is what NAS boxes, Nextcloud, Alist and
 //! rclone serve; Digest-only servers answer 401 and the hint says so.
 //!
 //! Paths are absolute on the server (`/remote.php/dav/files/me/games`): the DAV root goes
 //! in the connection's start folder, and the browser walks down from there. Nothing here
-//! writes.
+//! writes file contents.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +22,8 @@ const PROPFIND_MAX: u64 = 64 * 1024 * 1024;
 
 pub struct WebdavFs {
     agent: ureq::Agent,
+    /// For PROPFIND and the writes: follows no redirect itself (see [`run_dav`]).
+    dav: ureq::Agent,
     /// `https://nas:5006`, no trailing slash.
     base: String,
     host: String,
@@ -52,20 +55,24 @@ impl WebdavFs {
                 base64::engine::general_purpose::STANDARD.encode(format!("{user}:"))
             )),
         };
-        let config = ureq::Agent::config_builder()
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .disable_verification(conn.insecure_tls)
-                    .build(),
-            )
-            .http_status_as_error(false)
-            // PROPFIND is not in ureq's method list.
-            .allow_non_standard_methods(true)
-            .timeout_global(Some(REQUEST_TIMEOUT))
-            .max_idle_connections_per_host(8)
-            .build();
+        let config = |redirects: u32| {
+            ureq::Agent::config_builder()
+                .tls_config(
+                    ureq::tls::TlsConfig::builder()
+                        .disable_verification(conn.insecure_tls)
+                        .build(),
+                )
+                .http_status_as_error(false)
+                // PROPFIND is not in ureq's method list.
+                .allow_non_standard_methods(true)
+                .timeout_global(Some(REQUEST_TIMEOUT))
+                .max_idle_connections_per_host(8)
+                .max_redirects(redirects)
+                .build()
+        };
         let fs = Self {
-            agent: ureq::Agent::new_with_config(config),
+            agent: ureq::Agent::new_with_config(config(10)),
+            dav: ureq::Agent::new_with_config(config(0)),
             base: format!("{scheme}://{hostport}"),
             host: hostport,
             auth,
@@ -86,24 +93,25 @@ impl WebdavFs {
 
     /// PROPFIND `path` with `depth` 0 or 1, parsed.
     async fn propfind(&self, path: &str, depth: u8) -> Result<Vec<DavItem>, RemoteError> {
-        let agent = self.agent.clone();
+        let agent = self.dav.clone();
+        let base = self.base.clone();
         let url = self.url(path);
         let auth = self.auth.clone();
         let host = self.host.clone();
         tokio::task::spawn_blocking(move || {
-            let mut req = ureq::http::Request::builder()
-                .method("PROPFIND")
-                .uri(&url)
-                .header("Depth", depth.to_string())
-                .header("Content-Type", "application/xml; charset=utf-8")
-                .header("User-Agent", "ps5upload");
-            if let Some(a) = &auth {
-                req = req.header("Authorization", a);
-            }
-            let req = req
-                .body(PROPFIND_BODY)
-                .map_err(|e| RemoteError::Io(format!("{host}: {e}")))?;
-            let mut resp = agent.run(req).map_err(|e| map_err(&host, e))?;
+            let mut resp = run_dav(&agent, &base, &url, &host, |url| {
+                let mut req = ureq::http::Request::builder()
+                    .method("PROPFIND")
+                    .uri(url)
+                    .header("Depth", depth.to_string())
+                    .header("Content-Type", "application/xml; charset=utf-8")
+                    .header("User-Agent", "ps5upload");
+                if let Some(a) = &auth {
+                    req = req.header("Authorization", a);
+                }
+                req.body(PROPFIND_BODY)
+                    .map_err(|e| RemoteError::Io(format!("{host}: {e}")))
+            })?;
             let status = resp.status().as_u16();
             match status {
                 207 | 200 => {}
@@ -128,6 +136,42 @@ impl WebdavFs {
         .map_err(|e| RemoteError::Io(format!("{e}")))?
     }
 
+    /// One bodiless request; the status, with sign-in failures already turned into errors.
+    async fn send(
+        &self,
+        method: &'static str,
+        path: &str,
+        headers: Vec<(&'static str, String)>,
+    ) -> Result<u16, RemoteError> {
+        let agent = self.dav.clone();
+        let base = self.base.clone();
+        let url = self.url(path);
+        let auth = self.auth.clone();
+        let host = self.host.clone();
+        tokio::task::spawn_blocking(move || {
+            let resp = run_dav(&agent, &base, &url, &host, |url| {
+                let mut req = ureq::http::Request::builder()
+                    .method(method)
+                    .uri(url)
+                    .header("User-Agent", "ps5upload");
+                for (k, v) in &headers {
+                    req = req.header(*k, v);
+                }
+                if let Some(a) = &auth {
+                    req = req.header("Authorization", a);
+                }
+                req.body(())
+                    .map_err(|e| RemoteError::Io(format!("{host}: {e}")))
+            })?;
+            match resp.status().as_u16() {
+                s @ (401 | 403) => Err(RemoteError::Auth(auth_reason(s))),
+                s => Ok(s),
+            }
+        })
+        .await
+        .map_err(|e| RemoteError::Io(format!("{e}")))?
+    }
+
     /// The entries directly under `path`, excluding `path` itself.
     async fn entries(&self, path: &str) -> Result<Vec<Entry>, RemoteError> {
         let me = normal(path);
@@ -141,6 +185,37 @@ impl WebdavFs {
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
+}
+
+/// Sends `make(url)`, and once more to where a redirect points when that is on the same
+/// server. ureq's own redirects drop the Authorization header, and Apache (behind many NAS
+/// WebDAV shares) redirects a folder's URL without its trailing slash to the one with it.
+fn run_dav<B: ureq::AsSendBody>(
+    agent: &ureq::Agent,
+    base: &str,
+    url: &str,
+    host: &str,
+    make: impl Fn(&str) -> Result<ureq::http::Request<B>, RemoteError>,
+) -> Result<ureq::http::Response<ureq::Body>, RemoteError> {
+    let resp = agent.run(make(url)?).map_err(|e| map_err(host, e))?;
+    if !matches!(resp.status().as_u16(), 301 | 302 | 307 | 308) {
+        return Ok(resp);
+    }
+    let to = resp
+        .headers()
+        .get("Location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let next = if to.starts_with('/') {
+        format!("{base}{to}")
+    } else if to.starts_with(&format!("{base}/")) {
+        to.to_string()
+    } else {
+        return Err(RemoteError::Io(format!(
+            "{host} redirected to another server ({to})"
+        )));
+    };
+    agent.run(make(&next)?).map_err(|e| map_err(host, e))
 }
 
 const PROPFIND_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -524,6 +599,48 @@ impl RemoteFs for WebdavFs {
         }
         Ok(out)
     }
+
+    async fn create_dir(&self, path: &str) -> Result<(), RemoteError> {
+        match self.send("MKCOL", path, Vec::new()).await? {
+            200 | 201 | 204 => Ok(()),
+            // 405: something is there already. A folder is fine; a file is not.
+            405 => match self.stat(path).await {
+                Ok(e) if e.is_dir => Ok(()),
+                Ok(_) => Err(RemoteError::Exists(format!("{path} is a file"))),
+                Err(e) => Err(e),
+            },
+            409 => Err(RemoteError::NotFound(format!("no folder for {path}"))),
+            s => Err(RemoteError::Io(format!(
+                "{}: MKCOL {path} returned HTTP {s}",
+                self.host
+            ))),
+        }
+    }
+
+    /// MOVE with `Overwrite: F`: the server answers 412 rather than replace the target.
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteError> {
+        let dest = self.url(&normal(to));
+        let headers = vec![("Destination", dest), ("Overwrite", "F".to_string())];
+        match self.send("MOVE", &normal(from), headers).await? {
+            200 | 201 | 204 => Ok(()),
+            412 => Err(RemoteError::Exists(format!("{to} already exists"))),
+            404 => Err(RemoteError::NotFound(format!("{from} not found"))),
+            409 => Err(RemoteError::NotFound(format!("no folder for {to}"))),
+            s => Err(RemoteError::Io(format!(
+                "{}: MOVE {from} returned HTTP {s}",
+                self.host
+            ))),
+        }
+    }
+
+    /// Never: DELETE on a collection removes it with everything in it, so even after a
+    /// listing showed it empty, a file landing in the moment before the DELETE would go too.
+    /// An emptied folder is left in place.
+    async fn remove_dir(&self, path: &str) -> Result<(), RemoteError> {
+        Err(RemoteError::Unsupported(format!(
+            "{path} left in place: WebDAV can only remove a folder with everything in it"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -715,5 +832,31 @@ mod tests {
         assert!(f.read_at(1000, 5).await.unwrap().is_empty());
         let walked = fs.walk("/d", 10).await.unwrap();
         assert!(walked.iter().any(|(p, _)| p == "a b.bin"));
+    }
+
+    /// A real server: `docker run -d -p 8088:80 -e AUTH_TYPE=Basic -e USERNAME=t -e PASSWORD=t
+    /// bytemark/webdav` with files `w/a` and `w/b` of different sizes in its /var/lib/dav/data,
+    /// then `PS5UPLOAD_WEBDAV_TEST=127.0.0.1:8088`.
+    #[tokio::test]
+    #[ignore = "needs a WebDAV server; see the doc comment"]
+    async fn webdav_meets_the_remote_contract() {
+        let Ok(addr) = std::env::var("PS5UPLOAD_WEBDAV_TEST") else {
+            return;
+        };
+        let (host, port) = addr.split_once(':').unwrap();
+        let mut conn = crate::remote::store::conn("t", Protocol::Webdav);
+        conn.host = host.into();
+        conn.port = port.parse().unwrap();
+        conn.user = "t".into();
+        let fs = WebdavFs::connect(
+            &conn,
+            &Secret::Password {
+                password: "t".into(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::remote::contract::check(&fs, "/").await;
+        crate::remote::contract::check_writes(&fs, "/w").await;
     }
 }

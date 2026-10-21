@@ -129,6 +129,115 @@ static int contains(const char *hay, const char *needle) {
     return strstr(hay, needle) != NULL;
 }
 
+
+/* ── app.db pagination fixtures (#473) ────────────────────────────────
+ *
+ * A big app table: `n` rows CUSA00000.. in title order, plus (when
+ * `late` is set) one late-sorting row ZZZZ99999 -- the shape of a title
+ * that used to fall off the end of the fixed 256-row window. */
+static void make_big_app_db(const char *path, int n, int late,
+                            int long_names) {
+    unlink(path);
+    sqlite3 *db = NULL;
+    assert(sqlite3_open(path, &db) == SQLITE_OK);
+    exec_or_die(db,
+        "CREATE TABLE tbl_info_1000000 ("
+        "  titleId TEXT, appId INTEGER, titleName TEXT);");
+    exec_or_die(db, "BEGIN");
+    sqlite3_stmt *st = NULL;
+    assert(sqlite3_prepare_v2(db,
+                              "INSERT INTO tbl_info_1000000 VALUES (?,?,?)",
+                              -1, &st, NULL) == SQLITE_OK);
+    for (int i = 0; i < n; i++) {
+        char tid[16], name[300];
+        snprintf(tid, sizeof tid, "CUSA%05d", i);
+        if (long_names) {
+            /* 200+ characters with quotes, backslashes and a control
+             * byte: every one of them grows when escaped. */
+            int o = snprintf(name, sizeof name, "Game \"%d\" \\ \t", i);
+            while (o < 240) name[o++] = 'x';
+            name[o] = '\0';
+        } else {
+            snprintf(name, sizeof name, "Game %d", i);
+        }
+        sqlite3_bind_text(st, 1, tid, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, 1000 + i);
+        sqlite3_bind_text(st, 3, name, -1, SQLITE_TRANSIENT);
+        assert(sqlite3_step(st) == SQLITE_DONE);
+        sqlite3_reset(st);
+    }
+    sqlite3_finalize(st);
+    if (late)
+        exec_or_die(db, "INSERT INTO tbl_info_1000000 VALUES"
+                        " ('ZZZZ99999', 9, 'Late Title')");
+    exec_or_die(db, "COMMIT");
+    sqlite3_close(db);
+}
+
+/* The unsigned number after "key": in `json`, or -1. */
+static long json_num(const char *json, const char *key) {
+    char needle[40];
+    snprintf(needle, sizeof needle, "\"%s\":", key);
+    const char *p = strstr(json, needle);
+    if (!p) return -1;
+    return strtol(p + strlen(needle), NULL, 10);
+}
+
+static int json_true(const char *json, const char *key) {
+    char needle[40];
+    snprintf(needle, sizeof needle, "\"%s\":true", key);
+    return strstr(json, needle) != NULL;
+}
+
+/* Count the title ids in one page and check each is the next expected
+ * one, so a skipped or repeated row fails, not just a short count. */
+static int page_ids(const char *json, int *seen_upto, int *saw_late) {
+    int n = 0;
+    const char *p = json;
+    while ((p = strstr(p, "\"title_id\":\"")) != NULL) {
+        p += strlen("\"title_id\":\"");
+        if (strncmp(p, "ZZZZ99999", 9) == 0) {
+            *saw_late = 1;
+        } else {
+            char want[16];
+            snprintf(want, sizeof want, "CUSA%05d", *seen_upto);
+            assert(strncmp(p, want, 9) == 0);
+            (*seen_upto)++;
+        }
+        n++;
+    }
+    return n;
+}
+
+/* Page through the whole table the way the engine does; returns how many
+ * rows arrived. Fails if a page claims more but makes no progress. */
+static int page_all(char *buf, size_t cap, unsigned limit, int *saw_late,
+                    int *pages, int *truncated) {
+    int seen_upto = 0, total = 0;
+    unsigned offset = 0;
+    *saw_late = 0;
+    *pages = 0;
+    *truncated = 0;
+    for (;;) {
+        size_t written = 0;
+        assert(content_db_apps_page_json(offset, limit, buf, cap, &written) ==
+               0);
+        assert(written > 0 && written < cap);
+        assert(buf[written - 1] == '}');
+        (*pages)++;
+        int got = page_ids(buf, &seen_upto, saw_late);
+        total += got;
+        assert(json_num(buf, "offset") == (long)offset);
+        assert(json_num(buf, "next") == (long)(offset + (unsigned)got));
+        if (json_true(buf, "truncated")) *truncated = 1;
+        if (!json_true(buf, "more")) break;
+        assert(got > 0);
+        offset += (unsigned)got;
+        assert(*pages < 10000);
+    }
+    return total;
+}
+
 int main(void) {
     char buf[64 * 1024];
     size_t written = 0;
@@ -276,6 +385,135 @@ int main(void) {
                                        &written) == 0);
         assert(contains(buf, "\"ok\":true"));
         printf("✓ non-SELECT refused; table intact\n");
+    }
+
+
+    /* ── app.db pagination (#473) ───────────────────────────────────── */
+    {
+        static char pbuf[64 * 1024];
+        int late, pages, trunc;
+        const int sizes[] = {255, 256, 257, 1000, 1500};
+        for (size_t i = 0; i < sizeof sizes / sizeof *sizes; i++) {
+            make_big_app_db(CONTENT_DB_APP, sizes[i], 1, 0);
+            int got = page_all(pbuf, sizeof pbuf, 0, &late, &pages, &trunc);
+            assert(got == sizes[i] + 1);
+            assert(late);
+            assert(!trunc);
+            printf("✓ %d rows + a late-sorting title: all %d arrive in %d page(s)\n",
+                   sizes[i], got, pages);
+        }
+
+        /* The no-argument call (what an older engine sends) is page one:
+         * never a silent cap that looks complete. */
+        make_big_app_db(CONTENT_DB_APP, 1000, 1, 0);
+        assert(content_db_apps_json(pbuf, sizeof pbuf, &written) == 0);
+        assert(json_num(pbuf, "offset") == 0);
+        assert(json_true(pbuf, "more"));
+        assert(!json_true(pbuf, "truncated"));
+        assert(json_num(pbuf, "next") > 256);
+        assert(json_num(pbuf, "total") == 1001);
+        printf("✓ the unpaged call says more rows follow (next=%ld)\n",
+               json_num(pbuf, "next"));
+
+        /* An earlier-sorting row added later shifts the window but does
+         * not push the late title out. */
+        {
+            sqlite3 *db = NULL;
+            assert(sqlite3_open(CONTENT_DB_APP, &db) == SQLITE_OK);
+            exec_or_die(db, "INSERT INTO tbl_info_1000000 VALUES"
+                            " ('AAAA00001', 1, 'Early Title')");
+            sqlite3_close(db);
+            int seen = 0, saw_late = 0, saw_early = 0;
+            unsigned off = 0;
+            for (;;) {
+                assert(content_db_apps_page_json(off, 0, pbuf, sizeof pbuf,
+                                                 &written) == 0);
+                const char *p = pbuf;
+                int got = 0;
+                while ((p = strstr(p, "\"title_id\":\"")) != NULL) {
+                    p += 12;
+                    if (!strncmp(p, "ZZZZ99999", 9)) saw_late = 1;
+                    if (!strncmp(p, "AAAA00001", 9)) saw_early = 1;
+                    got++;
+                }
+                seen += got;
+                if (!json_true(pbuf, "more")) break;
+                off += (unsigned)got;
+            }
+            assert(seen == 1002 && saw_late && saw_early);
+            printf("✓ an earlier-sorting row does not push the late title out\n");
+        }
+
+        /* An explicit limit is honoured. */
+        make_big_app_db(CONTENT_DB_APP, 300, 0, 0);
+        assert(content_db_apps_page_json(100, 50, pbuf, sizeof pbuf,
+                                         &written) == 0);
+        assert(contains(pbuf, "\"title_id\":\"CUSA00100\""));
+        assert(contains(pbuf, "\"title_id\":\"CUSA00149\""));
+        assert(!contains(pbuf, "\"title_id\":\"CUSA00150\""));
+        assert(json_num(pbuf, "next") == 150);
+        assert(json_true(pbuf, "more"));
+        assert(content_db_apps_page_json(300, 50, pbuf, sizeof pbuf,
+                                         &written) == 0);
+        assert(contains(pbuf, "\"apps\":[]"));
+        assert(!json_true(pbuf, "more"));
+        assert(json_num(pbuf, "next") == 300);
+        printf("✓ offset/limit select a window; past the end is empty and final\n");
+
+        /* A small buffer stops early and says where -- a continuation,
+         * not a complete-looking list. */
+        make_big_app_db(CONTENT_DB_APP, 300, 1, 1);
+        {
+            static char small[2048];
+            assert(content_db_apps_page_json(0, 0, small, sizeof small,
+                                             &written) == 0);
+            long next = json_num(small, "next");
+            assert(next > 0 && next < 300);
+            assert(json_true(small, "more"));
+            assert(!json_true(small, "truncated"));
+            assert(contains(small, "Game \\\"0\\\" \\\\ \\t"));
+            int got = page_all(small, sizeof small, 0, &late, &pages, &trunc);
+            assert(got == 301 && late && !trunc);
+            printf("✓ a 2 KiB buffer pages long escaped names: 301 rows in %d pages\n",
+                   pages);
+        }
+
+        /* A buffer that cannot hold even one row reports truncation and
+         * stops, rather than looping or claiming an empty success. */
+        {
+            static char tiny[160];
+            assert(content_db_apps_page_json(0, 0, tiny, sizeof tiny,
+                                             &written) == 0);
+            assert(contains(tiny, "\"apps\":[]"));
+            assert(json_true(tiny, "truncated"));
+            assert(!json_true(tiny, "more"));
+            printf("✓ a buffer too small for one row is reported as truncated\n");
+        }
+
+        /* The row API is no longer clipped at 256 either. */
+        make_big_app_db(CONTENT_DB_APP, 600, 0, 0);
+        {
+            content_db_app_t *big =
+                (content_db_app_t *)malloc(sizeof(content_db_app_t) * 700);
+            assert(big);
+            assert(content_db_apps(big, 700, NULL) == 600);
+            assert(strcmp(big[599].title_id, "CUSA00599") == 0);
+            free(big);
+        }
+        printf("✓ row API returns all 600 rows\n");
+
+        /* A query error is still the err envelope, and says it is final. */
+        {
+            FILE *f = fopen(CONTENT_DB_APP, "wb");
+            assert(f);
+            fputs("not a database", f);
+            fclose(f);
+            assert(content_db_apps_page_json(0, 0, pbuf, sizeof pbuf,
+                                             &written) == 0);
+            assert(contains(pbuf, "\"err\":") && contains(pbuf, "\"apps\":[]"));
+            assert(!json_true(pbuf, "more"));
+            printf("✓ unreadable app.db on a paged call still answers err+apps\n");
+        }
     }
 
     /* ── home-screen icon hide / unhide (#407) ─────────────────────── */

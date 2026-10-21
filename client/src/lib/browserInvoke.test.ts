@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { browserInvoke, BrowserUnsupportedError, parseSseBlock, timeSyncBody } from "./browserInvoke";
+import {
+  browserInvoke,
+  BrowserUnsupportedError,
+  parseSseBlock,
+  statusFailureFields,
+  timeSyncBody,
+} from "./browserInvoke";
 
 vi.mock("../state/engine", () => ({
   getEngineUrl: () => "http://engine.test:19113",
@@ -267,6 +273,27 @@ describe("engine-backed commands the web UI depends on (#300)", () => {
     });
   });
 
+  it("sends transfer_file_list to the engine's file-list job, body unchanged", async () => {
+    // The Files screen's multi-file pick: one job for the set. The web UI must reach the same
+    // route the desktop shell proxies to, or a pick of thousands of files breaks there.
+    const calls = captureFetch({ job_id: "j2" });
+    const req = {
+      dest_root: "/data/x",
+      files: [
+        { src: "/srv/a.bin", dest: "/data/x/a.bin" },
+        { src: "/srv/b.bin", dest: "/data/x/b (2).bin" },
+      ],
+      addr: "192.168.1.50",
+      tx_id: "0123456789abcdef0123456789abcdef",
+      bandwidth_cap_mbps: null,
+    };
+    const r = await browserInvoke<{ job_id: string }>("transfer_file_list", { req });
+    expect(r.job_id).toBe("j2");
+    expect(calls[0].url).toBe(`${B}/api/transfer/file-list`);
+    expect(calls[0].init.method).toBe("POST");
+    expect(JSON.parse(calls[0].init.body as string)).toEqual(req);
+  });
+
   it("maps ffpkg_extract's camelCase args onto the engine's snake_case body", async () => {
     const calls = captureFetch({ ok: true });
     await browserInvoke("ffpkg_extract", {
@@ -386,5 +413,82 @@ describe("streaming archive inspect over SSE", () => {
       { event: "progress", data: "a\nb" },
     );
     expect(parseSseBlock(": just a comment")).toBeNull();
+  });
+});
+
+/**
+ * `payload_check` is the status probe the poller reads rest mode from: the engine's 502 body
+ * `{ error, reason, power }` must reach the caller the same way probes.rs passes it through.
+ */
+describe("payload_check passes the status failure's reason and power through", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function stubStatus(status: number, body: string) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => body,
+        json: async () => JSON.parse(body) as unknown,
+      })) as unknown as typeof fetch,
+    );
+  }
+
+  it("parses reason and power from a rest-mode reply", async () => {
+    const body = JSON.stringify({
+      error: "payload rejected NODE_STATUS: console_rest_mode: The PS5 is in rest mode.",
+      reason: "console_rest_mode",
+      power: "rest",
+    });
+    stubStatus(502, body);
+    const res = await browserInvoke<Record<string, unknown>>("payload_check", {
+      ip: "10.0.0.2",
+    });
+    expect(res).toEqual({
+      ok: false,
+      reachable: false,
+      engine: true,
+      error: body,
+      reason: "console_rest_mode",
+      power: "rest",
+    });
+  });
+
+  it("leaves both out for an older engine's body or a non-JSON one", async () => {
+    stubStatus(502, JSON.stringify({ error: "helper_not_ava1: gone" }));
+    const a = await browserInvoke<Record<string, unknown>>("payload_check", {
+      ip: "10.0.0.2",
+    });
+    expect("reason" in a || "power" in a).toBe(false);
+    stubStatus(502, "Bad Gateway");
+    const b = await browserInvoke<Record<string, unknown>>("payload_check", {
+      ip: "10.0.0.2",
+    });
+    expect(b["error"]).toBe("Bad Gateway");
+    expect("reason" in b || "power" in b).toBe(false);
+  });
+
+  it("statusFailureFields keeps only string fields", () => {
+    expect(
+      statusFailureFields('{"reason":"ava1_unreachable","power":"unreachable"}'),
+    ).toEqual({ reason: "ava1_unreachable", power: "unreachable" });
+    expect(statusFailureFields('{"reason":5,"power":null}')).toEqual({});
+    expect(statusFailureFields("null")).toEqual({});
+    expect(statusFailureFields("")).toEqual({});
+  });
+});
+
+
+describe("remote conversion preflight", () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  it.each(["fpkg_inspect", "fpkg_build", "fpkg_estimate"])("%s allows console metadata reads beyond one minute", async (cmd) => {
+    const deadline = vi.spyOn(AbortSignal, "timeout");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ files: 42 }), { status: 200 })));
+    await browserInvoke(cmd, { source: "ps5://console/data/game.exfat", outputDir: "/games" });
+    expect(deadline).toHaveBeenCalledWith(3_600_000);
+    const call = vi.mocked(fetch).mock.calls[0];
+    expect(JSON.parse(call[1]?.body as string).source).toBe("ps5://console/data/game.exfat");
   });
 });

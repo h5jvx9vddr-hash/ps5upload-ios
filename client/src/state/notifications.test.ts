@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // so the vi.mock factory can reference it.
 const { mockSend, state } = vi.hoisted(() => ({
   mockSend: vi.fn(),
-  state: { foreground: true },
+  state: { foreground: true, native: false },
 }));
 
 vi.mock("../lib/osNotify", () => ({
@@ -14,12 +14,20 @@ vi.mock("../lib/osNotify", () => ({
   ensureOsNotificationPermission: vi.fn(async () => false),
 }));
 
+// Whether the host posts job outcomes itself (desktop / Android watcher).
+vi.mock("../lib/bgNotify", () => ({
+  nativeJobNotify: () => Promise.resolve(state.native),
+}));
+
 import { useNotificationsStore } from "./notifications";
+
+const flush = () => new Promise((r) => setTimeout(r, 0));
 
 describe("notifications → OS notification mirror", () => {
   beforeEach(() => {
     mockSend.mockClear();
     state.foreground = true;
+    state.native = false;
     useNotificationsStore.setState({ entries: [], osNotifyEnabled: true });
   });
 
@@ -56,5 +64,30 @@ describe("notifications → OS notification mirror", () => {
     expect(entries[0]?.id).toBe(id);
     expect(entries[0]?.title).toBe("Done");
     expect(entries[0]?.level).toBe("success");
+  });
+
+  it("leaves a job outcome to the host when the host notifies job endings", async () => {
+    state.foreground = false;
+    state.native = true;
+    useNotificationsStore
+      .getState()
+      .push("success", "Upload complete", { body: "Astro Bot", jobOutcome: true });
+    await flush();
+    expect(mockSend).not.toHaveBeenCalled();
+    // Still in the inbox.
+    expect(useNotificationsStore.getState().entries[0]?.title).toBe("Upload complete");
+    // Anything else is still mirrored.
+    useNotificationsStore.getState().push("warning", "Low space");
+    expect(mockSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("mirrors a job outcome itself where no host notifies (browser, older host)", async () => {
+    state.foreground = false;
+    state.native = false;
+    useNotificationsStore
+      .getState()
+      .push("error", "Install failed", { body: "refused", jobOutcome: true });
+    await flush();
+    expect(mockSend).toHaveBeenCalledWith("error", "Install failed", "refused");
   });
 });

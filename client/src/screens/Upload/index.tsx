@@ -1,3 +1,4 @@
+import BrowserFilePicker from "./BrowserFilePicker";
 import { consoleAddr } from "../../lib/addr";
 import { useEffect, useMemo, useState } from "react";
 import { PackagePanel } from "../../components/PackagePanel";
@@ -15,6 +16,7 @@ import {
   Plus,
   type LucideIcon,
   ListPlus,
+  Moon,
 } from "lucide-react";
 import clsx from "clsx";
 import { openDialog } from "../../lib/openDialog";
@@ -746,6 +748,11 @@ export default function UploadScreen() {
       />
 
       <PayloadReadinessBanner />
+
+      {!isTauriEnv() && <BrowserFilePicker onFiles={(paths) => {
+        if (paths.length === 1 && !source && batchRows.length === 0) void pickFile(paths[0]);
+        else addToBatch(paths.map((path) => ({ path, isDir: false })));
+      }} />}
 
       <Step1Picker
         active={!source}
@@ -3683,8 +3690,33 @@ export type { SourceKind };
 function PayloadReadinessBanner() {
   const tr = useTr();
   const status = useConnectionStore((s) => s.payloadStatus);
+  const power = useConnectionStore((s) => s.power);
   const navigate = useNavigate();
   if (status === "up") return null;
+  // Asleep is not a fault: say so calmly, and that queued uploads wait for the wake.
+  if (status === "down" && power === "rest") {
+    return (
+      <div
+        role="status"
+        data-testid="upload-rest-mode"
+        className="mb-4 flex items-start gap-3 rounded-[var(--radius-card)] border border-[color-mix(in_srgb,var(--color-accent)_35%,transparent)] bg-[var(--color-accent-soft)] px-4 py-3 text-sm"
+      >
+        <Moon size={16} className="mt-0.5 shrink-0 text-[var(--color-accent-bright)]" aria-hidden />
+        <div className="min-w-0">
+          <div className="font-semibold">
+            {tr("gate_rest_title", undefined, "Your PS5 is in rest mode")}
+          </div>
+          <div className="mt-0.5 text-[var(--color-muted)]">
+            {tr(
+              "upload_rest_detail",
+              undefined,
+              "Uploads wait for it to wake and carry on by themselves once the helper is back.",
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
   // "Helper" (not "payload") — the ps5upload ELF is called the Helper
   // everywhere on Connection/Dashboard; "payload" here meant the same
   // thing but collided with the separate Payloads catalog. And these were

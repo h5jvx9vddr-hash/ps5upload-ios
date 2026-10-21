@@ -332,7 +332,7 @@ export default function CollectionScreen() {
                   label: tr(
                     "collection.org_menu",
                     undefined,
-                    "Organize packages…",
+                    "Organize collection\u2026",
                   ),
                   disabled: scanning,
                   onSelect: () => setOrganizeOpen(true),
@@ -418,6 +418,25 @@ export default function CollectionScreen() {
             retrying={s.loading}
           />
         </div>
+      )}
+
+      {/* A folder the last scan could not open was skipped (#461): its games are missing
+          until it is back, so say which and where to remove it. */}
+      {(s.library?.missing_roots?.length ?? 0) > 0 && (
+        <p className="mb-4 rounded-2xl border border-[var(--color-bad)]/30 bg-[var(--color-bad)]/10 px-3 py-2 text-xs">
+          {tr(
+            "collection.missing_roots",
+            { paths: (s.library?.missing_roots ?? []).join(", ") },
+            "The last scan skipped what it could not find: {paths}. If a folder was deleted, remove it in Folders; if it is on a drive or server, reconnect it and scan again.",
+          )}{" "}
+          <button
+            type="button"
+            className="font-medium underline"
+            onClick={() => setFoldersOpen(true)}
+          >
+            {tr("collection.folders", undefined, "Folders")}
+          </button>
+        </p>
       )}
 
       {/* Not loaded (the read failed): an unread collection is not an empty

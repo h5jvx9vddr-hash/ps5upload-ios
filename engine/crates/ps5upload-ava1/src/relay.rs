@@ -565,6 +565,13 @@ pub fn ps5_to_ps5_capped(
                 last_at = Instant::now();
                 last_durable = durable;
             } else if last_at.elapsed() > STALL_LIMIT {
+                // A console asleep is named (rest mode, the one to wake); else the bare stall.
+                for (pool, console) in [(from_pool, from), (to_pool, to)] {
+                    let e = SessionGate::stalled(pool, console, String::new());
+                    if let Ok(f) = e.downcast::<crate::upload::UploadFailure>() {
+                        return Err(ConsoleFailure::on(console, f).into());
+                    }
+                }
                 return Err(anyhow!("no durable progress for {STALL_LIMIT:?}"));
             }
             let sa = match from_pool.session(from).await {

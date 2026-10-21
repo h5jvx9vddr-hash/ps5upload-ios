@@ -8,6 +8,8 @@ import {
   cachedGameIcon,
   gameIconUrl,
   gameIconDataUrl,
+  GRID_ICON_SIZE,
+  iconSizeFor,
 } from "../api/ps5";
 import { transferAddr } from "../lib/addr";
 import { iconTitleId } from "../lib/titleId";
@@ -55,6 +57,8 @@ export function GameIcon({
   fill?: boolean;
 }) {
   const hostReady = !!host.trim();
+  // A scaled copy from the engine: a full icon0.png is 300-700 KiB (#450).
+  const px = fill ? GRID_ICON_SIZE : iconSizeFor(size);
   // A folder named after a title but not exactly it (a save backup `PPSA17221.bak`) shows that
   // title's icon; a name that isn't a title id at all skips the console lookup.
   const iconId = titleId ? iconTitleId(titleId) : null;
@@ -62,8 +66,8 @@ export function GameIcon({
   // Filtering nulls here means the fallback chain naturally skips sources we
   // don't have rather than rendering a broken <img>.
   const candidates = [
-    hostReady && iconId ? appIconUrl(transferAddr(host), iconId) : null,
-    hostReady && gamePath ? gameIconUrl(transferAddr(host), gamePath) : null,
+    hostReady && iconId ? appIconUrl(transferAddr(host), iconId, px) : null,
+    hostReady && gamePath ? gameIconUrl(transferAddr(host), gamePath, px) : null,
     fallbackSrc || null,
   ].filter((s): s is string => !!s);
   const [idx, setIdx] = useState(0);
@@ -87,15 +91,15 @@ export function GameIcon({
     // already holds its bytes there is nothing to fetch.
     cached:
       idx === 0 && hostReady && iconId
-        ? cachedAppIcon(transferAddr(host), iconId)
+        ? cachedAppIcon(transferAddr(host), iconId, px)
         : idx === (iconId && hostReady ? 1 : 0) && hostReady && gamePath
-          ? cachedGameIcon(transferAddr(host), gamePath)
+          ? cachedGameIcon(transferAddr(host), gamePath, px)
           : undefined,
     fallbackLoader: () =>
       idx === 0 && hostReady && iconId
-        ? appIconDataUrl(transferAddr(host), iconId)
+        ? appIconDataUrl(transferAddr(host), iconId, px)
         : idx === (iconId && hostReady ? 1 : 0) && hostReady && gamePath
-          ? gameIconDataUrl(transferAddr(host), gamePath)
+          ? gameIconDataUrl(transferAddr(host), gamePath, px)
           : Promise.resolve(null),
   });
   const advance = useCallback(() => setIdx((i) => i + 1), [setIdx]);

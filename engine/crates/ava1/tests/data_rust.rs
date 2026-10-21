@@ -1194,6 +1194,47 @@ async fn a_slow_but_moving_sender_is_not_cut() {
     );
 }
 
+/// SkipProgress (SPEC.md §12.8) is progress: a sender reading past data the receiver holds
+/// sends only that for several deadlines, is not cut, and then finishes.
+#[tokio::test(flavor = "multi_thread")]
+async fn skip_progress_is_progress_for_the_rust_receiver() {
+    let (link, _s, mut ended, _d, n) =
+        deadline_job("rr-skip", 0x93, 2, Duration::from_millis(800), None).await;
+    let lane = link.opener().unwrap().open().await.unwrap();
+    let t0 = std::time::Instant::now();
+    let mut skipped = 0u64;
+    while t0.elapsed() < Duration::from_millis(3000) {
+        skipped += 1 << 20;
+        link.control
+            .send(&gen::SkipProgress {
+                job_id: [0x93; 16],
+                bytes_skipped: skipped,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            ended.try_recv().is_err(),
+            "the job ended after {:?} of SkipProgress",
+            t0.elapsed()
+        );
+    }
+    for i in 0..n {
+        link.lane(lane)
+            .unwrap()
+            .tx
+            .send_raw(Bundle::TYPE, 0, i + 1, bundle_body([0x93; 16], i, b"data"))
+            .await
+            .unwrap();
+    }
+    let files = tokio::time::timeout(Duration::from_secs(20), ended.recv())
+        .await
+        .expect("the job ended")
+        .expect("a result")
+        .expect("it completed, was not cut");
+    assert_eq!(files, n);
+}
+
 /// Disk work in flight is progress too: a sync batch that outlasts the deadline (a slow
 /// drive) must not read as a stalled sender.
 #[tokio::test(flavor = "multi_thread")]

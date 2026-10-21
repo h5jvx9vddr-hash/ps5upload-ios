@@ -1,14 +1,16 @@
-import { Package, HardDrive } from "lucide-react";
+import { Folder, Package, HardDrive } from "lucide-react";
 
 import { Badge, Card } from "../../components";
 import { ps5FakeGameUnplayableFirmware } from "../../lib/ps5Firmware";
+import type { MakeKind } from "../../state/convertPrefs";
 import { useTr } from "../../state/lang";
 
 /**
- * ② What to make: a package the PS5 installs, or a game image ShadowMount+ mounts. The two
- * are explained side by side, and the one that suits the game on the connected console is
- * marked: a PS5 game on firmware above 11.60 installs as a package but will not play, so the
- * image is the way; otherwise the package is the ordinary choice.
+ * ② What to make: a package the PS5 installs, a game image ShadowMount+ mounts, or (#469) the
+ * game's files back as a plain folder. They are explained side by side, and the one of the
+ * first two that suits the game on the connected console is marked: a PS5 game on firmware
+ * above 11.60 installs as a package but will not play, so the image is the way; otherwise the
+ * package is the ordinary choice. The folder is never marked: it is a way back, not a way in.
  */
 export function MakeCard({
   make,
@@ -18,8 +20,8 @@ export function MakeCard({
   checked,
   locked = false,
 }: {
-  make: "pkg" | "image";
-  onMake: (make: "pkg" | "image") => void;
+  make: MakeKind;
+  onMake: (make: MakeKind) => void;
   /** The connected console's kernel string, for the firmware line. */
   kernel: string | null | undefined;
   /** The checked game's content id (or title id); null before a game is checked. */
@@ -31,7 +33,7 @@ export function MakeCard({
   const tr = useTr();
   const unplayableOn = checked ? ps5FakeGameUnplayableFirmware(kernel, contentId) : null;
   const recommended: "pkg" | "image" | null = !checked ? null : unplayableOn ? "image" : "pkg";
-  const tiles: { id: "pkg" | "image"; icon: typeof Package; title: string; body: string }[] = [
+  const tiles: { id: MakeKind; icon: typeof Package; title: string; body: string }[] = [
     {
       id: "pkg",
       icon: Package,
@@ -52,12 +54,22 @@ export function MakeCard({
         "One file on a PS5 drive that ShadowMount+ mounts and shows on the home screen. Nothing is installed, and it plays on firmware where a PS5 package will not.",
       ),
     },
+    {
+      id: "folder",
+      icon: Folder,
+      title: tr("fpkg.make.folder_title", undefined, "A game folder"),
+      body: tr(
+        "fpkg.make.folder_body",
+        undefined,
+        "The game's files as a plain folder on this computer, from a game image or a package made with the debug key. Edit it, keep it, or upload it like any folder.",
+      ),
+    },
   ];
   return (
     <Card>
       <div className="flex flex-col gap-3 text-sm">
         <div className="font-medium">{tr("fpkg.card.make", undefined, "② What to make")}</div>
-        <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" data-testid="make-choice">
+        <div className="grid gap-2 sm:grid-cols-3" role="radiogroup" data-testid="make-choice">
           {tiles.map((t) => {
             const on = make === t.id;
             const Icon = t.icon;

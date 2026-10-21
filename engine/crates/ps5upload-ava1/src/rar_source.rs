@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ava1::gen;
 use ava1::manifest::{self, Entry, Manifest};
@@ -119,6 +119,8 @@ pub struct RarSource {
     sizes: Vec<u64>,
     /// Manifest id -> path.
     by_id: Vec<String>,
+    /// Bytes decoded only to be discarded (solid: the entries a pass skips).
+    skipped: AtomicU64,
 }
 
 impl RarSource {
@@ -214,12 +216,19 @@ impl RarSource {
                 order,
                 sizes: layout.files.iter().map(|(_, s)| *s).collect(),
                 by_id,
+                skipped: AtomicU64::new(0),
             },
         ))
     }
 
     pub fn is_solid(&self) -> bool {
         self.solid
+    }
+
+    /// Bytes decoded only to be discarded (the "skipping data the console already has"
+    /// phase of a solid resume).
+    pub fn bytes_skipped(&self) -> u64 {
+        self.skipped.load(Ordering::Relaxed)
     }
 
     /// Test seam: replace the archive-order listing the entry positions come from
@@ -287,6 +296,10 @@ impl RarWalkSink for Adapter<'_> {
     fn end(&mut self) -> io::Result<()> {
         self.sink.end()
     }
+
+    fn skipped(&mut self, n: u64) {
+        self.src.skipped.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 impl SeqSource for RarSource {
@@ -341,6 +354,10 @@ impl SeqSource for RarSource {
             .get(file_id as usize)
             .and_then(|p| self.ordinal.get(p))
             .map_or(Restart::START, |o| Restart(*o))
+    }
+
+    fn bytes_skipped(&self) -> u64 {
+        RarSource::bytes_skipped(self)
     }
 }
 

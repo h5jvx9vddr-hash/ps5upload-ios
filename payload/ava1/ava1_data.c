@@ -933,6 +933,38 @@ static int root_in_use(const uint8_t id[16], const char *root) {
     return busy;
 }
 
+typedef struct {
+    char (*roots)[AVA1_MAX_PATH + 1];
+    unsigned max, n;
+} upload_roots_t;
+
+/* Under the table lock and g_open_mu (ava1_data_upload_roots): kind and root are written by
+ * ava1_recv_open under g_open_mu, `attached` under the table lock, so both reads are stable. */
+static void upload_root_each(ava1_job_t *j, void *ctx) {
+    static const uint8_t zero_owner[32];
+    upload_roots_t *r = ctx;
+    size_t len;
+    if (r->n >= r->max || j->kind != AVA1_JOB_UPLOAD || !j->attached) return; /* parked: nobody is sending */
+    if (memcmp(j->owner, zero_owner, 32) == 0) return; /* a start-time recovery placeholder */
+    if (__atomic_load_n(&j->finished, __ATOMIC_ACQUIRE) || __atomic_load_n(&j->stopping, __ATOMIC_ACQUIRE)) return;
+    len = strnlen(j->root, AVA1_MAX_PATH);
+    if (!len) return;
+    memcpy(r->roots[r->n], j->root, len);
+    r->roots[r->n][len] = '\0';
+    r->n++;
+}
+
+int ava1_data_upload_roots(char (*roots)[AVA1_MAX_PATH + 1], unsigned max) {
+    upload_roots_t r;
+    r.roots = roots;
+    r.max = max;
+    r.n = 0;
+    pthread_mutex_lock(&g_open_mu);
+    ava1_job_foreach(upload_root_each, &r);
+    pthread_mutex_unlock(&g_open_mu);
+    return (int)r.n;
+}
+
 /* Consumes `o`'s refusal flag under O.mu. The slot cannot be reused while its open runs
  * (the drain that frees it follows open_now), so the flag always belongs to this open.
  * 1 = a pipelined frame was not queued; `status`/`msg` carry why. */
@@ -1329,6 +1361,23 @@ static void tell_cancelled(ava1_job_t *j) {
     }
 }
 
+/* JOB_CANCEL's effect on a job the caller holds a reference to. */
+static void cancel_job(ava1_job_t *j) {
+    if (j->kind == AVA1_JOB_OPKIND) ava1_op_cancel(j); /* an operation: stays listed, finished */
+    else {
+        tell_cancelled(j);
+        ava1_recv_cancel(j); /* stops it and unlists it: the journal stays */
+    }
+}
+
+int ava1_job_cancel_any(const uint8_t id[16]) {
+    ava1_job_t *j = ava1_job_find(id);
+    if (!j) return AVA1_ERR_UNKNOWN_JOB;
+    cancel_job(j);
+    ava1_job_put(j);
+    return AVA1_STATUS_OK;
+}
+
 int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *out, size_t cap,
                   size_t *out_len) {
     const uint8_t *peer = ava1_server_rpc_peer();
@@ -1392,7 +1441,11 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
         int st = AVA1_STATUS_OK;
         if (ava1_job_ref_decode(body, len, &r) != 0) return AVA1_ERR_PROTOCOL;
         if (!(j = ava1_job_find(r.job_id))) return AVA1_ERR_UNKNOWN_JOB;
-        if (memcmp(j->owner, peer, 32) != 0 && !(j->c2c && memcmp(j->c2c_by, peer, 32) == 0)) {
+        /* A transfer (an upload, a download, a send to another console) answers any paired device,
+         * so another one can watch or take it over (#444, CAP_SHARED_JOBS); an operation or a local
+         * copy only its owner. Only a fully paired session reaches an RPC. */
+        if (memcmp(j->owner, peer, 32) != 0 && !(j->c2c && memcmp(j->c2c_by, peer, 32) == 0) &&
+            j->kind != AVA1_JOB_UPLOAD && j->kind != AVA1_JOB_DOWNLOAD) {
             ava1_job_put(j);
             return AVA1_ERR_UNKNOWN_JOB;
         }
@@ -1400,11 +1453,7 @@ int ava1_data_rpc(uint16_t method, const uint8_t *body, uint32_t len, uint8_t *o
             int fin = j->kind == AVA1_JOB_OPKIND && ava1_op_finished_before(j); /* before encoding */
             st = encode_status(j, out, cap, out_len);
             if (st == AVA1_STATUS_OK && j->kind == AVA1_JOB_OPKIND) ava1_op_status_delivered(j, fin);
-        } else if (j->kind == AVA1_JOB_OPKIND) ava1_op_cancel(j); /* an operation: stays listed, finished */
-        else {
-            tell_cancelled(j);
-            ava1_recv_cancel(j); /* stops it and unlists it: the journal stays */
-        }
+        } else cancel_job(j);
         ava1_job_put(j);
         return st;
     }
@@ -1569,6 +1618,16 @@ static int route(const uint8_t sid[16], const uint8_t peer[32], uint8_t type, co
         if (mine) inbox_add(j, type, body, len);
         break;
     }
+    case AVA1_TYPE_SKIP_PROGRESS: {
+        /* SPEC.md §12.8: the sender is reading past data this job already holds (a solid
+         * archive decoded from its start on resume). It is progress for the watchdog, and
+         * nothing else: no inbox entry, no reply. Only from the session the job is
+         * attached to. */
+        pthread_mutex_lock(&j->cmu);
+        if (j->attached && memcmp(j->sid, sid, 16) == 0) j->frames_in++;
+        pthread_mutex_unlock(&j->cmu);
+        break;
+    }
     default:
         break; /* nothing else is for a receiver */
     }
@@ -1585,6 +1644,7 @@ static int well_formed(uint8_t type, const uint8_t *body, size_t len) {
         ava1_resume_t r;
         ava1_file_root_t f;
         ava1_job_cancel_t c;
+        ava1_skip_progress_t s;
     } u;
     switch (type) {
     case AVA1_TYPE_JOB_OPEN: return ava1_job_open_decode(body, len, &u.o) == 0;
@@ -1593,6 +1653,7 @@ static int well_formed(uint8_t type, const uint8_t *body, size_t len) {
     case AVA1_TYPE_RESUME: return ava1_resume_decode(body, len, &u.r) == 0;
     case AVA1_TYPE_FILE_ROOT: return ava1_file_root_decode(body, len, &u.f) == 0;
     case AVA1_TYPE_JOB_CANCEL: return ava1_job_cancel_decode(body, len, &u.c) == 0;
+    case AVA1_TYPE_SKIP_PROGRESS: return ava1_skip_progress_decode(body, len, &u.s) == 0;
     default: return 1;
     }
 }

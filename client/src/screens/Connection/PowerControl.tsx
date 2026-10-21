@@ -18,12 +18,13 @@ import { Button, Spinner } from "../../components";
 // Direct import to avoid the barrel's circular-dep warning at build.
 import { useConfirm } from "../../components/ConfirmDialog";
 import { useTr } from "../../state/lang";
-import { ddpStatus, powerWake, wakeAndSignIn, type DdpStatus } from "../../api/ps5";
-import { useRosterStore } from "../../state/roster";
+import { ddpStatus, type DdpStatus } from "../../api/ps5";
+import { useConsoleWake } from "../../lib/useConsoleWake";
+import { useHostRuntime } from "../../state/connection";
 import { pushNotification } from "../../state/notifications";
 import { withConsolePrefix } from "../../state/roster";
 import { audit } from "../../state/auditLog";
-import { powerStateFromDdp, wakeUi } from "../../lib/wakeState";
+import { powerStateFromDdp, wakeUi, type PowerState } from "../../lib/wakeState";
 import WakeSetup from "./WakeSetup";
 
 /**
@@ -37,9 +38,7 @@ import WakeSetup from "./WakeSetup";
  */
 export default function PowerControl({ host }: { host: string }) {
   const tr = useTr();
-  const [busy, setBusy] = useState<null | "reboot" | "shutdown" | "standby" | "wake">(
-    null,
-  );
+  const [runBusy, setBusy] = useState<null | "reboot" | "shutdown" | "standby">(null);
   const [last, setLast] = useState<PowerControlAck | null>(null);
   const [error, setError] = useState<string | null>(null);
   const { confirm: confirmDialog, dialog: confirmDialogNode } = useConfirm();
@@ -51,13 +50,11 @@ export default function PowerControl({ host }: { host: string }) {
    * Asked over the discovery protocol, which needs neither the payload nor a
    * credential — so it can tell "the console is in standby" apart from "the
    * helper is not running", which nothing else here can. */
-  const profiles = useRosterStore((st) => st.profiles);
-  const activeId = useRosterStore((st) => st.active_id);
-  const profile = profiles.find((p) => p.id === activeId) ?? null;
-  const credential = profile?.wake_credential ?? "";
-  const registKey = profile?.wake_regist_key ?? "";
-  const rpKey = profile?.wake_rp_key ?? "";
-  const hasSessionKeys = !!registKey && !!rpKey;
+  // THIS console's stored wake credentials (by address), not the selected profile's: the
+  // card can show a console that is not the active tab.
+  const wakeCtl = useConsoleWake(host);
+  const { profile, credential, hasSessionKeys } = wakeCtl;
+  const rt = useHostRuntime(host);
   const [ddp, setDdp] = useState<DdpStatus | null>(null);
 
   // Shared poller: no overlap, nothing while hidden or while a transfer runs to this console.
@@ -81,47 +78,24 @@ export default function PowerControl({ host }: { host: string }) {
   /* The console state and the stored credential together decide what the UI
      may offer — kept in one testable place rather than as scattered JSX
      conditionals. */
-  const power = powerStateFromDdp(ddp?.code);
+  // Until this card's own DDP poll answers, start from what the status poller already knows
+  // (lib/consolePower): a console it saw asleep shows Wake at once instead of after 15 s.
+  const power: PowerState = ddp
+    ? powerStateFromDdp(ddp.code)
+    : rt.power === "rest"
+      ? "standby"
+      : rt.payloadStatus === "up" || rt.power === "awake"
+        ? "awake"
+        : "offline";
   const ui = wakeUi(power, !!credential, hasSessionKeys);
-
-  async function runWake() {
-    setBusy("wake");
-    setError(null);
-    try {
-      if (ui.canSignIn) {
-        // Wake AND sign the user in — a longer, confirmed operation: it waits
-        // for the console to boot, then establishes the control session.
-        await wakeAndSignIn(host, credential, registKey, rpKey);
-        pushNotification(
-          "success",
-          tr("power_wake_signedin", undefined, "Woken and signed in"),
-          {
-            body: tr("power_wake_signedin_body", undefined,
-              "The console is on and signed in to your user."),
-          },
-        );
-        audit("system_wake", withConsolePrefix(host, "woken and signed in"));
-        return;
-      }
-      if (!credential) return;
-      await powerWake(host, credential);
-      // Not "waking up": the console never acknowledges, and ignores the
-      // request entirely unless Remote Play is enabled.
-      pushNotification(
-        "info",
-        tr("power_wake_sent", undefined, "Wake signal sent"),
-        {
-          body: tr("power_wake_sent_body", undefined,
-            "The console doesn't confirm a wake. If it stays asleep, check that Remote Play, Stay Connected to the Internet, and Turning On PS5 from Network are all enabled on the console."),
-        },
-      );
-      audit("system_wake", withConsolePrefix(host, "wake request sent"));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(null);
-    }
-  }
+  const busy = wakeCtl.busy ? "wake" : runBusy;
+  // Rest mode, reboot and shut down go through the helper, which a sleeping console does not
+  // run: offered only while it is not known to be asleep.
+  const asleep = power === "standby";
+  const helperActionTitle = asleep
+    ? tr("status_ps5_rest_mode", undefined, "In rest mode")
+    : undefined;
+  const runWake = () => wakeCtl.wake();
 
   async function run(
     kind: "reboot" | "shutdown" | "standby",
@@ -221,6 +195,13 @@ export default function PowerControl({ host }: { host: string }) {
       <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
         <Power size={15} className="text-[var(--color-accent-bright)]" />
         {tr("power_control_title", undefined, "PS5 power")}
+        {power !== "awake" ? (
+          <span className="ml-auto text-xs font-normal text-[var(--color-muted)]">
+            {asleep
+              ? tr("status_ps5_rest_mode", undefined, "In rest mode")
+              : tr("status_ps5_not_answering", undefined, "Not answering")}
+          </span>
+        ) : null}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         {/* Only when it can actually work: the console is asleep and a wake
@@ -271,7 +252,8 @@ export default function PowerControl({ host }: { host: string }) {
               powerStandby,
             )
           }
-          disabled={busy !== null}
+          disabled={busy !== null || asleep}
+          title={helperActionTitle}
         >
           {tr("power_action_standby", undefined, "Rest mode")}
         </Button>
@@ -296,7 +278,8 @@ export default function PowerControl({ host }: { host: string }) {
               powerReboot,
             )
           }
-          disabled={busy !== null}
+          disabled={busy !== null || asleep}
+          title={helperActionTitle}
         >
           {tr("power_action_reboot", undefined, "Reboot")}
         </Button>
@@ -321,7 +304,8 @@ export default function PowerControl({ host }: { host: string }) {
               powerShutdown,
             )
           }
-          disabled={busy !== null}
+          disabled={busy !== null || asleep}
+          title={helperActionTitle}
         >
           {tr("power_action_shutdown", undefined, "Shut down")}
         </Button>
@@ -354,10 +338,10 @@ export default function PowerControl({ host }: { host: string }) {
           </span>
         </div>
       )}
-      {error && (
+      {(error || wakeCtl.error) && (
         <div className="mt-2 flex items-start gap-1.5 text-xs text-[var(--color-bad)]">
           <AlertTriangle size={11} className="mt-0.5 shrink-0" />
-          <span>{error}</span>
+          <span>{error || wakeCtl.error}</span>
         </div>
       )}
     </section>

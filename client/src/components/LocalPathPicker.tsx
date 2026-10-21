@@ -114,8 +114,10 @@ export function PickerView(p: PickerViewProps) {
     [],
   );
   return (
+    // z-[55]: above a Modal (z-50) that opened the picker — Collection's folders dialog opened it
+    // behind itself — and below the confirm/prompt layer (z-[60]).
     <div
-      className="anim-scrim scrim fixed inset-0 z-50 flex items-end justify-center sm:items-center"
+      className="anim-scrim scrim fixed inset-0 z-[55] flex items-end justify-center sm:items-center"
       style={{ paddingTop: "env(safe-area-inset-top)", paddingBottom: "var(--safe-bottom)" }}
       onClick={p.onCancel}
     >

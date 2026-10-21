@@ -415,6 +415,10 @@ fn rar_solid_resume_still_correct() {
     src.pass(Restart::START, &mut want, &mut rec, &AtomicBool::new(false))
         .unwrap();
     assert_eq!(rec.got, f.0[7..].to_vec());
+    // The held prefix was decoded to be discarded: the sender reports it as SkipProgress.
+    let held: u64 = f.0[..7].iter().map(|(_, d)| d.len() as u64).sum();
+    assert_eq!(src.bytes_skipped(), held);
+    assert_eq!(SeqSource::bytes_skipped(&src), held);
 }
 
 #[test]

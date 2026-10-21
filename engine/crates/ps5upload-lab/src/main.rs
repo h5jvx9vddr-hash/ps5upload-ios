@@ -884,12 +884,17 @@ fn do_register(addr: &str, src_path: &str) -> Result<()> {
 
 fn do_unregister(addr: &str, title_id: &str) -> Result<()> {
     let outcome = app_unregister(addr, title_id)?;
-    if outcome.sony_refused() {
+    if outcome.refusal_stands() {
         println!(
             "unregistered: {title_id} (our teardown ok, but the console's own \
              uninstaller REFUSED with rc=0x{:08X} — the title may remain in \
              Settings > Storage)",
             outcome.sony_uninstall_rc
+        );
+    } else if outcome.still_present == Some(true) {
+        println!(
+            "unregistered: {title_id} (the console accepted, but the title's folders \
+             are still there)"
         );
     } else {
         println!("unregistered: {title_id}");
@@ -1005,6 +1010,11 @@ fn main() -> Result<()> {
         "save-open" => {
             let image = rest.get(1).map(String::as_str).unwrap_or("");
             let r = ps5upload_core::saves::save_open(addr, image)?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            Ok(())
+        }
+        "net-ports" => {
+            let r = ps5upload_core::diagnostics::console_ports(addr)?;
             println!("{}", serde_json::to_string_pretty(&r)?);
             Ok(())
         }

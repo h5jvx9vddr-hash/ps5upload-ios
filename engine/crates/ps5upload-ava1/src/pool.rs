@@ -15,6 +15,7 @@ use ava1::keys::Identity;
 use ava1::peers::PeerStore;
 use ava1::session::{connect_expecting, Session, Timing};
 use ava1::Ava1Error;
+use ps5upload_core::ddp::Power;
 
 /// `host:9120` — the AVA1 default port, or the user's helper port setting
 /// (`ps5upload_core::ports`). The lab can override an address on its own Pool;
@@ -85,18 +86,53 @@ pub struct Pool {
     /// Overrides how an upload learns the destination's free space (tests); `None` asks the
     /// console (`fs.volumes`).
     room_probe: Option<crate::space::RoomProbe>,
+    /// Asks a console's DDP status after a connection failed (rest mode or off): the host,
+    /// without a port, to the reply's code. Tests replace it so they need no network.
+    power_probe: PowerProbe,
+    /// How long a failure DDP explained (rest mode, or nothing answering) is repeated.
+    probed_ttl: Duration,
 }
 
-/// A remembered session failure: when it happened and the reason/detail to repeat.
+/// The DDP probe a pool uses: host (no port) to the reply's code (`200` awake, `620` rest
+/// mode), `None` for no reply. Blocking.
+pub type PowerProbe = Arc<dyn Fn(&str) -> Option<u16> + Send + Sync>;
+
+/// The real probe: two SRCH datagrams within about 800 ms. A console is never on loopback, so
+/// a loopback host (tests, the lab) is not asked and costs nothing.
+fn ddp_power_probe() -> PowerProbe {
+    Arc::new(|host: &str| {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let loopback = bare.eq_ignore_ascii_case("localhost")
+            || bare
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if loopback {
+            return None;
+        }
+        ps5upload_core::ddp::standby_probe(
+            bare,
+            ps5upload_core::ddp::STANDBY_PROBE_BUDGET,
+            ps5upload_core::ddp::STANDBY_PROBE_SENDS,
+        )
+    })
+}
+
+/// A remembered session failure: when it happened, the reason/detail to repeat, and what DDP
+/// said about the console's power when it was asked.
 #[derive(Clone)]
 struct Refusal {
     at: Instant,
     reason: String,
     detail: String,
+    power: Option<Power>,
 }
 
 /// How long a failed session attempt is repeated without trying again.
 pub const REFUSAL_TTL: Duration = Duration::from_secs(5);
+/// How long a failure DDP explained (rest mode, or nothing answering at all) is repeated: it
+/// outlasts the client's 10 s status poll, so a sleeping console costs one UDP probe (and no
+/// TCP connects) per period.
+pub const PROBED_REFUSAL_TTL: Duration = Duration::from_secs(12);
 /// How long a `ava1_not_paired` refusal is repeated: it outlasts the client's 10 s status poll.
 /// A pairing attempt (the dialog opening, a confirm, a dismissal) resets it.
 pub const NOT_PAIRED_TTL: Duration = Duration::from_secs(30);
@@ -276,6 +312,8 @@ impl Pool {
             busy_tries: DEFAULT_BUSY_TRIES,
             open_ack_timeout: None,
             room_probe: None,
+            power_probe: ddp_power_probe(),
+            probed_ttl: PROBED_REFUSAL_TTL,
         }
     }
 
@@ -342,6 +380,8 @@ impl Pool {
             busy_tries: DEFAULT_BUSY_TRIES,
             open_ack_timeout: None,
             room_probe: None,
+            power_probe: ddp_power_probe(),
+            probed_ttl: PROBED_REFUSAL_TTL,
         }
     }
 
@@ -364,9 +404,30 @@ impl Pool {
         self
     }
 
-    /// The failure (`reason`, `detail`) of a session attempt to `console` within the last
-    /// [`REFUSAL_TTL`], if any.
-    pub(crate) fn recent_refusal(&self, console: &str) -> Option<(String, String)> {
+    /// Test seam: how long a failure DDP explained (rest mode, nothing answering) is remembered.
+    pub fn with_probed_refusal_ttl(mut self, ttl: Duration) -> Pool {
+        self.probed_ttl = ttl;
+        self
+    }
+
+    /// Test seam: what DDP answers for this pool's consoles (host to code, `None` = silent).
+    pub fn with_power_probe(
+        mut self,
+        probe: impl Fn(&str) -> Option<u16> + Send + Sync + 'static,
+    ) -> Pool {
+        self.power_probe = Arc::new(probe);
+        self
+    }
+
+    /// The console's DDP code (`200` awake, `620` rest mode), asked now; `None` when it did not
+    /// answer. Asked at the address sessions connect to. Blocking (about 800 ms at most).
+    pub(crate) fn ddp_code(&self, console: &str) -> Option<u16> {
+        (self.power_probe)(&host_of(&self.addr_for(console)))
+    }
+
+    /// The remembered failure of `console` while it is fresh: the not-paired TTL for an
+    /// unpaired console, the probed TTL for one DDP explained, the plain TTL otherwise.
+    fn recent(&self, console: &str) -> Option<Refusal> {
         let host = host_of(console);
         let mut m = self.refusals.lock().unwrap_or_else(|e| e.into_inner());
         match m.get(&host) {
@@ -374,11 +435,13 @@ impl Pool {
                 if r.at.elapsed()
                     < if r.reason == "ava1_not_paired" {
                         self.not_paired_ttl
+                    } else if matches!(r.power, Some(Power::Rest | Power::Unreachable)) {
+                        self.probed_ttl
                     } else {
                         self.refusal_ttl
                     } =>
             {
-                Some((r.reason.clone(), r.detail.clone()))
+                Some(r.clone())
             }
             Some(_) => {
                 m.remove(&host);
@@ -388,7 +451,30 @@ impl Pool {
         }
     }
 
+    /// The failure (`reason`, `detail`) of a session attempt to `console` within the last
+    /// [`REFUSAL_TTL`] ([`PROBED_REFUSAL_TTL`] when DDP explained it), if any.
+    pub(crate) fn recent_refusal(&self, console: &str) -> Option<(String, String)> {
+        self.recent(console).map(|r| (r.reason, r.detail))
+    }
+
+    /// What DDP said about `console`'s power when its last session attempt failed, while that
+    /// failure is remembered. `None`: no fresh failure, or DDP was not asked.
+    pub fn recent_power(&self, console: &str) -> Option<Power> {
+        self.recent(console).and_then(|r| r.power)
+    }
+
     pub(crate) fn note_refusal(&self, console: &str, reason: &str, detail: &str) {
+        self.note_verdict(console, reason, detail, None);
+    }
+
+    /// [`Pool::note_refusal`] with what DDP said about the console's power.
+    pub(crate) fn note_verdict(
+        &self,
+        console: &str,
+        reason: &str,
+        detail: &str,
+        power: Option<Power>,
+    ) {
         self.refusals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -398,6 +484,7 @@ impl Pool {
                     at: Instant::now(),
                     reason: reason.to_string(),
                     detail: detail.to_string(),
+                    power,
                 },
             );
     }
@@ -462,6 +549,11 @@ impl Pool {
             Ok(me) => ava1::hex::encode(&me.public())[..8].to_string(),
             Err(_) => "none".to_string(),
         }
+    }
+
+    /// This engine's public key (the owner of the jobs it starts), when it has an identity.
+    pub fn identity_key(&self) -> Option<[u8; 32]> {
+        self.me.as_ref().ok().map(|me| me.public())
     }
 
     /// How many consoles have accepted this engine (its paired peers).

@@ -53,6 +53,7 @@ scripts/.translate-cache.json
 
 # ─── Client (Vite / Tauri) ───────────────────────────────────────────────
 client/dist/
+client/dist-console/
 client/.vite/
 client/out/
 client/.cache/

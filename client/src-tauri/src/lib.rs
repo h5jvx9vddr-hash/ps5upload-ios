@@ -43,6 +43,13 @@ mod mgmt_forward;
 // One-time 6.0 upgrade clean-up of the app's data folder (see the module doc).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod migrate_6;
+// Background watcher: job notifications and, on Android, the transfer service (#457).
+#[cfg(target_os = "android")]
+mod android_bg;
+mod bg_activity;
+// The JavaVM / Application context every Android JNI caller shares.
+#[cfg(target_os = "android")]
+mod android_jni;
 
 /// Build and run the Tauri application. The desktop `main.rs` calls this
 /// directly; on mobile the `tauri::mobile_entry_point` macro generates
@@ -199,6 +206,9 @@ pub fn run() {
                         // something was squatting it.
                         use tauri::Emitter;
                         let _ = handle.emit("ps5upload-engine-ready", &url);
+                        // Watches the engine for running and finished jobs from here on,
+                        // whatever the WebView is doing.
+                        bg_activity::spawn(&handle);
                     }
                     Err(e) => {
                         let message = format!("engine failed to start: {e:#}");
@@ -222,6 +232,7 @@ pub fn run() {
             commands::engine_diagnose,
             commands::engine_restart,
             commands::ps5_volumes,
+            commands::ps5_helper_stop,
             commands::pkg_scan_external,
             commands::pkg_metadata_console,
             commands::ps5_list_dir,
@@ -229,6 +240,7 @@ pub fn run() {
             commands::ps5_readiness,
             commands::transfer_file,
             commands::transfer_dir,
+            commands::transfer_file_list,
             commands::transfer_zip,
             commands::zip_inspect,
             commands::zip_inspect_stream,
@@ -325,6 +337,7 @@ pub fn run() {
             commands::ps5_elfldr_ensure,
             commands::ffpfsc_compress,
             commands::exfat_build,
+            commands::folder_build,
             commands::fpkg_extract,
             commands::fpkg_extract_cleanup,
             commands::job_status,
@@ -560,6 +573,12 @@ pub fn run() {
             commands::request_storage_access,
             // iOS Files-app picker (files + folders, in place).
             commands::ios_pick_paths,
+            // ── Background work (#457) ──────────────────────────────
+            // The renderer's queued-work hold, its visibility / language,
+            // and whether the host posts job notifications itself.
+            bg_activity::bg_work_hold,
+            bg_activity::bg_configure,
+            bg_activity::bg_capabilities,
         ])
         .build(tauri::generate_context!())
         .expect("tauri runtime failed to build");

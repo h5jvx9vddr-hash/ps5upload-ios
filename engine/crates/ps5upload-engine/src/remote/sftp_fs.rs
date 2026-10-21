@@ -337,6 +337,75 @@ impl RemoteFs for SftpFs {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
+
+    async fn create_dir(&self, path: &str) -> Result<(), RemoteError> {
+        let full = under(&self.home, path);
+        let host = self.host.as_str();
+        let made = timed(host, "making a folder", async {
+            self.sftp
+                .create_dir(full.clone())
+                .await
+                .map_err(|e| sftp_err(host, e))
+        })
+        .await;
+        match made {
+            Ok(()) => Ok(()),
+            // SFTP v3 answers a taken name with a bare FAILURE: look to see what is there.
+            Err(e) => match self.stat(path).await {
+                Ok(st) if st.is_dir => Ok(()),
+                Ok(_) => Err(RemoteError::Exists(format!("{path} is a file"))),
+                Err(_) => Err(e),
+            },
+        }
+    }
+
+    /// SSH_FXP_RENAME (v3), which refuses an existing target (OpenSSH links the new name, so
+    /// the refusal is atomic there). The posix-rename extension, which replaces, is never
+    /// used. The target is also looked up first, for servers that bend the v3 rule.
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteError> {
+        match self.stat(to).await {
+            Ok(_) => return Err(RemoteError::Exists(format!("{to} already exists"))),
+            Err(RemoteError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        let (src, dst) = (under(&self.home, from), under(&self.home, to));
+        let host = self.host.as_str();
+        let done = timed(host, "a rename", async {
+            self.sftp
+                .rename(src.clone(), dst.clone())
+                .await
+                .map_err(|e| sftp_err(host, e))
+        })
+        .await;
+        match done {
+            // Something took the name meanwhile, and the file is still where it was.
+            Err(e)
+                if !matches!(e, RemoteError::NotFound(_))
+                    && self.stat(to).await.is_ok()
+                    && self.stat(from).await.is_ok() =>
+            {
+                Err(RemoteError::Exists(format!("{to} already exists ({e})")))
+            }
+            other => other,
+        }
+    }
+
+    async fn remove_dir(&self, path: &str) -> Result<(), RemoteError> {
+        if path.trim_matches('/').is_empty() {
+            return Err(RemoteError::BadPath(
+                "the login folder cannot be removed".into(),
+            ));
+        }
+        let full = under(&self.home, path);
+        let host = self.host.as_str();
+        timed(host, "removing a folder", async {
+            self.sftp
+                .remove_dir(full.clone())
+                .await
+                .map_err(|e| sftp_err(host, e))
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +441,10 @@ mod tests {
         conn.host_key = Some(fingerprint);
         let fs = SftpFs::connect(&conn, &secret).await.unwrap();
         crate::remote::contract::check(&fs, "/data").await;
+        // A folder `data/w/` holding files `a` and `b` of different sizes, writable by t.
+        if fs.stat("/data/w/a").await.is_ok() {
+            crate::remote::contract::check_writes(&fs, "/data/w").await;
+        }
         let wrong = Secret::Password {
             password: "nope".into(),
         };

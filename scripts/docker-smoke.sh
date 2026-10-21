@@ -12,7 +12,7 @@ image="$1"
 webui="${2:-}"
 name="ps5upload-smoke-$$"
 port="${SMOKE_PORT:-19313}"
-base="http://127.0.0.1:${port}"
+base="http://127.0.0.1:${port}${SMOKE_BASE_PATH:-}"
 
 cleanup() {
   if [ "${ok:-0}" != 1 ]; then docker logs "$name" 2>&1 | tail -40 || true; fi
@@ -46,6 +46,19 @@ upload_id="$(sed -n 's/.*"upload_id":"\([^"]*\)".*/\1/p' "$tmp/upload.json")"
 [ -n "$upload_id" ] || fail "upload response had no upload_id: $(cat "$tmp/upload.json")"
 curl -fsS -m 10 -X DELETE "$base/api/pkg/upload/$upload_id" >/dev/null || fail "upload cleanup failed"
 echo "ok: a package uploads to the engine's /tmp and cleans up"
+
+# Generic browser intake and remote downloads share the same API prefix.
+code="$(curl -sS -m 30 -o "$tmp/file.json" -w '%{http_code}' -F "file=@$tmp/smoke.pkg;filename=notes.txt" "$base/api/files/upload")"
+[ "$code" = 200 ] || fail "browser file upload returned HTTP $code"
+file_id="$(sed -n 's/.*"upload_id":"\([^"]*\)".*/\1/p' "$tmp/file.json")"
+[ -n "$file_id" ] || fail "browser file response had no upload_id: $(cat "$tmp/file.json")"
+curl -fsS -m 10 -X DELETE "$base/api/files/upload/$file_id" >/dev/null || fail "browser file cleanup failed"
+code="$(curl -sS -m 5 -o "$tmp/download.json" -w '%{http_code}' "$base/api/pkg/remote/download/status?id=smoke-missing")"
+[ "$code" = 404 ] && grep -q 'no such download' "$tmp/download.json" || fail "remote download API missed the configured prefix"
+# Console URLs are generated at the root, independently of the browser prefix.
+code="$(curl -sS -m 5 -o "$tmp/host.txt" -w '%{http_code}' "http://127.0.0.1:${port}/pkg-host/smoke-missing/file.pkg")"
+[ "$code" = 404 ] && grep -q 'no such install session' "$tmp/host.txt" || fail "console package route is missing at the root"
+echo "ok: browser intake and download APIs follow the prefix; console URLs remain reachable"
 
 # The artwork cache is created under HOME at first use; a read-only home
 # logs "Permission denied" and silently disables it.

@@ -169,6 +169,7 @@ export default function FirstRunScreen() {
           payloadVersion: status.payloadVersion,
           ps5Kernel: status.ps5Kernel,
           ucredElevated: status.ucredElevated,
+          power: "awake",
           payloadProbing: false,
         });
       }

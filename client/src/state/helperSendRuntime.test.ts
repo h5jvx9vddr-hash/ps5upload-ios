@@ -92,3 +92,18 @@ describe("sendHelperAndWait", () => {
     expect(out).toBe("timed out");
   });
 });
+
+describe("an explicit send after Stop helper (#471)", () => {
+  it("clears the console's 'stopped by you' mark so the reconnect loop looks after it again", async () => {
+    const { markHelperStopped, isHelperStopped } = await import("./helperStopped");
+    const { sendHelperTo } = await import("./helperSendRuntime");
+    runHelperSend.mockReset();
+    runHelperSend.mockResolvedValue("ok");
+    markHelperStopped("192.168.0.9");
+    markHelperStopped("192.168.0.10");
+    await sendHelperTo(" 192.168.0.9 ", tr);
+    expect(isHelperStopped("192.168.0.9")).toBe(false);
+    // Only the console sent to.
+    expect(isHelperStopped("192.168.0.10")).toBe(true);
+  });
+});

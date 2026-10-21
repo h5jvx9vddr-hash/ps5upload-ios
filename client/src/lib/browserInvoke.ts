@@ -75,6 +75,29 @@ export function timeSyncBody(
   return body;
 }
 
+/**
+ * `reason` and `power` from a failed status probe's body (`{ error, reason, power }`), the
+ * fields probes.rs passes through for `payload_check`. Only string values; nothing for an
+ * older engine or a body that is not JSON.
+ */
+export function statusFailureFields(body: string): {
+  reason?: string;
+  power?: string;
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null) return {};
+  const o = parsed as Record<string, unknown>;
+  const out: { reason?: string; power?: string } = {};
+  if (typeof o["reason"] === "string") out.reason = o["reason"];
+  if (typeof o["power"] === "string") out.power = o["power"];
+  return out;
+}
+
 /** Build a path + optional `?addr=` query, matching the Rust `addr_url()`. */
 function addrUrl(path: string, addr?: string | null): string {
   return addr && addr.length > 0 ? `${path}?addr=${uenc(addr)}` : path;
@@ -589,10 +612,11 @@ export async function browserInvoke<T>(
         args["addr"],
       );
       const sep = base.includes("?") ? "&" : "?";
+      const size = args["size"] ? `&size=${encodeURIComponent(String(args["size"]))}` : "";
       const q =
-        cmd === "ps5_app_icon_data"
+        (cmd === "ps5_app_icon_data"
           ? `title_id=${encodeURIComponent(String(args["titleId"] ?? ""))}`
-          : `path=${encodeURIComponent(String(args["path"] ?? ""))}`;
+          : `path=${encodeURIComponent(String(args["path"] ?? ""))}`) + size;
       const res = await fetch(`${base}${sep}${q}`);
       if (!res.ok) throw new Error(`icon HTTP ${res.status}`);
       const blob = await res.blob();
@@ -736,7 +760,7 @@ export async function browserInvoke<T>(
       return postJson<T>("/api/fpkg/inspect", {
         source: args["source"],
         output_dir: args["outputDir"],
-      });
+      }, true);
     }
     case "fpkg_build": {
       return postJson<T>("/api/fpkg/build", {
@@ -747,7 +771,8 @@ export async function browserInvoke<T>(
         compression: args["compression"],
         firmware: args["firmware"],
         language: args["language"],
-      });
+        full_verify: args["fullVerify"] ?? false,
+      }, true);
     }
     case "ps5_elfldr_health": {
       return getJson<T>(`/api/ps5/elfldr/health?host=${encodeURIComponent(String(args["host"] ?? ""))}`);
@@ -759,7 +784,7 @@ export async function browserInvoke<T>(
       return postJson<T>("/api/fpkg/estimate", {
         source: args["source"],
         output_dir: args["outputDir"],
-      });
+      }, true);
     }
     case "fpkg_delete": {
       return postJson<T>("/api/fpkg/delete", { path: args["path"] });
@@ -779,6 +804,7 @@ export async function browserInvoke<T>(
         source: args["source"],
         output_dir: args["outputDir"],
         level: args["level"],
+        full_verify: args["fullVerify"] ?? false,
       });
     }
     case "exfat_build": {
@@ -789,6 +815,15 @@ export async function browserInvoke<T>(
         compress: args["compress"] ?? false,
         ampr_lz4: args["amprLz4"],
         verify_chunk_kib: args["verifyChunkKib"],
+        full_verify: args["fullVerify"] ?? false,
+      });
+    }
+    case "folder_build": {
+      return postJson<T>("/api/folder/build", {
+        source: args["source"],
+        output_dir: args["outputDir"],
+        name: args["name"],
+        full_verify: args["fullVerify"] ?? false,
       });
     }
     case "job_status": {
@@ -960,6 +995,8 @@ export async function browserInvoke<T>(
           reachable: false,
           engine: true,
           error: body.trim() || `engine HTTP ${r.status}`,
+          // The engine's `{ error, reason, power }`: passed through like probes.rs does.
+          ...statusFailureFields(body),
         } as unknown as T;
       } catch (e) {
         return {
@@ -1006,6 +1043,30 @@ export async function browserInvoke<T>(
         addr: args["addr"],
         action: "tick",
       });
+
+    case "ps5_helper_stop": {
+      // The engine's decided refusals (409 busy, 502 refused / still running) carry a
+      // `reason`: they are an answer, like the desktop command returns them.
+      const r = await fetch(`${getEngineUrl()}/api/ps5/helper/stop`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ addr: args["addr"] }),
+        signal: AbortSignal.timeout(TIMEOUT_STANDARD),
+      });
+      const body = (await r.json().catch(() => ({}))) as {
+        state?: string;
+        error?: string;
+        reason?: string;
+      };
+      if (r.ok) return body as T;
+      if (body.reason)
+        return {
+          state: "refused",
+          reason: body.reason,
+          error: body.error ?? "",
+        } as T;
+      throw new Error(body.error || `engine HTTP ${r.status}`);
+    }
 
     case "power_telemetry_get":
       return getJson<T>(addrUrl("/api/ps5/power/telemetry", args["addr"]));
@@ -1122,6 +1183,10 @@ export async function browserInvoke<T>(
 
     case "transfer_dir":
       return postJson<T>("/api/transfer/dir", args["req"], /*long=*/ true);
+
+    // The Files screen's multi-file upload: one job for the whole set (same body shape).
+    case "transfer_file_list":
+      return postJson<T>("/api/transfer/file-list", args["req"], /*long=*/ true);
 
     case "transfer_dir_reconcile":
       return postJson<T>(
@@ -1429,6 +1494,7 @@ export async function browserInvoke<T>(
       return postJson<T>("/api/profile/avatar/preview", {
         image_path: args["req"]?.image_path,
         mode: args["req"]?.mode,
+        crop: args["req"]?.crop,
       });
 
     case "profile_apply_avatar":
@@ -1438,6 +1504,7 @@ export async function browserInvoke<T>(
           addr: args["req"]?.addr,
           image_path: args["req"]?.image_path,
           mode: args["req"]?.mode,
+          crop: args["req"]?.crop,
           uid: args["req"]?.uid,
           username: args["req"]?.username,
         },

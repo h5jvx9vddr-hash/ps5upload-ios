@@ -4,9 +4,10 @@
 import type { FpkgCompression, FpkgEstimate, ImageFormat } from "../../api/fpkg";
 import { Button, Card } from "../../components";
 import { PLAYGO_LANGUAGES } from "../../lib/playgoLanguages";
+import type { MakeKind } from "../../state/convertPrefs";
 import { useTr } from "../../state/lang";
 import { CompressionTiles } from "./CompressionTiles";
-import { ImageChoice, type Lz4Choice } from "./ImageOptions";
+import { FullVerifyOption, ImageChoice, type Lz4Choice } from "./ImageOptions";
 import { prettyBytes } from "./RunCard";
 
 /** The most room a conversion needs on the output drive: the package, which the compressed
@@ -32,7 +33,7 @@ export interface OptionsCardProps {
   language?: string;
   /** What Convert makes. Compression and language are a package's: an image carries the
    *  folder's files as they are, and its own compression is chosen beside its format. */
-  make?: "pkg" | "image";
+  make?: MakeKind;
   /** The image's options, shown in place of the package's when `make` is "image". */
   image?: {
     format: ImageFormat;
@@ -107,6 +108,14 @@ export function OptionsCard(props: OptionsCardProps) {
               />
             )}
           </div>
+        ) : props.make === "folder" ? (
+          <div className="text-xs text-[var(--color-muted)]" data-testid="options-folder">
+            {tr(
+              "fpkg.folder.what",
+              undefined,
+              "The folder is named after the image or package, in the output folder. Nothing is compressed, and nothing reaches the PS5.",
+            )}
+          </div>
         ) : (
           <div className="flex flex-col gap-1">
             <div className="text-[var(--color-muted)]">
@@ -120,7 +129,7 @@ export function OptionsCard(props: OptionsCardProps) {
             />
           </div>
         )}
-        {props.onLanguage && props.make !== "image" && (
+        {props.onLanguage && props.make !== "image" && props.make !== "folder" && (
           <div className="flex flex-col gap-1">
             <label htmlFor="fpkg-language" className="text-[var(--color-muted)]">
               {tr("fpkg.language", undefined, "Game language")}
@@ -148,6 +157,7 @@ export function OptionsCard(props: OptionsCardProps) {
             </div>
           </div>
         )}
+        <FullVerifyOption disabled={props.locked} />
       </div>
     </Card>
   );

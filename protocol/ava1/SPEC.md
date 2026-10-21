@@ -163,6 +163,8 @@ is derived from them any more.
    for `ERR_UNKNOWN_METHOD`; a node that does not advertise it answers
    `ERR_UNKNOWN_METHOD` to them. The payload advertises it when its management table is
    installed (`mgmt_rpc_installed()`); the Rust `Session::has_mgmt()` reads it.
+   Bit 2 is `CAP_SHARED_JOBS` (4): any paired device may read and cancel a transfer and take over a
+   parked upload (§18.5); only a node with the data plane advertises it.
 3. Client → `Hs3{noise}`: message 3, payload `ClientInfo` (nonce_c (§4.6), name). Both sides
    now key lane 0 (§4.3) and every further frame is sealed. A client that expects
    a particular device (it knows the key it paired with at this address) compares
@@ -363,7 +365,7 @@ normative table; the second column names the constant in the generated code.
 | 8 | `ERR_BUSY` | a limit of §8 or §11.7: connections, sessions, an unconfirmed-session slot, in-flight RPCs (8 per session, §7.4), jobs, a destination another job is writing, no buffer budget left for another job |
 | 9 | `ERR_PATH` | a manifest or RPC path that breaks §11.2, a root the node's write or read policy refuses, a source that cannot be stat'd or a staging parent that is not a directory |
 | 10 | `ERR_NO_SPACE` | the destination drive is full (`ENOSPC` while writing) |
-| 11 | `ERR_UNKNOWN_JOB` | `Resume`, `job.status` or `job.cancel` for a job the node does not list, or lists for another peer key (the two are not told apart) |
+| 11 | `ERR_UNKNOWN_JOB` | `Resume`, `job.status` or `job.cancel` for a job the node does not list, or lists for another peer key (the two are not told apart; with `CAP_SHARED_JOBS` a transfer answers any paired key, §18.5) |
 | 12 | `ERR_IO` | a disk or filesystem failure on the node's side: write, fsync, rename, journal append, reading a source, a failed `disk.calibrate` |
 | 13 | `ERR_VERIFY` | a file or copy whose bytes do not match their root and that a `FileRetry` cannot fix |
 | 14 | `ERR_EXISTS` | a destination that is already there and may not be replaced: the root without `JF_OVERWRITE`, a staging root that appeared meanwhile, a file where one must go in a merge |
@@ -718,7 +720,10 @@ or `job.copy` whose root is, or lies inside or around, the root of another job t
 (and, for a move, its source) is answered `ERR_BUSY`; parked jobs count, because they can resume.
 When a session ends its jobs are parked, not ended: they stay listed, detached, for 10 minutes
 and then leave the table; their journal stays on disk (§14.3), so a later `JobOpen` resumes them.
-A finished upload or download leaves the table 10 s after its session lets go of it; a finished local job
+A finished upload or download leaves the table 10 s after it ended (its `JobDone` went out or came in), whether
+or not its session goes on: a session runs job after job, so the jobs it ended must not hold the table until it
+ends. A `JobOpen` that finds the table full takes the slot of the ended upload or download (with nothing left
+to settle) that ended longest ago instead of answering `ERR_BUSY` (a reopen of an upload replays its journal; a download starts over). A finished local job
 (`job.copy`) stays listed for the full park age so `job.status` can still answer. Either peer ends a
 job with `JobCancel{job_id, reason}`, where `reason` is the `ERR_*` code the ender wants reported
 (`ERR_CANCELLED` for a user's cancel, `ERR_IO` or `ERR_VERIFY` when a sender's source fails); the
@@ -759,6 +764,7 @@ peers for the job (§11.3), not who opened it.
 | 0x2D | `Status` | receiver → sender (IGNORABLE) | control |
 | 0x2E | `JobDone{status, files, bytes}` | receiver → sender | control |
 | 0x2F | `JobCancel` | either | control |
+| 0x30 | `SkipProgress{bytes_skipped}` | sender → receiver | control |
 
 `FileRetry.reason` is `RETRY_VERIFY` (1, the root did not match), `RETRY_IO` (2, the receiver lost
 the part file or outboard) or `RETRY_CHANGED` (3, the record's length disagrees with the manifest).
@@ -868,6 +874,14 @@ running sync batch, holds the clock. The engine's receiver sends `JobCancel{reas
 and fails the job (the engine's session retry resumes it); the console ends it with `JobDone`
 status `ERR_STALLED` and keeps the journal, as for every console-side failure. The sender
 observes the code like any receiver-ended job and may resume.
+
+`SkipProgress{job_id, bytes_skipped}` (0x30) is job-scoped liveness. A sender that reads past
+data the receiver already holds (a solid archive decoded from its start on resume, §17.2, or the
+durable stretches of a partly held large file) sends no data frame while it does; it sends a
+`SkipProgress` at least every 10 s instead (the engine: every 5 s while its skip counter moves).
+`bytes_skipped` is the running total the sender has read past for this job (informational). A
+receiver counts it as progress for that job, only from the session the job is attached to, and
+answers nothing. Receivers that predate it ignore it as an unknown data-plane type.
 
 ## 13. Verification
 
@@ -1209,7 +1223,7 @@ sender (§11–§13), exactly like a download's sender except that its window is
 `JobOpenAck` and the job ends with B's `JobDone`. The reply is the sending job's `Status` once it
 runs; a dial, handshake or ticket failure is `ERR_IO` with the reason as text. A source the read
 policy denies is `ERR_PATH` whether or not it exists. A's job is listed under `job_id` and its
-`job.status` / `job.cancel` answer the device that called `c2c.send`. A `c2c.send` from that device
+`job.status` / `job.cancel` answer the device that called `c2c.send` (and, on a node with `CAP_SHARED_JOBS`, any paired device: §18.5). A `c2c.send` from that device
 again under the same `job_id` replaces its earlier send; any other job listed under that id is
 left alone and the call is `ERR_BUSY`. When the session drops before the job ends, A fails the job
 (`ERR_IO`); a cancel on A sends B a `JobCancel`, unless the job on A was replaced under the same id
@@ -1228,3 +1242,29 @@ on the lanes, and on the control connection only a receiver's frames (`JobOpenAc
 `Received`, `Credit`, `FileRetry`, `Durable`, `Status`, `JobDone`, `JobCancel`) for the one job;
 anything else closes it. No lane may join it, and no handshake to A replaces it.
 
+18.5 Sharing a transfer among paired devices (`CAP_SHARED_JOBS`, bit 2 = 4; #444). A node that
+advertises it relaxes ownership for transfers only: `job.status` and `job.cancel` answer any fully
+paired session for a job of kind `JOB_UPLOAD` or `JOB_DOWNLOAD` (an upload, a download, a send to
+another console and its receiving half), so another device can watch a send or end it to take it
+over. Operations (`job.run`) and local copies (`job.copy`) stay their owner's: another key still gets
+`ERR_UNKNOWN_JOB`, and `job.list` (21) still lists only the caller's own jobs. A `JobOpen` of
+`JOB_UPLOAD` for a listed upload of another key moves the job to the new key when no session is
+attached to it (parked: its device paused it, lost the link or went away): the node retires it
+from memory and reopens it from its journal, which is keyed by the job alone, under the new owner
+(the same root, kind and flags rule as any reopen). One attached to a session is still refused with
+`ERR_UNKNOWN_JOB` ("this job belongs to another device"); one still settling its files, or held for
+a moment by another thread, is `ERR_BUSY` (try again). A `Resume` for another key's job is answered
+`JobMap{status = ERR_UNKNOWN_JOB}` as before (§11.5), and the `JobOpen` the sender then sends is the
+one that moves the job. A node without the bit keeps every job its owner's; an engine decides by the
+bit, never by version, whether it may watch or take over a send another device runs.
+
+18.6 The shared send record (engine convention, not wire). The device that drives a send keeps
+`/data/ps5upload/c2c/<job id hex>.json` on the receiving console with the management fs write:
+both consoles (address and key), paths, route, the driving device's key and name, a lease (45 s,
+refreshed every 15 s), state (`running`, `paused`, `failed`) and progress; it is removed when the
+send finishes and records not updated for 7 days are removed when listed. A device that takes a
+send over moves the lease to itself, ends both halves (`job.cancel` on both consoles) and sends again
+under the same `job_id`, which resumes from the receiving console's journal; the device that had it
+reads the lease before anything that would end a half or fall back to the relay, and stops driving
+the send without ending anything once the lease is another device's. A pause ends both halves, so a
+paused send resumes from any device with any helper.

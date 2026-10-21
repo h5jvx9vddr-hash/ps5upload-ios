@@ -174,9 +174,9 @@ static int handle_appinfo_set(void *st, int fd, uint64_t t, const char *b, uint6
     if (strstr(b, "RUNNING")) return ok_body("{\"ok\":false,\"err\":\"title is running\"}");
     return ok_body("{\"ok\":true,\"err\":null}");
 }
-static int handle_appdb_query(void *st, int fd, uint64_t t) {
-    (void)st; (void)fd; (void)t;
-    note(AVA1_METHOD_APP_DB_QUERY, NULL);
+static int handle_appdb_query(void *st, int fd, uint64_t t, const char *b, uint64_t l) {
+    (void)st; (void)fd; (void)t; (void)l;
+    note(AVA1_METHOD_APP_DB_QUERY, b);
     return ok_body("{\"apps\":[{\"title_id\":\"CUSA00001\",\"app_id\":57368,\"name\":\"Stub\"}],\"source\":\"sql\"}");
 }
 static int handle_focus_probe(void *st, int fd, uint64_t t) {

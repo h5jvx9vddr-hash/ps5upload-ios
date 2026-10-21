@@ -3898,6 +3898,30 @@ int ava1_job_cancel_decode(const uint8_t *buf, size_t len, ava1_job_cancel_t *m)
     return ava1_r_finish(&r);
 }
 
+int ava1_skip_progress_encode(const ava1_skip_progress_t *m, ava1_w_t *w) {
+    ava1_w_fixed(w, m->job_id, 16);
+    ava1_w_u64(w, m->bytes_skipped);
+    ava1_w_u16(w, 0);
+    return w->err;
+}
+
+int ava1_skip_progress_decode(const uint8_t *buf, size_t len, ava1_skip_progress_t *m) {
+    ava1_r_t r;
+    uint16_t ext_n, i;
+    memset(m, 0, sizeof(*m));
+    ava1_r_init(&r, buf, len);
+    ava1_r_fixed(&r, m->job_id, 16);
+    m->bytes_skipped = ava1_r_u64(&r);
+    ext_n = ava1_r_u16(&r);
+    for (i = 0; i < ext_n && !r.err; i++) {
+        uint32_t vlen;
+        (void)ava1_r_u16(&r);
+        vlen = ava1_r_u32(&r);
+        (void)ava1_r_take(&r, vlen);
+    }
+    return ava1_r_finish(&r);
+}
+
 const char *const ava1_message_names[] = {
     "NodeInfo",
     "HelloInfo",
@@ -3975,8 +3999,9 @@ const char *const ava1_message_names[] = {
     "Status",
     "JobDone",
     "JobCancel",
+    "SkipProgress",
 };
-const size_t ava1_message_count = 76;
+const size_t ava1_message_count = 77;
 
 int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *out, size_t cap,
                    size_t *out_len) {
@@ -4363,6 +4388,11 @@ int ava1_roundtrip(const char *name, const uint8_t *in, size_t in_len, uint8_t *
         ava1_job_cancel_t m;
         rc = ava1_job_cancel_decode(in, in_len, &m);
         if (rc == 0) rc = ava1_job_cancel_encode(&m, &w);
+    }
+    else if (strcmp(name, "SkipProgress") == 0) {
+        ava1_skip_progress_t m;
+        rc = ava1_skip_progress_decode(in, in_len, &m);
+        if (rc == 0) rc = ava1_skip_progress_encode(&m, &w);
     }
     else {
         return AVA1_E_PROTO;

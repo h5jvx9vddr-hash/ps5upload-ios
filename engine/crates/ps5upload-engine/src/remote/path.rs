@@ -26,13 +26,17 @@ pub fn parse(s: &str) -> Result<RemotePath, RemoteError> {
     }
     let mut segments = Vec::new();
     for raw in raw_path.split('/') {
+        // A backslash travels encoded (`%5C`, see [`encode_segment`]); a bare one is refused.
+        if raw.contains('\\') {
+            return Err(RemoteError::BadPath(format!("bad path segment {raw:?}")));
+        }
         let seg = percent_decode(raw)?;
         match seg.as_str() {
             "" | "." => continue,
             ".." => return Err(RemoteError::BadPath(format!("{s} leaves its folder"))),
             _ => {}
         }
-        check_segment(&seg)?;
+        check_name(&seg)?;
         segments.push(seg);
     }
     Ok(RemotePath {
@@ -48,12 +52,35 @@ pub fn format(id: &str, path: &str) -> String {
     format!("{SCHEME}{id}/{}", path.trim_start_matches('/'))
 }
 
+/// One file or folder name as it goes into a `remote://` path: `%` and `\` encoded, so that
+/// [`parse`] gives back exactly this name ("a%20b.pkg" is not "a b.pkg", and a backslash in a
+/// name on a Unix server is a name character, not a separator).
+pub fn encode_segment(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '\\' => out.push_str("%5C"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A `/`-separated relative path of `remote://` segments back to the names they stand for.
+pub fn decode_rel(rel: &str) -> String {
+    rel.split('/')
+        .map(|seg| percent_decode(seg).unwrap_or_else(|_| seg.to_string()))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// `base` + one entry name, for walking a tree. The name must be a single plain segment.
 pub fn join(base: &str, name: &str) -> Result<String, RemoteError> {
     if name.is_empty() || name == "." || name == ".." {
         return Err(RemoteError::BadPath(format!("bad name {name:?}")));
     }
-    check_segment(name)?;
+    check_name(name)?;
     let base = base.trim_end_matches('/');
     Ok(format!("{base}/{name}"))
 }
@@ -66,8 +93,10 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn check_segment(seg: &str) -> Result<(), RemoteError> {
-    if seg.contains(['/', '\\', '\0']) {
+/// A name: no `/` or NUL, and no `..` hidden behind a backslash (which a Windows server would
+/// read as a separator).
+fn check_name(seg: &str) -> Result<(), RemoteError> {
+    if seg.contains(['/', '\0']) || seg.split('\\').any(|p| p == "..") {
         return Err(RemoteError::BadPath(format!("bad path segment {seg:?}")));
     }
     Ok(())
@@ -124,8 +153,27 @@ mod tests {
         assert!(join("/games", "../x").is_err());
         assert!(join("/games", "a/b").is_err());
         assert!(join("/games", "..").is_err());
+        assert!(join("/games", "a\\..\\x").is_err());
+        assert!(parse("remote://nas-1/a%5C..%5Cx").is_err());
         assert_eq!(join("/games", "a.pkg").unwrap(), "/games/a.pkg");
         assert_eq!(join("/", "a.pkg").unwrap(), "/a.pkg");
+    }
+
+    #[test]
+    fn every_name_comes_back_as_itself() {
+        for name in [
+            "a%20b.pkg",
+            "a b.pkg",
+            "100% Orange.pkg",
+            "a\\b.pkg",
+            "%25",
+            "x%",
+        ] {
+            let s = format!("remote://nas-1/games/{}", encode_segment(name));
+            assert_eq!(parse(&s).unwrap().path, format!("/games/{name}"), "{name}");
+            assert_eq!(decode_rel(&encode_segment(name)), name);
+        }
+        assert_eq!(join("/g", "a\\b.pkg").unwrap(), "/g/a\\b.pkg");
     }
 
     #[test]

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   Heart,
   Coffee,
+  Globe,
   Mail,
   Sparkles,
   ShieldAlert,
@@ -17,8 +18,11 @@ import { useTr } from "../../state/lang";
 import { Button, Card, Badge } from "../../components";
 
 const AUTHOR_EMAIL = "phantomptr@gmail.com";
+const AUTHOR_SITE = "phantomptr.com";
 
 const URLS = {
+  website: "https://ps5upload.phantomptr.com/",
+  authorSite: `https://${AUTHOR_SITE}/`,
   github: "https://github.com/phantomptr/ps5upload",
   issues: "https://github.com/phantomptr/ps5upload/issues",
   license: "https://github.com/phantomptr/ps5upload/blob/main/LICENSE",
@@ -70,6 +74,11 @@ export default function AboutScreen() {
         </p>
 
         <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
+          <PrimaryLink
+            icon={<Globe size={14} />}
+            label={tr("about_website", undefined, "Website")}
+            onClick={() => openExternal(URLS.website)}
+          />
           <PrimaryLink
             icon={<GithubIcon />}
             label="GitHub"
@@ -123,10 +132,17 @@ export default function AboutScreen() {
               </div>
               <button
                 type="button"
-                onClick={() => openExternal(URLS.author)}
+                onClick={() => openExternal(URLS.authorSite)}
                 className="mt-0.5 text-base font-medium hover:text-[var(--color-accent)] max-md:inline-flex max-md:min-h-11 max-md:items-center"
               >
                 PhantomPtr
+              </button>
+              <button
+                type="button"
+                onClick={() => openExternal(URLS.authorSite)}
+                className="ml-2 text-xs text-[var(--color-muted)] hover:text-[var(--color-accent)] max-md:inline-flex max-md:min-h-11 max-md:items-center"
+              >
+                {AUTHOR_SITE}
               </button>
               <p className="mt-2 max-w-lg text-xs leading-relaxed text-[var(--color-muted)]">
                 {tr(

@@ -152,10 +152,14 @@ fn package(path: &Path) -> PkgInfo {
 /// A `.ffpfs` image: PS5 games keep `sce_sys/param.json`.
 fn pfs_image(path: &Path) -> PkgInfo {
     use ps5upload_fpkg::source::SourceTree;
-    let mut tree = match ps5_dump_forge_pfs::PfsSource::open(path) {
-        Ok(t) => t,
-        Err(e) => return failed(e.to_string()),
+    let Some((reader, _)) = open_any(path) else {
+        return failed("could not be read");
     };
+    let mut tree =
+        match ps5_dump_forge_pfs::PfsSource::from_reader(reader, path.display().to_string()) {
+            Ok(t) => t,
+            Err(e) => return failed(e.to_string()),
+        };
     let Ok(bytes) = tree.read("sce_sys/param.json") else {
         return failed("no sce_sys/param.json in this image");
     };
@@ -186,6 +190,9 @@ fn identify_raw(path: &Path, kind: &str) -> Option<PkgInfo> {
         "mount.ffpfs" => Some(pfs_image(path)),
         "folder" | "mount.exfat" | "mount.ffpkg" | "mount.ffpfsc" => {
             Some(match crate::inspect::inspect_local(path) {
+                Ok(g) if g.partial && g.identity.title_id.is_empty() => {
+                    failed("no readable sce_sys/param.json or param.sfo")
+                }
                 Ok(g) => from_inspection(&g),
                 Err(e) => failed(format!("{e:#}")),
             })

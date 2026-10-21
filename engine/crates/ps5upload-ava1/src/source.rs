@@ -128,3 +128,102 @@ impl Source for ListSource {
         })
     }
 }
+
+/// A folder source whose listed names differ from the files read: `(source path, console
+/// path)` pairs, both relative to the folder, differing only in the last component. The
+/// manifest, the skip-existing comparison and the console all see the console name.
+pub struct RenamedSource {
+    inner: Arc<dyn Source>,
+    /// Source path -> console name (last component).
+    to: HashMap<String, String>,
+    /// Console path -> source path.
+    back: HashMap<String, String>,
+}
+
+impl RenamedSource {
+    pub fn new(inner: Arc<dyn Source>, renames: &[(String, String)]) -> Self {
+        let last = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+        Self {
+            inner,
+            to: renames.iter().map(|(f, t)| (f.clone(), last(t))).collect(),
+            back: renames
+                .iter()
+                .map(|(f, t)| (t.clone(), f.clone()))
+                .collect(),
+        }
+    }
+
+    fn source_path<'a>(&'a self, rel: &'a str) -> &'a str {
+        self.back.get(rel).map_or(rel, String::as_str)
+    }
+}
+
+impl Source for RenamedSource {
+    fn open(&self, rel: &str) -> io::Result<Box<dyn ReadAt>> {
+        self.inner.open(self.source_path(rel))
+    }
+
+    fn list(&self, rel: &str) -> io::Result<Vec<(String, SourceMeta)>> {
+        let mut out = self.inner.list(rel)?;
+        for (name, _) in &mut out {
+            let path = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if let Some(new) = self.to.get(&path) {
+                *name = new.clone();
+            }
+        }
+        Ok(out)
+    }
+
+    fn stat(&self, rel: &str) -> io::Result<SourceMeta> {
+        self.inner.stat(self.source_path(rel))
+    }
+
+    fn close(&self) {
+        self.inner.close()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ava1::source::LocalSource;
+
+    #[test]
+    fn a_renamed_module_is_listed_under_its_new_name_and_read_from_the_old_file() {
+        let d = std::env::temp_dir().join(format!("p5a-renamed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("Media/Modules")).unwrap();
+        std::fs::write(d.join("eboot.bin"), b"eboot").unwrap();
+        std::fs::write(d.join("Media/Modules/Il2cppUserAssemblies.prx"), b"module").unwrap();
+        std::fs::write(d.join("Media/Modules/PS5Util.prx"), b"util").unwrap();
+        let src = RenamedSource::new(
+            Arc::new(LocalSource::new(d.clone())),
+            &[(
+                "Media/Modules/Il2cppUserAssemblies.prx".into(),
+                "Media/Modules/Il2CppUserAssemblies.prx".into(),
+            )],
+        );
+        let m = ava1::manifest::walk(&src, &|_| false).unwrap();
+        let paths: Vec<&str> = m.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "Media",
+                "Media/Modules",
+                "Media/Modules/Il2CppUserAssemblies.prx",
+                "Media/Modules/PS5Util.prx",
+                "eboot.bin"
+            ]
+        );
+        let new = "Media/Modules/Il2CppUserAssemblies.prx";
+        assert_eq!(src.stat(new).unwrap().size, 6);
+        let mut buf = [0u8; 6];
+        let n = src.open(new).unwrap().read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"module");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

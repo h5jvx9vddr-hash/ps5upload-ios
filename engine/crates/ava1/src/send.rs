@@ -587,6 +587,18 @@ fn stall_limit(outstanding: u64) -> Duration {
 /// console's job thread in one sync for minutes.
 pub const RECEIVER_SILENT_FATAL: Duration = Duration::from_secs(600);
 
+/// How often a sender that is reading past data the receiver already holds (a solid
+/// archive decoded from its start on resume) tells it so with `SkipProgress` (SPEC.md §12.8).
+/// The spec asks for at least every 10 s; the console's progress deadline is far longer.
+pub const SKIP_PROGRESS_EVERY: Duration = Duration::from_secs(5);
+const _: () = assert!(SKIP_PROGRESS_EVERY.as_secs() <= 10, "SPEC.md §12.8");
+
+/// Whether a `SkipProgress` is due: the skip counter moved since the last one and the
+/// interval has passed.
+fn skip_progress_due(skipped: u64, last_sent: u64, since_last: Duration) -> bool {
+    skipped != last_sent && since_last >= SKIP_PROGRESS_EVERY
+}
+
 fn receiver_silent(limit: Duration) -> SendError {
     SendError::Protocol(format!(
         "the receiver said nothing about the job for {limit:?} although the connection is alive"
@@ -1492,6 +1504,17 @@ pub async fn run_upload(
     let seq_retries = Arc::new(crate::seq::Retries::default());
     let budget_wait: Arc<crate::seq::BudgetWait> = Arc::default();
     let mut budget_wait_seen = 0u64;
+    // Bytes read past without sending (SPEC.md §12.8): the decode thread's own (held
+    // stretches of a partly durable file) plus the source's (entries decoded to discard).
+    let seq_skipped = Arc::new(AtomicU64::new(0));
+    let skip_base = opts.seq.as_ref().map_or(0, |s| s.bytes_skipped());
+    let skipped_now = |seq: &Arc<dyn crate::seq::SeqSource>| {
+        seq.bytes_skipped()
+            .saturating_sub(skip_base)
+            .saturating_add(seq_skipped.load(Ordering::Relaxed))
+    };
+    let (mut skip_sent, mut skip_sent_at) = (0u64, Instant::now());
+    let mut skip_next: Option<u64> = None;
     let mut readers = if let Some(seq) = opts.seq.clone() {
         // One decode thread for a forward-only source (SPEC.md §17).
         let chunk_sh = sh.clone();
@@ -1514,6 +1537,7 @@ pub async fn run_upload(
             cancel: opts.cancel.clone(),
             retries: seq_retries.clone(),
             rt: tokio::runtime::Handle::current(),
+            skipped: seq_skipped.clone(),
         })]
     } else {
         spawn_readers(
@@ -1666,6 +1690,20 @@ pub async fn run_upload(
                     break Err(SendError::Disconnected(e.to_string()));
                 }
                 root_next.pop_front();
+            },
+            skip_sent_r = async {
+                let bytes_skipped = skip_next.expect("guarded by `if skip_next.is_some()`");
+                link.control
+                    .send(&gen::SkipProgress { job_id, bytes_skipped })
+                    .await
+            }, if skip_next.is_some() => {
+                // Queued from the tick and sent here, like the roots: awaiting it inline
+                // would stop the inbox drain while the control outbox is full.
+                if let Err(e) = skip_sent_r {
+                    break Err(SendError::Disconnected(e.to_string()));
+                }
+                skip_sent = skip_next.take().expect("guarded by `if skip_next.is_some()`");
+                skip_sent_at = Instant::now();
             },
             cancel_sent = async {
                 link.control
@@ -1878,6 +1916,14 @@ pub async fn run_upload(
                             "no queued frame fits the receiver's window ({} bytes granted, the smallest queued frame is {} bytes) and nothing was sent, received or credited for {:?}",
                             st.grant, st.smallest, limit
                         )));
+                    }
+                }
+                // A long skip sends no data frame: tell the receiver it is progress, or its
+                // watchdog ends the job (SPEC.md §12.8). Older receivers ignore the frame.
+                if let Some(seq) = opts.seq.as_ref() {
+                    let n = skipped_now(seq);
+                    if skip_next.is_none() && skip_progress_due(n, skip_sent, skip_sent_at.elapsed()) {
+                        skip_next = Some(n);
                     }
                 }
                 let secs = last_tick.elapsed().as_secs_f64();
@@ -2220,6 +2266,18 @@ mod tests {
             });
         }
         m
+    }
+
+    #[test]
+    fn skip_progress_is_sent_only_when_the_skip_moved_and_the_interval_passed() {
+        let every = SKIP_PROGRESS_EVERY;
+        assert!(!skip_progress_due(0, 0, every * 10), "nothing skipped");
+        assert!(
+            !skip_progress_due(5, 5, every * 10),
+            "no new skip since the last"
+        );
+        assert!(!skip_progress_due(9, 5, every / 2), "too soon");
+        assert!(skip_progress_due(9, 5, every));
     }
 
     #[test]

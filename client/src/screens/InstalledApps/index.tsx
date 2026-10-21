@@ -40,6 +40,7 @@ import {
   appLaunch,
   appIconUrl,
   appIconDataUrl,
+  GRID_ICON_SIZE,
   cachedAppIcon,
   smpStatus,
   sdkScan,
@@ -83,7 +84,7 @@ import { useMakeWay } from "../../lib/useMakeWay";
 import { pushNotification } from "../../state/notifications";
 import { withConsolePrefix } from "../../state/roster";
 import { audit } from "../../state/auditLog";
-import { useTr } from "../../state/lang";
+import { useLangStore, useTr } from "../../state/lang";
 import { transferAddr, mgmtAddr, hostOf } from "../../lib/addr";
 import { useImageRetry } from "../../lib/useImageRetry";
 import { transferScreenBusy } from "../../lib/ps5Transfers";
@@ -168,17 +169,17 @@ function KindBadge({ title }: { title: InstalledTitle }) {
 
 function Cover({ host, title }: { host: string; title: InstalledTitle }) {
   const { src, onError } = useImageRetry(
-    host.trim() ? appIconUrl(transferAddr(host), title.titleId) : null,
+    host.trim() ? appIconUrl(transferAddr(host), title.titleId, GRID_ICON_SIZE) : null,
     {
       // Bytes this session already fetched. Returning to Games then paints
       // covers on the first frame instead of re-deriving what we hold.
       cached: host.trim()
-        ? cachedAppIcon(transferAddr(host), title.titleId)
+        ? cachedAppIcon(transferAddr(host), title.titleId, GRID_ICON_SIZE)
         : undefined,
       // If the webview refuses the direct URL, pull the same bytes over the
       // IPC as a data: URL rather than showing a glyph. See useImageRetry.
       fallbackLoader: () =>
-        appIconDataUrl(transferAddr(host), title.titleId),
+        appIconDataUrl(transferAddr(host), title.titleId, GRID_ICON_SIZE),
     },
   );
   return (
@@ -362,6 +363,7 @@ export const AppCard = memo(function AppCard({
    *  bookkeeping around a cold start doesn't run for a foreground nudge. */
 }) {
   const tr = useTr();
+  const lang = useLangStore((s) => s.lang);
   const navigate = useNavigate();
   const canPlay = !title.system;
   // On-console folder this title lives in — only folder/disc kinds carry a
@@ -493,7 +495,7 @@ export const AppCard = memo(function AppCard({
               {playSeconds && playSeconds > 0
                 ? tr(
                     "installed_playtime_line",
-                    { time: formatPlayTime(playSeconds), seen: formatLastSeen(lastSeenMs) },
+                    { time: formatPlayTime(playSeconds), seen: formatLastSeen(lastSeenMs, undefined, lang) },
                     `${formatPlayTime(playSeconds)} · last seen ${formatLastSeen(lastSeenMs)}`,
                   )
                 : tr("installed_playtime_never", undefined, "not seen playing")}
@@ -810,6 +812,11 @@ export default function InstalledAppsScreen() {
       if (probe.isStale()) return;
       setTitles(res.titles);
       setRegisteredUnavailable(res.registeredUnavailable);
+      if (res.incomplete) {
+        console.warn(
+          "[installed] the console's installed list may be incomplete (a listing or app.db read did not finish); refresh to retry",
+        );
+      }
       try {
         const sdk = await sdkScan(mgmtAddr(probe.host));
         if (!probe.isStale()) setSdkState(sdk);
@@ -1196,10 +1203,22 @@ export default function InstalledAppsScreen() {
       setBusyId(t.titleId);
       setError(null);
       try {
-        await appUnregister(transferAddr(probe.host), t.titleId);
+        const res = await appUnregister(transferAddr(probe.host), t.titleId);
         audit("app_uninstall", withConsolePrefix(probe.host, t.titleName), { context: t.titleId });
         if (probe.isStale()) return;
-        setTitles((cur) => cur?.filter((x) => x.titleId !== t.titleId) ?? cur);
+        if (res.stillPresent) {
+          // #476: the PS5 accepted but the game is still there. Dropping it from the list
+          // only for the next refresh to bring it back is what looked like "it pops up again".
+          pushNotification("warning", withConsolePrefix(probe.host, t.titleName), {
+            body: tr(
+              "installed_uninstall_still_present",
+              { name: t.titleName },
+              `The PS5 accepted the uninstall, but ${t.titleName} is still on the console. A large game can take a few minutes to remove: refresh in a moment. If it stays, delete it from the PS5's Settings → Storage.`,
+            ),
+          });
+        } else {
+          setTitles((cur) => cur?.filter((x) => x.titleId !== t.titleId) ?? cur);
+        }
         void refresh();
       } catch (e) {
         if (probe.isStale()) return;
@@ -1348,9 +1367,9 @@ export default function InstalledAppsScreen() {
   // While the probe is still in flight we know neither "running" nor "off",
   // so the warning must stay hidden — surfacing it only once we've confirmed
   // ShadowMount+ is actually not running.
-  const smpChecking = smp === "checking";
-  const smpRunning = smp !== null && smp !== "checking" && smp.running === true;
-  const discNeedsSmp = discs.length > 0 && !smpRunning && !smpChecking;
+  const smpAbsent = smp !== null && smp !== "checking" && !smp.running &&
+    !smp.errors.some((e) => e.startsWith("proc list:"));
+  const discNeedsSmp = discs.length > 0 && smpAbsent;
 
   // One pass instead of a linear find per card on every render.
   const sdkById = useMemo(
@@ -1368,7 +1387,7 @@ export default function InstalledAppsScreen() {
     launching: launchingId === t.titleId,
     running: running.has(t.titleId),
     stopping: stoppingId === t.titleId,
-    discNeedsSmp: kindOf(t) === "disc" && !smpRunning && !smpChecking,
+    discNeedsSmp: kindOf(t) === "disc" && smpAbsent,
     playSeconds: playOf(t.titleId).seconds,
     lastSeenMs: playOf(t.titleId).lastSeenMs,
     onUninstall: handleUninstall,
@@ -1756,9 +1775,9 @@ export default function InstalledAppsScreen() {
                   "Folder homebrew",
                 )}
                 hint={tr(
-                  "installed_section_folder_hint",
+                  "installed_section_folder_hint_v2",
                   undefined,
-                  "Registered from a /data/homebrew/<id>-app folder on the console.",
+                  "Registered from a game folder, in /data/homebrew on the console or on a USB or external drive. Hover a game's ID to see its folder.",
                 )}
                 count={folders.length}
               >

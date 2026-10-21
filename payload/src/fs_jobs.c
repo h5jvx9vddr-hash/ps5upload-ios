@@ -80,6 +80,9 @@ static const char *find_value(const char *j, const char *key) {
     return NULL;
 }
 
+/* 1 when `key` is in the object at all (any value, null included). */
+int fsj_json_present(const char *json, const char *key) { return json && find_value(json, key) != NULL; }
+
 int fsj_json_str(const char *json, const char *key, char *out, size_t cap) {
     const char *p = json ? find_value(json, key) : NULL;
     size_t n = 0;
@@ -848,4 +851,5 @@ void fsj_register_ops(void) {
     (void)ava1_op_register(AVA1_JOB_OP_CHMOD_R, op_chmod_r, NULL);
     (void)ava1_op_register(AVA1_JOB_OP_HASH, op_hash, NULL);
     (void)ava1_op_register(AVA1_JOB_OP_CRC32, op_crc32, NULL);
+    (void)ava1_op_register(AVA1_JOB_OP_FFPFSC_UNPACK, fsj_op_ffpfsc_unpack, NULL);
 }

@@ -2,7 +2,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-import { hydrateConvertQueue, setConvertRunner, thenFor, useConvertQueue, type ConvertRunner } from "./convertQueue";
+import {
+  buildExtension,
+  hydrateConvertQueue,
+  setConvertRunner,
+  thenFor,
+  useConvertQueue,
+  type ConvertRunner,
+} from "./convertQueue";
 
 const flush = async () => {
   for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0));
@@ -100,6 +107,12 @@ describe("what happens after converting", () => {
     expect(thenFor("pkg", "upload", true)).toBe("upload");
     expect(thenFor("image", "stream", true)).toBe("upload");
     expect(thenFor("image", "keep", true)).toBe("keep");
+  });
+
+  it("only keeps a folder, and names it as one", () => {
+    expect(thenFor("folder", "stream", true)).toBe("keep");
+    expect(thenFor("folder", "upload", true)).toBe("keep");
+    expect(buildExtension({ kind: "folder" })).toBe("folder");
   });
 
   it("keeps the result when no console answers", () => {

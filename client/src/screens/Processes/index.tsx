@@ -1,12 +1,15 @@
 import { usePoll, useTransferBusy } from "../../lib/usePoll";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Cpu, RefreshCw, RotateCw, Skull, TriangleAlert, Layers } from "lucide-react";
+import { Cpu, RefreshCw, RotateCw, Skull, TriangleAlert, Layers, Network } from "lucide-react";
+import { useSearchParams } from "react-router";
+
+import TabbedShell, { type TabbedShellTab } from "../../layout/TabbedShell";
+import PortsPanel from "./PortsPanel";
 
 import { useConnectionStore } from "../../state/connection";
 import { mgmtAddr, transferAddr } from "../../lib/addr";
 import { useDocumentVisible } from "../../lib/visibility";
 import {
-  PageHeader,
   Button,
   EmptyState,
   ErrorCard,
@@ -56,7 +59,63 @@ const RESTART_RELAUNCH_DELAY_MS = 1200;
 
 type SortKey = "memory" | "pid" | "name" | "threads";
 
+/**
+ * "Processes & ports": the running processes and, beside them, the ports in use (a port is
+ * found by binding it, so it can't be tied to a pid; the two lists stay separate).
+ */
 export default function ProcessesScreen() {
+  const tr = useTr();
+  const [count, setCount] = useState<number | undefined>(undefined);
+  const [searchParams] = useSearchParams();
+  const tab: ProcessesTabId = searchParams.get("tab") === "ports" ? "ports" : "processes";
+  const tabs: ReadonlyArray<TabbedShellTab<ProcessesTabId>> = [
+    {
+      id: "processes",
+      icon: Layers,
+      key: "processes_title",
+      fallback: "Processes",
+      description: tr(
+        "processes_subtitle_v2",
+        undefined,
+        "The programs running on the PS5 right now. You can stop or restart one; take care with system processes, since stopping the wrong one can freeze the console.",
+      ),
+    },
+    {
+      id: "ports",
+      icon: Network,
+      key: "payloads_tab_ports",
+      fallback: "Ports",
+      description: tr(
+        "payloads_description_ports",
+        undefined,
+        "The ports in use on the PS5 and what usually listens on each, so you can tell which payload is where. Open the ones with a web page in your browser.",
+      ),
+    },
+  ];
+  return (
+    <TabbedShell
+      idPrefix="processes"
+      titleIcon={Layers}
+      titleKey="processes_and_ports"
+      titleFallback="Processes & ports"
+      count={tab === "processes" ? count : undefined}
+      tabs={tabs}
+      renderPanel={(id) =>
+        id === "ports" ? (
+          <ConnectionGate require="payload">
+            <PortsPanel />
+          </ConnectionGate>
+        ) : (
+          <ProcessesPanel onCount={setCount} />
+        )
+      }
+    />
+  );
+}
+
+type ProcessesTabId = "processes" | "ports";
+
+function ProcessesPanel({ onCount }: { onCount: (n: number | undefined) => void }) {
   const tr = useTr();
   const host = useConnectionStore((s) => s.host);
   const payloadStatus = useConnectionStore((s) => s.payloadStatus);
@@ -261,20 +320,12 @@ export default function ProcessesScreen() {
   }, [procs, showSystem, sortKey]);
 
   const systemCount = procs.filter((p) => p.kind === "system").length;
+  useEffect(() => {
+    onCount(procs.length || undefined);
+  }, [procs.length, onCount]);
 
   return (
-    <div className="app-page">
-      <PageHeader
-        icon={Layers}
-        title={tr("processes_title", undefined, "Processes")}
-        count={procs.length || undefined}
-        description={tr(
-          "processes_subtitle_v2",
-          undefined,
-          "The programs running on the PS5 right now. You can stop or restart one; take care with system processes, since stopping the wrong one can freeze the console.",
-        )}
-      />
-
+    <>
       <ConnectionGate require="payload">
         <div className="mb-4 flex flex-wrap items-center gap-3">
           <Toggle
@@ -447,7 +498,7 @@ export default function ProcessesScreen() {
           </Modal>
         )}
       </ConnectionGate>
-    </div>
+    </>
   );
 }
 

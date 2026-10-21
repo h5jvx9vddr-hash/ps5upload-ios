@@ -54,6 +54,16 @@ describe("review fixes", () => {
     });
   });
 
+  it("a PS5 update whose base is missing is only a warning: the PS5 decides", () => {
+    // A YouTube update package installed on a console without YouTube.
+    const pre = { state: "base_missing", installedVersion: null };
+    expect(installedFromPreflight("01.000.030", pre, "ps5")).toMatchObject({
+      verdict: "warn",
+      relation: "base-missing",
+    });
+    expect(installedFromPreflight("01.04", pre, "ps4")).toMatchObject({ verdict: "bad" });
+  });
+
   it("an empty package version is not compared", () => {
     expect(installedFromPreflight("", { state: "installed", installedVersion: "01.04" })).toMatchObject({
       relation: "installed",

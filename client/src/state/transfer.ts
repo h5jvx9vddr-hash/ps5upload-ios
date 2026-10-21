@@ -37,6 +37,7 @@ import { useUploadSettingsStore } from "./uploadSettings";
 import { useRecentHostMetricsStore } from "./recentHostMetrics";
 import { jobLiveFromSnapshot, type JobLive } from "../lib/jobLive";
 import { pushNotification } from "./notifications";
+import { labelEngineJob } from "../lib/bgWork";
 import { withConsolePrefix } from "./roster";
 import { trStatic } from "../lib/trStatic";
 
@@ -458,6 +459,7 @@ export const useTransferStore = create<TransferState>((set) => {
         return;
       }
 
+      labelEngineJob(jobId, "upload", uploadName);
       const startedAtMs = Date.now();
       setPhase(key, {
         kind: "running",

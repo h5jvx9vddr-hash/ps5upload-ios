@@ -170,6 +170,13 @@ static int rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t 
     return AVA1_STATUS_OK;
 }
 
+/* The AVA1 server's RPC entry (the data plane first, then the management table), for an in-process
+ * caller on its own thread: the identity is whatever ava1_server_set_rpc_peer set on that thread. */
+int ava1_payload_rpc(uint16_t method, const uint8_t *body, uint32_t body_len, uint8_t *out, size_t cap,
+                     size_t *out_len) {
+    return rpc(method, body, body_len, out, cap, out_len);
+}
+
 int ava1_payload_start(void) {
     ava1_server_cfg_t cfg;
     uint8_t launcher[32], token[16];
@@ -216,7 +223,7 @@ int ava1_payload_start(void) {
                 fprintf(stderr, "ava1: data layer did not start (%d); transfers are unavailable\n", rc);
             else {
                 cfg.data = ava1_data_hooks();
-                cfg.caps = AVA1_CAP_DATA_PLANE;
+                cfg.caps = AVA1_CAP_DATA_PLANE | AVA1_CAP_SHARED_JOBS; /* the data layer's own rules (SPEC.md §18.5) */
                 g_data_on = 1;
                 fsj_register_ops(); /* job.run: delete, chmod -R, hash, crc32 (the table adds the rest) */
             }

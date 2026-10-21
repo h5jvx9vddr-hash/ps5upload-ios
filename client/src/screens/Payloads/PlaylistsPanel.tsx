@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   CircleDashed,
   Clock,
+  Download,
   FilePlus,
   FolderOpen,
   ListPlus,
@@ -15,6 +16,7 @@ import {
   Plus,
   Square,
   Trash2,
+  Upload,
   X,
   XCircle,
   Zap,
@@ -34,7 +36,8 @@ import {
   sanitiseSleepMs,
   type Playlist,
 } from "../../lib/playlistOps";
-import { payloadsCatalog, type PayloadInfo } from "../../api/ps5";
+import { payloadsAddCustomRepo, payloadsCatalog, type PayloadInfo } from "../../api/ps5";
+import { buildPlaylistExport, parsePlaylistExport } from "../../lib/playlistShare";
 import { isAndroid } from "../../lib/platform";
 import { isTauriEnv, safeUnlisten } from "../../lib/tauriEnv";
 import { log } from "../../state/logs";
@@ -60,6 +63,71 @@ export function PlaylistsPanel({ host, port }: { host: string; port: number }) {
   const createPlaylist = usePayloadPlaylistsStore((s) => s.createPlaylist);
   const stop = usePayloadPlaylistsStore((s) => s.stop);
   const run = usePayloadPlaylistsStore((s) => s.run);
+
+  // Export and import (playlists, the auto-loader choice, custom repos) as one JSON file.
+  const [shareMsg, setShareMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const exportPlaylists = async () => {
+    setShareMsg(null);
+    try {
+      const st = usePayloadPlaylistsStore.getState();
+      const doc = buildPlaylistExport(st.playlists, st.autoLoader, await payloadsCatalog().catch(() => []), Date.now());
+      const fileName = `ps5upload-playlists-${new Date().toISOString().slice(0, 10)}.json`;
+      const json = JSON.stringify(doc, null, 2);
+      if (!isTauriEnv()) {
+        const { browserDownloadText } = await import("../../lib/browserDownload");
+        browserDownloadText(fileName, json, "application/json");
+        setShareMsg({ ok: true, text: tr("playlists_exported", { name: fileName }, `Saved ${fileName}`) });
+        return;
+      }
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const { writeTextFileToPath } = await import("../../lib/saveTextFile");
+      const dest = isAndroid()
+        ? ""
+        : await save({ defaultPath: fileName, filters: [{ name: "JSON", extensions: ["json"] }] });
+      if (!isAndroid() && (!dest || typeof dest !== "string")) return;
+      await writeTextFileToPath(dest ?? "", json, fileName);
+      setShareMsg({ ok: true, text: tr("playlists_exported", { name: dest || fileName }, `Saved ${dest || fileName}`) });
+    } catch (e) {
+      setShareMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
+    }
+  };
+  const applyImport = async (text: string) => {
+    const doc = parsePlaylistExport(text);
+    // The repos first, so the imported repo steps find their payloads.
+    const known = new Set((await payloadsCatalog().catch(() => [] as PayloadInfo[])).map((p) => p.id));
+    let repos = 0;
+    for (const r of doc.customRepos) {
+      if (known.has(r.id)) continue;
+      await payloadsAddCustomRepo({ host: r.host, owner: r.owner, name: r.name, displayName: r.displayName });
+      repos += 1;
+    }
+    const added = usePayloadPlaylistsStore.getState().importPlaylists(doc);
+    setShareMsg({
+      ok: true,
+      text: tr(
+        "playlists_imported",
+        { count: added, repos },
+        `Imported ${added} playlist(s) and ${repos} custom repo(s)`,
+      ),
+    });
+  };
+  const importPlaylists = async () => {
+    setShareMsg(null);
+    if (!isTauriEnv()) {
+      importInputRef.current?.click();
+      return;
+    }
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const { readTextFileFromPath } = await import("../../lib/saveTextFile");
+      const src = await open({ multiple: false, filters: [{ name: "JSON", extensions: ["json"] }] });
+      if (!src || typeof src !== "string") return;
+      await applyImport(await readTextFileFromPath(src));
+    } catch (e) {
+      setShareMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
+    }
+  };
 
   useEffect(() => {
     if (!loaded) void hydrate();
@@ -250,6 +318,49 @@ export function PlaylistsPanel({ host, port }: { host: string; port: number }) {
             onPick={(p) => createFromPaths([p])}
           />
           <Button
+            variant="secondary"
+            size="sm"
+            leftIcon={<Upload size={12} />}
+            onClick={() => void importPlaylists()}
+            disabled={isBusy}
+            title={tr(
+              "playlists_import_title",
+              undefined,
+              "Add playlists (and the custom repos they use) from a file someone exported",
+            )}
+          >
+            {tr("playlists_import", undefined, "Import…")}
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            leftIcon={<Download size={12} />}
+            onClick={() => void exportPlaylists()}
+            disabled={playlists.length === 0}
+            title={tr(
+              "playlists_export_title",
+              undefined,
+              "Save every playlist, the auto-loader choice and your custom repos to one file to share",
+            )}
+          >
+            {tr("playlists_export", undefined, "Export…")}
+          </Button>
+          <input
+            ref={importInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (!file) return;
+              void file
+                .text()
+                .then(applyImport)
+                .catch((err) => setShareMsg({ ok: false, text: err instanceof Error ? err.message : String(err) }));
+            }}
+          />
+          <Button
             variant="primary"
             size="sm"
             leftIcon={<Plus size={12} />}
@@ -260,6 +371,14 @@ export function PlaylistsPanel({ host, port }: { host: string; port: number }) {
           </Button>
         </div>
       </header>
+      {shareMsg && (
+        <p
+          className={`mb-3 text-xs ${shareMsg.ok ? "text-[var(--color-muted)]" : "text-[var(--color-bad)]"}`}
+          role={shareMsg.ok ? "status" : "alert"}
+        >
+          {shareMsg.text}
+        </p>
+      )}
 
       {/* Drag-to-create zone (desktop). Drop one or more payloads to spin up
           a playlist; auto-detected by extension, so a stray .pkg or folder

@@ -53,6 +53,9 @@ pub struct RuntimeSupport {
 pub fn runtime_support(module: &[u8]) -> RuntimeSupport {
     let has = |needle: &[u8]| module.windows(needle.len()).any(|w| w == needle);
     let packs = has(format::INDEX_MAGIC) && has(b"ampr_assets");
+    // The banner is one C string ending in the marker: "0.4.2.1 (c) Drakmor", and in the
+    // 0.3 series "0.3.6 (public beta) (c) Drakmor" (#449). The version is its first token
+    // made of digits and dots.
     let marker = b" (c) Drakmor";
     let version = module
         .windows(marker.len())
@@ -60,10 +63,13 @@ pub fn runtime_support(module: &[u8]) -> RuntimeSupport {
         .and_then(|end| {
             let start = module[..end]
                 .iter()
-                .rposition(|&b| !(b.is_ascii_digit() || b == b'.'))
+                .rposition(|&b| b == 0)
                 .map_or(0, |p| p + 1);
-            let v = std::str::from_utf8(&module[start..end]).ok()?;
-            (!v.is_empty() && v.contains('.')).then(|| v.to_string())
+            let banner = std::str::from_utf8(&module[start..end]).ok()?;
+            banner
+                .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .find(|t| t.contains('.') && t.starts_with(|c: char| c.is_ascii_digit()))
+                .map(|t| t.trim_end_matches('.').to_string())
         });
     RuntimeSupport { packs, version }
 }
@@ -447,5 +453,11 @@ mod tests {
         let old = runtime_support(b"\x000.3.1 (c) Drakmor\0 AMPRIDX3");
         assert!(!old.packs);
         assert_eq!(old.version.as_deref(), Some("0.3.1"));
+        // The 0.3 releases' real banner (0.3.4, 0.3.6, 0.3.6.6): "(public beta)" sits
+        // between the version and the marker; it read as "unknown version" (#449).
+        let beta = runtime_support(b"sceKernelJit\x000.3.6.6 (public beta) (c) Drakmor\0AMPRIDX3");
+        assert_eq!(beta.version.as_deref(), Some("0.3.6.6"));
+        assert!(!beta.packs);
+        assert_eq!(runtime_support(b"no banner here").version, None);
     }
 }

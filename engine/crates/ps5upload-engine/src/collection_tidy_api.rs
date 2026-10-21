@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use axum::{http::StatusCode, response::Response, Json};
 use serde::{Deserialize, Serialize};
 
+use crate::collection::organize_fs::{path_string, raw_root, split_raw, tree_for, Tree};
 use crate::collection::{junk, organize, store};
 use crate::collection_api::{err, library, settings};
 
@@ -295,36 +296,103 @@ fn pending_plans() -> &'static Mutex<HashMap<String, PendingPlan>> {
     P.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// This computer's roots: the organizer renames files, which it does only here.
-fn roots() -> Vec<PathBuf> {
+/// Every collection root, on this computer or on a saved server: (the root as the organizer's
+/// trees take it, the root as the settings and the index name it).
+fn roots() -> Vec<(PathBuf, String)> {
     settings()
         .roots
         .iter()
-        .filter(|r| !crate::remote::path::is_remote(r))
-        .map(PathBuf::from)
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| (raw_root(r), r.clone()))
         .collect()
 }
 
-/// Every collection folder holding packages, across the roots. The index already knows which
-/// top-level folders hold packages; walking the roots to find out reads every file of every
-/// game folder (measured: 189,000 files, a minute on an external drive) to learn nothing new.
-fn all_containers() -> Vec<PathBuf> {
-    let roots = roots();
-    let Some(lib) = library() else {
-        return roots.iter().flat_map(|r| organize::containers(r)).collect();
+fn path_str(p: &FsPath) -> String {
+    path_string(p)
+}
+
+/// The saved connection a path is on, if it is on one.
+fn connection_of(p: &FsPath) -> Option<String> {
+    split_raw(&path_str(p)).map(|(id, _)| id)
+}
+
+/// The saved connection with id `id`, as saved now.
+fn saved(id: &str) -> Option<crate::remote::store::Connection> {
+    crate::remote::pool::global()
+        .ok()
+        .and_then(|r| r.store.get(id))
+        .map(|(c, _)| c)
+}
+
+/// The saved server's name for a `remote://` path ("" on this computer).
+fn server_name(p: &FsPath) -> String {
+    let Some(id) = connection_of(p) else {
+        return String::new();
     };
-    let mut out: Vec<PathBuf> = lib
-        .games
-        .values()
-        .flat_map(|g| g.locations.iter())
-        .filter(|l| l.kind == "pkg" && !l.container.is_empty())
-        .filter(|l| roots.iter().any(|r| r == FsPath::new(&l.root)))
-        .map(|l| FsPath::new(&l.root).join(&l.container))
-        .filter(|c| c.is_dir())
-        .collect();
+    saved(&id).map(|c| c.name).unwrap_or(id)
+}
+
+/// How a folder is shown: its path here, or "Server: /path" on a saved server.
+fn label(p: &FsPath) -> String {
+    let s = path_str(p);
+    match split_raw(&s) {
+        Some((_, path)) => format!("{}: {path}", server_name(p)),
+        None => s,
+    }
+}
+
+/// Where a server folder is, for the undo log: which server, and the folder on it.
+fn origin_of(p: &FsPath) -> Option<organize::Origin> {
+    let (id, path) = split_raw(&path_str(p))?;
+    let c = saved(&id)?;
+    Some(organize::Origin {
+        protocol: format!("{:?}", c.protocol).to_ascii_lowercase(),
+        host: c.host.trim().to_ascii_lowercase(),
+        port: c.port,
+        share: c.share.trim_matches(['/', '\\']).to_ascii_lowercase(),
+        path,
+    })
+}
+
+/// One [`Tree`] per place (this computer, or each server) for one request, so a server's
+/// folders are listed once however many containers share it.
+#[derive(Default)]
+struct Trees(HashMap<String, Result<Box<dyn Tree>, String>>);
+
+impl Trees {
+    fn get(&mut self, p: &FsPath) -> Result<&dyn Tree, String> {
+        let k = connection_of(p).unwrap_or_default();
+        self.0
+            .entry(k)
+            .or_insert_with(|| tree_for(p))
+            .as_ref()
+            .map(|t| t.as_ref())
+            .map_err(Clone::clone)
+    }
+}
+
+/// The configured roots are independent organization boundaries. Discover current contents
+/// when planning instead of filtering roots through a possibly stale, package-only index.
+fn all_containers(trees: &mut Trees) -> (Vec<PathBuf>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut problems = Vec::new();
+    for (root, _) in roots() {
+        if out.contains(&root) {
+            continue;
+        }
+        match trees.get(&root) {
+            Ok(tree) if tree.list(&root).is_some() => out.push(root),
+            Ok(tree) => problems.push(format!(
+                "{}: {}",
+                label(&root),
+                tree.trouble()
+                    .unwrap_or_else(|| "directory could not be listed".into())
+            )),
+            Err(e) => problems.push(format!("{}: {e}", label(&root))),
+        }
+    }
     out.sort();
-    out.dedup();
-    out
+    (out, problems)
 }
 
 fn organize_dir() -> Option<PathBuf> {
@@ -335,6 +403,8 @@ fn organize_dir() -> Option<PathBuf> {
 pub struct PlanResponse {
     pub token: String,
     pub containers: Vec<String>,
+    /// How to show each container: its path, or "Server: /path" on a saved server.
+    pub labels: std::collections::BTreeMap<String, String>,
     pub moves: Vec<organize::Move>,
     pub skipped: Vec<organize::Skipped>,
     pub unsure_count: usize,
@@ -343,37 +413,47 @@ pub struct PlanResponse {
 
 /// POST /api/collection/organize/plan: what the organizer would do. Touches nothing.
 pub async fn post_organize_plan() -> Response {
-    // Off the async workers: it stats every package folder.
-    let containers = tokio::task::spawn_blocking(all_containers)
-        .await
-        .unwrap_or_default();
-    if containers.is_empty() {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "no folder in the collection holds packages",
-        );
-    }
-    let plans = tokio::task::spawn_blocking({
-        let containers = containers.clone();
-        move || {
-            let lib = library();
-            let roots = roots();
-            containers
-                .iter()
-                .map(|c| organize::plan_cached(c, lib.as_deref(), &roots))
-                .collect::<Vec<_>>()
-        }
+    // Off the async workers: it lists every package folder, perhaps over the network.
+    let (containers, problems, plans) = tokio::task::spawn_blocking(|| {
+        let mut trees = Trees::default();
+        let (containers, problems) = all_containers(&mut trees);
+        let lib = library();
+        let roots = roots();
+        let plans = containers
+            .iter()
+            .map(|c| match trees.get(c) {
+                Ok(t) => organize::plan_cached(t, c, lib.as_deref(), &roots),
+                Err(_) => organize::Plan::default(),
+            })
+            .collect::<Vec<_>>();
+        (containers, problems, plans)
     })
     .await
     .unwrap_or_default();
+    if containers.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            if problems.is_empty() {
+                "no collection root could be read".to_string()
+            } else {
+                format!("no collection root could be read: {}", problems.join("; "))
+            },
+        );
+    }
     let mut resp = PlanResponse {
         token: new_token(),
-        containers: containers
-            .iter()
-            .map(|c| c.to_string_lossy().into_owned())
-            .collect(),
+        containers: containers.iter().map(|c| path_str(c)).collect(),
+        labels: containers.iter().map(|c| (path_str(c), label(c))).collect(),
         moves: Vec::new(),
-        skipped: Vec::new(),
+        skipped: problems
+            .into_iter()
+            .map(|detail| organize::Skipped {
+                container: String::new(),
+                path: String::new(),
+                reason: organize::SKIP_UNREADABLE.into(),
+                detail,
+            })
+            .collect(),
         unsure_count: 0,
         total_bytes: 0,
     };
@@ -511,11 +591,10 @@ pub async fn post_organize_apply(Json(req): Json<OrganizeApplyReq>) -> Response 
             "no data folder for the undo log",
         );
     };
-    // Off the async workers: it stats every package folder.
-    let containers = tokio::task::spawn_blocking(all_containers)
-        .await
-        .unwrap_or_default();
+    // Off the async workers: it lists every package folder, perhaps over the network.
     let result = tokio::task::spawn_blocking(move || {
+        let mut trees = Trees::default();
+        let (containers, _) = all_containers(&mut trees);
         let lib = library();
         let roots = roots();
         let mut out = OrganizeApplyResult::default();
@@ -530,7 +609,14 @@ pub async fn post_organize_apply(Json(req): Json<OrganizeApplyReq>) -> Response 
                 out.dropped.extend(chosen.into_iter().map(|m| m.from));
                 continue;
             }
-            let plan = organize::plan_cached(&c, lib.as_deref(), &roots);
+            let tree = match trees.get(&c) {
+                Ok(t) => t,
+                Err(e) => {
+                    out.dropped.push(format!("{}: {e}", label(&c)));
+                    continue;
+                }
+            };
+            let plan = organize::plan_cached(tree, &c, lib.as_deref(), &roots);
             let live: HashMap<&str, &organize::Move> =
                 plan.moves.iter().map(|m| (m.from.as_str(), m)).collect();
             let mut picked = Vec::new();
@@ -560,7 +646,7 @@ pub async fn post_organize_apply(Json(req): Json<OrganizeApplyReq>) -> Response 
                 )),
                 &plan.unsure,
             );
-            match organize::apply(&c, picked, &log_path) {
+            match organize::apply(tree, &c, picked, &log_path, &server_name(&c), origin_of(&c)) {
                 Ok(log) => {
                     crate::engine_log::record(
                         "info",
@@ -574,7 +660,10 @@ pub async fn post_organize_apply(Json(req): Json<OrganizeApplyReq>) -> Response 
                     );
                     out.moved.extend(log.completed);
                     out.failed.extend(log.failed);
-                    out.kept_dirs.extend(log.kept_dirs);
+                    // Where each is: one name ("old") could be in several containers.
+                    let at = label(&c);
+                    out.kept_dirs
+                        .extend(log.kept_dirs.iter().map(|d| format!("{at}/{d}")));
                     out.logs.push(
                         log_path
                             .file_name()
@@ -602,6 +691,8 @@ pub async fn post_organize_apply(Json(req): Json<OrganizeApplyReq>) -> Response 
 pub struct RunSummary {
     pub id: String,
     pub container_root: String,
+    /// How to show the folder: its path, or "Server: /path" on a saved server.
+    pub label: String,
     pub created_at: String,
     pub moved: usize,
     pub failed: usize,
@@ -624,8 +715,31 @@ pub async fn get_organize_runs() -> Response {
             }
             let log: organize::UndoLog =
                 serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+            let root = FsPath::new(&log.container_root);
+            let shown = match (
+                connection_of(root),
+                crate::remote::path::parse(&log.container_root),
+            ) {
+                (Some(id), Ok(r)) => {
+                    // The server's name now; the one it had then, should it since be gone.
+                    let name = crate::remote::pool::global()
+                        .ok()
+                        .and_then(|g| g.store.get(&id))
+                        .map(|(c, _)| c.name)
+                        .unwrap_or_else(|| {
+                            if log.server.is_empty() {
+                                id.clone()
+                            } else {
+                                log.server.clone()
+                            }
+                        });
+                    format!("{name}: {}", r.path)
+                }
+                _ => log.container_root.clone(),
+            };
             Some(RunSummary {
                 id: name,
+                label: shown,
                 container_root: log.container_root,
                 created_at: log.created_at,
                 moved: log.completed.len(),
@@ -636,6 +750,36 @@ pub async fn get_organize_runs() -> Response {
         .collect();
     runs.sort_by(|a, b| b.id.cmp(&a.id));
     ok(&runs)
+}
+
+/// Whether a run's folder is still where the run was made: the saved connection it names must
+/// still point at the same server. An older log, from before that was recorded, is undone on
+/// the connection with the same id (Undo itself checks the folder is there), with a note.
+fn same_place(log_path: &FsPath) -> Result<Option<String>, String> {
+    let bytes = std::fs::read(log_path).map_err(|e| e.to_string())?;
+    let log: organize::UndoLog = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let root = FsPath::new(&log.container_root);
+    let Some((id, _)) = split_raw(&log.container_root) else {
+        return Ok(None);
+    };
+    let Some(now) = origin_of(root) else {
+        return Err(format!(
+            "the saved connection this run was made on ({id}) is gone"
+        ));
+    };
+    match &log.origin {
+        Some(then) if then.same_server(&now) => Ok(None),
+        Some(then) => Err(format!(
+            "the saved connection now points to another server ({} {}:{} instead of {} {}:{}); \
+             undo refused so nothing is renamed there",
+            now.protocol, now.host, now.port, then.protocol, then.host, then.port
+        )),
+        None => Ok(Some(format!(
+            "This run was logged before ps5upload recorded which server it was on: it was undone \
+             on the saved connection \"{}\" as it is set up now.",
+            server_name(root)
+        ))),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -655,10 +799,16 @@ pub async fn post_organize_revert(Json(req): Json<RevertReq>) -> Response {
     let Some(path) = organize_dir().map(|d| d.join(&req.id)) else {
         return err(StatusCode::NOT_FOUND, "no such run");
     };
-    let res = tokio::task::spawn_blocking(move || organize::revert(&path))
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))
-        .and_then(|r| r);
+    let res = tokio::task::spawn_blocking(move || {
+        let note = same_place(&path).map_err(std::io::Error::other)?;
+        organize::revert(&path, &tree_for).map(|mut r| {
+            r.note = note;
+            r
+        })
+    })
+    .await
+    .map_err(|e| std::io::Error::other(e.to_string()))
+    .and_then(|r| r);
     match res {
         Ok(r) => {
             crate::engine_log::record(
@@ -1084,6 +1234,50 @@ mod tests {
         let b = unique_log_base(&d, "organize_1_fpkg");
         assert_ne!(a, b);
         assert_eq!(b, d.join("organize_1_fpkg_2"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn undo_is_refused_when_the_saved_connection_now_points_elsewhere() {
+        use crate::remote::store::{conn, Protocol, Secret};
+        let r = crate::remote::pool::testing::install_global(&[]);
+        let id = r
+            .store
+            .add(conn("NAS", Protocol::Smb), Secret::None)
+            .unwrap()
+            .conn
+            .id;
+        let root = format!("remote://{id}/games/fpkg");
+        let now = origin_of(FsPath::new(&root)).unwrap();
+        let d = std::env::temp_dir().join(format!("ps5u-place-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let log = |origin: Option<organize::Origin>, root: &str| {
+            let p = d.join(format!("organize_{}.json", uuid::Uuid::new_v4()));
+            let v = serde_json::json!({
+                "version": 1, "container_root": root, "created_at": "x", "moves": [],
+                "origin": origin,
+            });
+            std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+            p
+        };
+        assert_eq!(same_place(&log(Some(now.clone()), &root)), Ok(None));
+        let moved = organize::Origin {
+            host: "another-nas".into(),
+            ..now.clone()
+        };
+        let refused = same_place(&log(Some(moved), &root)).unwrap_err();
+        assert!(refused.contains("another server"), "{refused}");
+        let other_share = organize::Origin {
+            share: "elsewhere".into(),
+            ..now
+        };
+        assert!(same_place(&log(Some(other_share), &root)).is_err());
+        // An older log: undone on the same connection id, with a note.
+        assert!(same_place(&log(None, &root)).unwrap().is_some());
+        // A connection that is gone: refused.
+        assert!(same_place(&log(None, "remote://gone-0000/games")).is_err());
+        // This computer's folders have nothing to compare.
+        assert_eq!(same_place(&log(None, "/Volumes/x/fpkg")), Ok(None));
         let _ = std::fs::remove_dir_all(&d);
     }
 

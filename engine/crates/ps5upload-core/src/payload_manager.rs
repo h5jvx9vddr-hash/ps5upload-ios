@@ -7,12 +7,20 @@
 //! sends nothing, and some setups never leave it listening (issues #344,
 //! #345). Payload Manager itself stays up and can launch a stored ELF.
 //!
-//! Its API, read from its own web UI (v0.5.2) and measured on a FW 13.60 Pro:
+//! Its API, read from its own web UI (v0.5.2) and measured on a FW 13.60 Pro,
+//! then again against 0.6.1 on a FW 13.60 Phat (#458):
 //!   POST /manage:upload?filename=<name>   raw bytes → stored under its folder
-//!   GET  /list_payloads                   {"payloads": ["/data/pldmgr/…", …]}
-//!   GET  /loadpayload:<path>              launch; only its own folders, any
-//!                                         other path is "Invalid payload name"
-//!   GET  /manage:delete?filename=<name>   remove the stored copy
+//!   GET  /list_payloads                   {"payloads": ["/data/pldmgr/…", …]} and,
+//!                                         from 0.6, "items": [{slot, path, kind,
+//!                                         filename, name, version, …}]
+//!   POST /loadpayload:<path>              launch; only its own folders, any
+//!                                         other path is "Invalid payload name".
+//!                                         0.6 refuses GET (405) and also takes
+//!                                         the slot ("local/<stem>", "repo/<id>@…")
+//!   POST /manage:delete?filename=<name>   remove the stored copy (0.6: 405 on GET)
+//! 0.5.2 does not look at the method of these two, so POST works on both. 0.6
+//! stores an upload at /data/pldmgr/payloads/local/<stem>/<name> (slot
+//! "local/<stem>") and its boot autoload list names slots, not file names.
 //! The installer answered on :9115 1.1 s after `loadpayload`, beside a running
 //! ps5upload helper, and kept running after its stored copy was deleted.
 //!
@@ -76,7 +84,7 @@ pub fn launch_elf(ip: &str, filename: &str, bytes: &[u8]) -> Result<(), String> 
         .ok_or_else(|| format!("Payload Manager accepted {filename} but does not list it"))?;
     let (status, body) = request(
         ip,
-        "GET",
+        "POST",
         &format!("/loadpayload:{}", encode_path(&path)),
         None,
     )?;
@@ -94,7 +102,7 @@ pub fn launch_elf(ip: &str, filename: &str, bytes: &[u8]) -> Result<(), String> 
 pub fn forget(ip: &str, filename: &str) {
     let _ = request(
         ip,
-        "GET",
+        "POST",
         &format!("/manage:delete?filename={}", encode_query(filename)),
         None,
     );
@@ -106,6 +114,9 @@ pub fn forget(ip: &str, filename: &str) {
 pub struct StoredPayload {
     /// The absolute path on the console; what `/loadpayload:` takes.
     pub path: String,
+    /// Payload Manager 0.6's slot (`local/<stem>`, `repo/<id>@<source>`): what its
+    /// autoload list names. Empty on 0.5, whose list names files.
+    pub slot: String,
     pub filename: String,
     /// The folder Payload Manager keeps it under (`/data/pldmgr/payloads/<folder>/`),
     /// or the mount root for a payload found on a USB stick.
@@ -149,6 +160,50 @@ fn parse_list(list_json: &[u8]) -> Option<Vec<StoredPayload>> {
             .unwrap_or("")
             .to_string()
     };
+    // 0.6 describes each payload in "items" (and its USB finds in "usb"); 0.5 only
+    // lists paths in "payloads" with a "meta" map keyed by file name.
+    if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
+        let usb = v.get("usb").and_then(|u| u.as_array());
+        let mut out: Vec<StoredPayload> = items
+            .iter()
+            .chain(usb.into_iter().flatten())
+            .filter_map(|m| {
+                let path = m.get("path")?.as_str()?.to_string();
+                let filename = text(m, &["filename"]);
+                let filename = if filename.is_empty() {
+                    path.rsplit('/').next().unwrap_or(&path).to_string()
+                } else {
+                    filename
+                };
+                // "local/<stem>" or "repo/<id>@<source>" under its storage; the
+                // mount root for a USB find.
+                let folder = path
+                    .strip_prefix("/data/pldmgr/payloads/")
+                    .and_then(|rest| rest.rsplit_once('/').map(|(d, _)| d.to_string()))
+                    .or_else(|| path.rsplit_once('/').map(|(d, _)| d.to_string()))
+                    .unwrap_or_default();
+                Some(StoredPayload {
+                    slot: text(m, &["slot"]),
+                    name: text(m, &["display_name", "name"]),
+                    version: text(m, &["version"]),
+                    source: text(m, &["source_name", "source"]),
+                    install_source: {
+                        let s = text(m, &["install_source", "origin"]);
+                        if s.is_empty() {
+                            text(m, &["kind"])
+                        } else {
+                            s
+                        }
+                    },
+                    path,
+                    filename,
+                    folder,
+                })
+            })
+            .collect();
+        out.sort_by_key(|p| !p.path.starts_with("/data/pldmgr/"));
+        return Some(out);
+    }
     let mut out: Vec<StoredPayload> = v
         .get("payloads")?
         .as_array()?
@@ -172,6 +227,7 @@ fn parse_list(list_json: &[u8]) -> Option<Vec<StoredPayload>> {
                 .unwrap_or(serde_json::Value::Null);
             StoredPayload {
                 path: path.to_string(),
+                slot: String::new(),
                 name: text(&m, &["display_name", "name"]),
                 version: text(&m, &["version"]),
                 source: text(&m, &["source_name", "source"]),
@@ -186,11 +242,12 @@ fn parse_list(list_json: &[u8]) -> Option<Vec<StoredPayload>> {
     Some(out)
 }
 
-/// Launch a payload Payload Manager already lists (`GET /loadpayload:<path>`).
+/// Launch a payload Payload Manager already lists (`POST /loadpayload:<path>`; 0.6 also
+/// takes its slot).
 pub fn launch(ip: &str, path: &str) -> Result<(), String> {
     let (status, body) = request(
         ip,
-        "GET",
+        "POST",
         &format!("/loadpayload:{}", encode_path(path)),
         None,
     )?;
@@ -203,12 +260,12 @@ pub fn launch(ip: &str, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Delete a stored payload by file name (`GET /manage:delete`). Payload Manager
-/// removes the file and its sidecar.
+/// Delete a stored payload by file name (`POST /manage:delete`). Payload Manager
+/// removes the file and its sidecar (0.6: the slot folder).
 pub fn delete(ip: &str, filename: &str) -> Result<(), String> {
     let (status, body) = request(
         ip,
-        "GET",
+        "POST",
         &format!("/manage:delete?filename={}", encode_query(filename)),
         None,
     )?;
@@ -330,7 +387,14 @@ fn parse_autoload(json: &[u8]) -> Option<Autoload> {
 /// keeps its other settings when they are not sent.
 pub fn autoload_set(ip: &str, enabled: bool, list: &[String]) -> Result<(), String> {
     for entry in list {
-        if entry.contains(',') || entry.contains('"') || entry.contains('/') {
+        // A file name (0.5), a slot like "local/x" or "repo/x@y" (0.6), or a "!<ms>"
+        // pause; never a path or anything that breaks the comma list.
+        if entry.contains(',')
+            || entry.contains('"')
+            || entry.starts_with('/')
+            || entry.contains("..")
+            || entry.chars().any(char::is_whitespace)
+        {
             return Err(format!("{entry:?} cannot be an autoload entry"));
         }
     }
@@ -403,6 +467,24 @@ fn encode_path(s: &str) -> String {
 }
 
 /// One HTTP/1.1 request with `Connection: close`; returns status and body.
+/// The request line and headers. Every request carries Payload Manager's request
+/// marker: since 0.6.0 a mutation (`POST`, `manage:delete`, `loadpayload`) without a
+/// same-origin `Origin`/`Referer` is refused with 403 "Mutation origin or request
+/// marker rejected" unless `X-PLDMGR-Request: 1` is present (its `mutation_authorized`
+/// in http_server.c). Older versions ignore the header (#458).
+fn request_head(method: &str, path: &str, addr: &str, body_len: usize) -> String {
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nX-PLDMGR-Request: 1\r\n"
+    );
+    if method == "POST" {
+        head.push_str(&format!(
+            "Content-Type: application/octet-stream\r\nContent-Length: {body_len}\r\n"
+        ));
+    }
+    head.push_str("\r\n");
+    head
+}
+
 fn request(
     ip: &str,
     method: &str,
@@ -419,14 +501,7 @@ fn request(
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
     let body = body.unwrap_or(&[]);
-    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
-    if method == "POST" {
-        head.push_str(&format!(
-            "Content-Type: application/octet-stream\r\nContent-Length: {}\r\n",
-            body.len()
-        ));
-    }
-    head.push_str("\r\n");
+    let head = request_head(method, path, &addr, body.len());
     stream
         .write_all(head.as_bytes())
         .and_then(|()| stream.write_all(body))
@@ -478,6 +553,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_request_carries_the_request_marker_payload_manager_0_6_demands() {
+        let post = request_head("POST", "/manage:upload?filename=a.elf", "10.0.0.2:8084", 3);
+        assert!(post.starts_with("POST /manage:upload?filename=a.elf HTTP/1.1\r\n"));
+        assert!(post.contains("\r\nX-PLDMGR-Request: 1\r\n"));
+        assert!(post.contains("\r\nContent-Length: 3\r\n"));
+        assert!(post.ends_with("\r\n\r\n"));
+        let get = request_head("GET", "/manage:delete?filename=a.elf", "10.0.0.2:8084", 0);
+        assert!(get.contains("\r\nX-PLDMGR-Request: 1\r\n"));
+        assert!(!get.contains("Content-Length"));
+    }
+
+    #[test]
     fn finds_the_stored_copy_in_its_own_folder() {
         // The real /list_payloads body from a FW 13.60 Pro, plus the upload.
         let body = br#"{"payloads":["/data/pldmgr/payloads/elfldr/elfldr_v0.26.elf","/mnt/usb0/ps5upload-installer.elf","/data/pldmgr/payloads/ps5upload-installer/ps5upload-installer.elf"],"meta":{}}"#;
@@ -517,6 +604,49 @@ mod tests {
         assert_eq!(list[1].filename, "kstuff.elf");
         assert_eq!(list[1].folder, "/mnt/usb0");
         assert_eq!(list[1].name, "");
+    }
+
+    #[test]
+    fn lists_payload_manager_0_6_items_with_their_slots() {
+        // Payload Manager 0.6.1 on a FW 13.60 Phat: a repository payload and a
+        // web upload. "payloads" is still there but carries no names.
+        let body = br#"{"self":{"id":"pldmgr","running_version":"0.6.1","pending_version":""},"items":[{"slot":"repo/elfldr@e8cce5d1","path":"/data/pldmgr/payloads/repo/elfldr@e8cce5d1/elfldr_v0.26.elf","kind":"repo","filename":"elfldr_v0.26.elf","id":"elfldr","source_url":"https://itsplk.github.io/ps5-payloads-mirror/payloads_v2.json","source_name":"Official Repository","name":"elfldr","version":"v0.26","checksum":"ed6d","last_update":"2026-08-29","author":"","details_url":"","source":"https://github.com/ps5-payload-dev/elfldr/releases","description":"An ELF loader"},{"slot":"local/ps5upload-probe","path":"/data/pldmgr/payloads/local/ps5upload-probe/ps5upload-probe.elf","kind":"local","filename":"ps5upload-probe.elf","origin":"web_upload","origin_detail":""}],"usb":[{"slot":"usb/x","path":"/mnt/usb0/x.elf","kind":"usb","filename":"x.elf"}],"payloads":["/data/pldmgr/payloads/repo/elfldr@e8cce5d1/elfldr_v0.26.elf","/data/pldmgr/payloads/local/ps5upload-probe/ps5upload-probe.elf"]}"#;
+        let list = parse_list(body).unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].slot, "repo/elfldr@e8cce5d1");
+        assert_eq!(list[0].folder, "repo/elfldr@e8cce5d1");
+        assert_eq!(list[0].name, "elfldr");
+        assert_eq!(list[0].version, "v0.26");
+        assert_eq!(list[0].source, "Official Repository");
+        assert_eq!(list[0].install_source, "repo");
+        assert_eq!(list[1].slot, "local/ps5upload-probe");
+        assert_eq!(list[1].filename, "ps5upload-probe.elf");
+        assert_eq!(list[1].install_source, "web_upload");
+        assert_eq!(list[2].folder, "/mnt/usb0");
+        assert_eq!(
+            stored_path(body, "ps5upload-probe.elf").as_deref(),
+            Some("/data/pldmgr/payloads/local/ps5upload-probe/ps5upload-probe.elf")
+        );
+    }
+
+    #[test]
+    fn autoload_entries_may_be_0_6_slots_but_never_paths() {
+        for bad in ["a,b", "/data/x.elf", "a/../b", "x y"] {
+            assert!(
+                autoload_set("127.0.0.9", true, &[bad.into()]).is_err(),
+                "{bad}"
+            );
+        }
+        // Slots and pauses pass the shape check and reach the network (which fails here).
+        for ok in [
+            "repo/elfldr@e8cce5d1",
+            "local/ps5upload-probe",
+            "!3000",
+            "kstuff.elf",
+        ] {
+            let e = autoload_set("127.0.0.9", true, &[ok.into()]).unwrap_err();
+            assert!(!e.contains("cannot be an autoload entry"), "{ok}: {e}");
+        }
     }
 
     #[test]

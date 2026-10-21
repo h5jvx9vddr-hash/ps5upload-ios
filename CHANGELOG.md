@@ -4,6 +4,474 @@ What's new in ps5upload, written for humans.
 
 ---
 
+## 7.1.13
+
+- **SMB collection moves.** Close metadata readers before moving inspected game folders, and
+  wait for pending closes before renames and directory removal. Denied SMB operations no longer
+  appear as failed sign-ins. CI checks intact folder moves and Undo on an authenticated Samba
+  share with Apple metadata streams.
+- **Adjustable avatar crop (#491).** Position a crop horizontally or vertically and center it
+  again. Preview and Apply use the same framing in both browser and desktop clients.
+- **Files and payloads from a browser (#489).** Choose or drop files from your device, upload
+  them to the engine, and review them before sending to the PS5. Send a selected ELF payload
+  through the engine to a running loader after an explicit Send action. Archive intake remains
+  available in the native app.
+- **Reverse proxy hosting (#490).** Docker healthchecks, package uploads, and remote downloads
+  respect the configured URL path prefix; console package downloads remain at the root.
+  New setup instructions cover dedicated hostnames, subpaths, proxy limits, allowlists, and the
+  direct connection the PS5 needs for package downloads.
+- **Queue sizes.** Show known sizes on individual pending rows and label unknown sizes clearly.
+  These are estimates, not a promise that the destination has enough free space.
+
+Version 7.1.12 was stopped during release validation; these changes ship in 7.1.13.
+
+## 7.1.11
+
+- **Browser avatar upload (#486).** Choose an image from the browser device, preview crop or
+  fit, and confirm applying it to the selected console user. Works with Docker engines too.
+- **Remote conversion inspection (#485).** Allow slow console image reads to complete beyond
+  the ordinary one-minute request deadline, including build preflight and size estimates.
+
+- **Organize the whole collection.** Include supported images and extracted game folders as
+  well as packages. File them under each configured collection root, preserve image formats
+  and intact game folders, and report skipped items without claiming they are already organized.
+
+## 7.1.10
+
+- **Compressed images in Game files.** `.ffpfsc` files now appear, including images beyond the
+  first directory page. Open their folder in Files to decompress before editing; compressed
+  images use ShadowMount+ for playback.
+- **Truthful tile removal (#480).** Removing PS5Upload's own tile now waits for the removal
+  result and reports save/uninstall failures. Update the helper for this fix.
+- **Bulk conversion and copying (#479, #481).** Convert recognizes packages inside game
+  subfolders, names generic `game.pkg` image outputs after the game folder, and accepts supported
+  image/package sources for image conversion. Files can queue further picks during a copy;
+  desktop Stream can select multiple packages and queues bases before updates and DLC.
+- **Payload setup.** Repair the LZ4 Compression catalogue source, add the upstream elfldr
+  download, recognize HyperHEN's specific mount process, and make Quick bring-up easier to find.
+- **Back navigation.** Duplicate Back requests now share one pending history navigation.
+  Firmware-specific controller mapping still needs the reporter's input log.
+- **Conversion diagnostics.** Record stage timings and compression settings for performance
+  reports. No compression or small-file speed improvement is claimed.
+
+- **Keep Rename first in the Files menu.** Properties and permissions remain available just
+  below it, with Delete last. The phone menu now preserves its familiar action order.
+- **Reliable coverage checks.** Transfer speed thresholds run on normal builds; instrumented
+  coverage builds continue to check the transfers without comparing their speed.
+
+---
+
+## 7.1.9
+
+- **File properties and custom permissions (#478).** In Files, open Properties to see a file or
+  folder's size, modification time and permissions, and set the permissions you need. Applying
+  to a whole folder is optional; drives that cannot keep Unix permissions are called out.
+- **Restore a hidden Minion tile (#478).** Settings can show, restore or hide PS5Upload Minion
+  on the PS5 home screen through your paired connection, even when Minion's LAN access is off.
+  Update the helper to use this control.
+- **Import a local JSON cheat.** Cheats can now import a trainer from your device or engine
+  computer. Imports are checked, never replace existing files and leave toggles off. Use the
+  exact title ID and game version; renaming a trainer does not make its patches compatible.
+- **Clearer save backup guidance.** Android shows where backups are saved. Save guidance now
+  explains account and title restrictions, and no longer presents restarting as a verified fix
+  for PS4 restore errors.
+
+---
+
+## 7.1.8
+
+- **Convert reads more Kraken-compressed PS5 packages (#477).** Some packages compressed at the
+  highest Kraken level stopped Convert with "kraken: chunk too short" although they were fine:
+  a small piece at the start of a block was refused. They convert now.
+
+---
+
+## 7.1.7
+
+- **Organize packages works on your servers too.** Folders on a saved SMB, FTP, SFTP or WebDAV
+  server can now be organized like folders on this computer: the same preview, the same
+  Platform › Game ID - Title layout, renames only, nothing overwritten, and every run can be
+  undone. A dropped connection stops the run cleanly and it can still be undone once the server is
+  back. Undo refuses if the saved connection now points at a different server. On WebDAV, folders
+  a run empties are left in place.
+- **WebDAV servers that redirect folder addresses work again.** Opening a folder on such a server
+  (Apache, for example) failed with a sign-in error.
+- **Clearer connection errors.** A very short saved password no longer garbles error messages.
+
+---
+
+## 7.1.6
+
+- **Uploading many files from Files is much faster.** Picking several files now sends them to the
+  PS5 together instead of one at a time: 240 small files went from over 2 minutes to about 5
+  seconds, and 5,000 small files from 44 minutes to under 30 seconds. A pick shows as one task
+  with one Cancel, and a stopped upload resumes where it left off.
+- **Choose what happens when a name is taken.** Instead of one all-or-nothing Overwrite question,
+  each clash offers Skip, Keep both or Replace (Merge for a folder onto a folder), with "do the
+  same for the rest". Keep both is the default, so Enter never overwrites, and names that differ
+  only in upper and lower case count as the same name.
+- **Uninstall tells you whether the game is really gone (#476).** Uninstall used to say
+  "Unregistered" whatever the console answered, and then quietly showed the game again if the
+  console had kept it. The helper now checks that the game has actually left the console. If the
+  PS5 refused, you see an error with its code, and a game that is still installed stays in the
+  list with a note instead of disappearing and coming back.
+- **Organize packages finds packages that sit loose in a collection folder.** A .pkg placed
+  directly in a collection folder (not in a subfolder) was skipped, and with only loose packages
+  Organize said no folder held any. They are now organized into the same Platform › Game ID -
+  Title layout inside that folder.
+- **The server folder browser opens in front.** In Collection → Folders, "Add a folder on …"
+  opened its folder browser behind the dialog.
+
+---
+
+## 7.1.5
+
+- **Uploading many small files no longer gets stuck (#475).** Picking hundreds of files in Files
+  (for example a Switch firmware folder) stopped after about 30 files with "the console is busy"
+  and never recovered. The console now lets go of each finished upload, so every file goes
+  through: a 240-file, 347 MB folder uploaded in about 2 minutes 20 seconds in testing.
+- **PS5Upload Files is now PS5Upload Minion.** Same page and tile, new name; the tile on the
+  home screen picks up the new name the next time the helper starts.
+- **Payload catalog fixes.** websrv's newest release showed an error instead of the release,
+  because its release notes are empty. A payload whose GitHub page has been taken down (such as
+  Ghostpad) now says so plainly and keeps offering the version saved in the app. How long ago a
+  release was saved reads like "saved 3 days ago" instead of a count of seconds.
+
+---
+
+## 7.1.4
+
+- **Cheats no longer crash the console.** Switching a cheat on or off could crash the game or the
+  whole console on newer firmware (seen with Marvel's Wolverine). Cheats are now written straight
+  into the game's memory, the way that works on these firmwares, instead of changing the game's
+  memory protection. A cheat now goes on completely or not at all: if any part can't be written,
+  the parts already written are put back. Cheats can only change the game itself, never the
+  system, and turning one cheat off no longer breaks another that shares code with it. Cheat
+  files too large to read are refused instead of being applied in part.
+- **Find and download cheats on the console.** In PS5Upload Files, Cheats has **Find cheats**:
+  it lists the cheat files for the running game from the same collections the PC app uses,
+  marks the one for your game's version, and downloads it straight to the console, where its
+  cheats show up at once. If the PS5 can't reach GitHub (for example when DNS blocking is on),
+  the page says so.
+- **Save backups are named after the game too.** A backup saved on your computer is now named
+  like `PPSA01234-Game Name-User.zip`.
+
+---
+
+## 7.1.3
+
+- **Payloads: one place for what's on your PS5.** The Payloads screen now has three tabs:
+  Catalog, Send and **On your PS5**. On your PS5 shows a card for each payload that is running
+  or installed on the console, with its status, Open (for payloads with a web page), Update when a
+  newer release is out, and Stop. **Manage** opens that payload's tools in the card:
+  ShadowMount+ mounts, the nanoDNS editor, Payload Manager and HearBridge. Old links to the
+  separate tabs still work.
+- **HearBridge in the catalog and on your PS5.** HearBridge plays the PS5's audio on ordinary
+  Bluetooth headphones or speakers. Its card shows the connected headset, battery, link quality,
+  latency, volume and the game's profile; Manage sets volume and mute, reconnects, switches
+  between saved headsets, scans for new ones, turns night mode on or off, sets latency, and stops
+  it. Pairing, EQ and everything else open in HearBridge's own page.
+- **Processes & ports.** The Processes screen now has a Ports tab next to it, showing which ports
+  are open on the console and what usually listens there (HearBridge and PS5Upload Files
+  included).
+- **PS5Upload Files: permissions, new files and text editing.** Info → Permissions sets read,
+  write and execute for owner, group and others (or the number, like 755), for a folder's
+  contents too; drives that don't keep permissions (exFAT, FAT) say so. Create a new file, and
+  edit text files up to 1 MiB with the on-screen keyboard. Saving never leaves a half-written
+  file, keeps the file's permissions and line endings, and warns when the file changed since
+  you opened it.
+- **PS5Upload Files: upload and download from your phone or computer.** When you open the page
+  from another device (Settings → Allow other devices), Files has **Upload here** to send files
+  and folders to the console and **Download** for a file, or a whole folder as one .tar file.
+  The usual Skip / Replace / Keep both choices apply, a cancelled upload leaves nothing behind,
+  and a stalled connection is let go so the page stays responsive. On a home network this
+  moved about 75 MB/s up and 110 MB/s down.
+
+---
+
+## 7.1.2
+
+- **Save data on a shared PS5 shows whose save is whose.** Each save is labelled with its
+  owner's name instead of a number, and the screen starts on the user who is signed in at the
+  console; "Whose saves" switches to another user or to everyone. Back up all and Restore all
+  act on the saves shown. A backup saved on your computer is named after the game and the user
+  (`PPSA01234-Alice.zip`).
+- **USB backups are kept per user.** Backups to a USB drive on the console now go into a folder
+  per user (`<game>/<name>-<user id>/<date>/`). Before, every user's backups of a game shared one
+  folder, so on a shared console "Restore all from USB" could put one user's latest backup into
+  another user's save. Backups made before this update are still used when only one user on the
+  console has a save of that game.
+
+---
+
+## 7.1.1
+
+- **The app scrolls again on macOS Big Sur.** On Big Sur's older built-in web engine the app
+  window lost its fixed height, so no screen could scroll, and the side bar's rows lost their
+  left padding. The app's styles now carry the older forms that engine understands.
+
+---
+
+## 7.1.0
+
+- **PS5Upload Files: manage your files from the couch.** A new PS5Upload Files tile on the
+  PS5 home screen opens a page in the PS5 browser that fills the TV. It has four sections:
+  **Home** (the running game with Close game, the tasks that are running with Cancel, and your
+  drives), **Files**, **Cheats** (switch the running game's cheats on and off) and **Settings**.
+  The PS5Upload helper must be loaded. If it isn't, the page tries to show a note that says so
+  (from a copy the PS5 browser keeps) and opens by itself once the helper answers. After an
+  update, a banner offers to reload.
+- **Made for the controller.** ✕ selects, ○ steps back, △ opens an item's actions, and the PS5's
+  own pointer works too. Every action also has a button on screen. Three short tips show the
+  first time, Help lists the buttons that work on the current screen, and Controls shows which
+  buttons your PS5 passes on to the page. Dark, Light, OLED and Peach themes, high contrast,
+  the language and full screen are in Settings.
+- **Browse and organise.** A path bar with Go to path, pinned and recent folders, and your
+  drives, with Eject for USB drives and Unmount for game images (refused while a game is
+  running). Sort, filter, show hidden files and select all. Copy, cut and paste, with Replace,
+  Keep both or Skip when a name is taken (and Apply to all); rename one item or many at once
+  with a pattern (a change of letter case alone works too); new folder; delete; Fix permissions.
+- **Look inside files.** Info with folder size; Verify (BLAKE3 and CRC32); Decompress a
+  `.ffpfsc` back to its image, with progress. The viewer shows text (with find), JSON, a
+  summary of a game's `param.json`, hex, and pictures (step through a folder's images); a game
+  folder shows its banner. Search finds files by name in this folder or on all drives (the first
+  search builds an index), and Disk usage shows what takes the space.
+- **Works with the app on your PC.** File System shows the folders pinned on the console
+  ("Pinned on console"), and **Show on console** opens a folder on the TV; **Show on PC** on the
+  console opens it in the PC app. Files being uploaded from your PC show an Uploading badge.
+  These need the 7.1.0 helper; with an older one the app simply doesn't show them.
+- **Only the console can open it by default.** Settings → Allow other devices lets a phone or
+  computer on your network open the page too. There is no password, so anyone on your network
+  can then manage your files; turn it off when you're done. While it's on, text boxes on the
+  console show a "Continue on your phone" code to type there instead.
+- **The tile is yours to remove.** Settings → Show PS5Upload Files on the home screen removes or
+  restores it. The tile is left out of the app's game list (an older engine or Docker image may
+  still list PSUP00001).
+- **Big app databases no longer hide installed games.** The console's app database was read
+  only up to its first 256 entries, and a long list could be cut shorter still, with nothing
+  saying so. On a console with many entries, a game installed by a homebrew installer (no
+  home-screen metadata folder) that sorted past that point was missing from Games. The app now
+  reads the whole database page by page. If the database still can't be read in full, games
+  whose folder and registration are on the console are listed anyway, and the app logs a warning
+  that the list may be incomplete (#473).
+
+---
+
+## 7.0.34
+
+- **Unity games no longer crash when they run as a folder.** Some game dumps name a file
+  `Il2cppUserAssemblies.prx` while the game loads `Il2CppUserAssemblies.prx`. An exFAT image
+  ignores the difference, so the game played from its `.exfat`. The console's internal storage
+  does not: the same game uploaded as a folder, or converted to one, crashed a second after it
+  started. Uploading a game folder, and Convert's game-folder and `.ffpkg` outputs, now give each
+  such file the spelling the game loads. Your copy on the computer is left as it is, and
+  Convert's checks list what was renamed. Four affected games (PPSA22999, PPSA30883, PPSA31909,
+  PPSA33090) launched and stayed running on a PS5 Pro (FW 13.60) once renamed.
+
+## 7.0.33
+
+- **A PS5 update package installs even when its base game isn't there.** The app refused any
+  update whose base game wasn't installed ("Install the base game first"), but some PS5 updates
+  carry the whole app: a YouTube update package installed fine through the PS5's own debug
+  Package Installer while ps5upload refused it. For PS5 packages the app now warns ("the PS5 may
+  still accept it") and lets the PS5 decide; if it can't, the PS5's own error still shows. PS4
+  updates are still refused, since there Sony accepts the request and installs nothing.
+  Stream-installed on both consoles (FW 13.60) with YouTube removed first.
+- **An install counts as done when its exact bytes are on the console.** Such a package lands as
+  the app, not in the updates folder, so the app looked in the wrong place: it called an
+  installed copy "not installed" and could not confirm a finished install.
+- **About links to the website.** About now has a Website link to ps5upload.phantomptr.com, and
+  the author's name opens phantomptr.com.
+
+## 7.0.32
+
+- **Rest mode is found on a computer with Wi-Fi and a cable at once.** A Mac on both, sending
+  through Wi-Fi, got "Host is down" from a sleeping PS5 and showed it as not answering, though
+  the same console answered "standby" over the cable. The app now asks every network connection
+  on the computer that shares the console's network, and treats "Host is down" as a reason to ask.
+  Wake goes out the same way, so it now reaches a sleeping console from such a computer too
+  (Mac, Linux and Android; Windows still uses its default connection).
+- **Wake is offered whenever the console isn't awake.** The PS5 power card showed Wake only when
+  it had confirmed rest mode; it now shows whenever wake is set up and the console isn't known
+  to be awake. The card says "In rest mode" or "Not answering", and greys out Rest mode, Reboot
+  and Shut down while the console sleeps, since those need the helper.
+
+## 7.0.31
+
+- **Rest mode is shown as rest mode, not as a problem.** A PS5 in rest mode used to look the
+  same as one that was off or broken: a red "Not connected", "Helper isn't running" on every
+  console screen, and Connection's Check blaming the jailbreak or a VPN. The app now asks the
+  console the way Remote Play does (it answers "standby" while it sleeps), and shows a calm,
+  blue "In rest mode" in the status bar, the console tabs, Home and the game page. Console screens
+  say "Your PS5 is in rest mode" with a Wake button when wake is set up. A console that answers
+  nothing at all reads "Not answering", with the setting it needs to stay reachable in rest mode
+  (Settings › System › Power Saving › Features Available in Rest Mode).
+- **Nothing fights a sleeping console.** The automatic reconnect no longer pokes a console in rest
+  mode every 30 seconds all night; it waits, and sends the helper again once the console is
+  awake. Uploads that meet rest mode wait ("Waiting for the PS5 to wake") and carry on after the
+  wake, without using up their retries; in the browser version they used to fail. Keep-awake skips
+  a sleeping console. Measured on both consoles on FW 13.60, including a full rest → wake →
+  helper back → rest cycle on the Pro.
+
+## 7.0.30
+
+- **Files fits on a phone (#470).** On a narrow screen every file and folder row carried up to
+  nine action buttons, which pushed the name out entirely, even at the smallest text size. Each
+  row now shows its name and size with one ⋮ button that opens the same actions as a menu. The
+  selection bar stays on one line, with its actions in a strip you can scroll sideways. The
+  Recent paths list is solid instead of see-through (on every screen size). The toolbar, drive
+  chips and path bar are tighter, so the list starts higher up. The desktop layout is unchanged.
+- **Stop helper (#471).** Connection has a "Stop helper" button next to Send helper. It turns
+  the helper off on that console and keeps it off: the automatic reconnect leaves the console
+  alone until you send the helper again or start something that needs it. The loader stays up,
+  so sending payloads still works. It is refused while an upload, download or install is
+  running on that console. Measured on a PS5 Pro: the helper exits in under a second.
+
+## 7.0.29
+
+- **Turn a game image or package back into a folder (#469).** Convert → What to make has a third
+  choice, "A game folder". It takes any image Convert reads (`.exfat`, `.ffpkg`, `.ffpfs`,
+  `.ffpfsc`) or a `.pkg` made with the default debug passcode (Convert's own packages, and fake
+  packages from other tools when they used that passcode), wherever it is: this computer, a saved server or the PS5. It writes the game's
+  files as a plain folder on this computer, empty folders and the package's icons included,
+  checks them against the source, and only then gives the folder its name, so a stopped or failed
+  run never leaves a folder that looks finished. A 125 GB exFAT image unpacked in 81 s, and a
+  Minecraft package came back file-for-file equal however it was compressed. A retail package, or
+  a fake one made with another passcode, can't be opened and is refused with that reason.
+
+## 7.0.28
+
+- **Android: transfers keep going when you leave the app, and you get told when they finish
+  (#457).** Android pauses an app soon after it leaves the screen, and the notices that a job
+  finished lived in the app's page, which pauses with it. Now, while anything is uploading,
+  downloading or installing, ps5upload runs as a foreground service with a progress
+  notification ("Uploading … 42% · 1.2 of 2.9 GB · 38 MB/s"), and posts "Upload complete" or
+  "Upload failed" when it ends. A queue moves on to the next item in the background too.
+  Measured on Android 16: a 1.8 GB upload with the screen off for 12 minutes finished, with one
+  "complete" notification. On a computer, a finished job is announced right away while the
+  window is minimised or hidden, and the queue no longer waits for the window to come back.
+- **Decompress a .ffpfsc on the console (#453).** Files → right-click a `.ffpfsc` →
+  "Decompress to .exfat…" writes the game image it holds next to it, on the console, with
+  progress and Stop: no download and re-upload through a computer. The console's own kernel
+  does the decoding (the way ShadowMount+ reads these files), so nothing extra runs in the
+  helper; a first version that decoded in the helper made it crash and was pulled from 7.0.23.
+  Measured on both consoles: a 4.5 GB image in 40-65 s, byte-identical to the source. Needs the
+  7.0.28 helper.
+- **Console to console: pick up a send from another device, and test the connection first
+  (#444).** Tasks lists sends between your consoles that another phone or computer started,
+  with Watch (follow a direct send), Take over, and Resume here for one that was paused or
+  whose device went away. Pausing now stops both consoles' halves, so any device can resume it
+  straight away. "Test connection" in Send to another console checks that the sending console
+  can reach the other one on the route and address you chose (handy for a ps5-tailscale
+  forward), optionally with a small real send. Watching or taking over a send that is still
+  running needs the 7.0.28 helper on both consoles.
+- **A large .7z upload is no longer called "damaged" when the phone just failed to read it
+  (#446).** The 7z decoder turns any failed read of the archive file into "dist overflow", the
+  same error a broken archive gives, and since 7.0.22 a broken archive is never retried. So one
+  read that failed on a busy phone ended a 70 GB upload as corrupt. A failed read is now reported
+  as itself, and the upload retries it. An 84 GiB single-block archive made with 7-Zip's
+  defaults decoded cleanly well past 40 GB in testing.
+- **"Helper not running" says what to do next everywhere.** Status checks used the old "not
+  running or an old version" text; they now say, like a job does, whether the app can send the
+  helper (the loader is up) or the jailbreak's loader needs starting first.
+
+## 7.0.27
+
+- **A stream install no longer fails on the PS5 after ps5upload says it's done.** The PS5
+  downloads a package in pieces and re-reads some of them; ps5upload added up every byte it
+  sent, repeats included, and took that total as "the console has it all". On a small package
+  the repeats made up the size of a part never sent, so ps5upload closed the download link
+  first: the app's tile appeared and could even open, but the PS5's Downloads showed it failed,
+  Retry failed too and Cancel removed it. ps5upload now keeps the link open until every byte has
+  been sent at least once. Seen with a 37 MB package on FW 13.60; any size could hit it.
+- **"Nothing answered on the ELF loader port :9021" when starting a stream install, then fine
+  on a retry, is fixed.** When an install starts, the app also replaces the console's stock
+  elfldr with its own fixed build, and the loader port is closed for about a second during that
+  swap. An install that started in that second failed. It now waits for the swap to finish, and
+  a loader port that is closed for a moment is tried again for a few seconds before the install
+  gives up.
+
+## 7.0.26
+
+- **Uploaded game and homebrew folders show up with ShadowMount+ again.** ShadowMount+
+  registers a folder as soon as its `sce_sys` has been still for 10 seconds; an upload sends
+  those small files first, so it tried while `eboot.bin` was still on its way, failed twice and
+  gave up on the title for good (measured on a 13.60 console). A game's `param.json` (and a PS4
+  game's `param.sfo`) is now put in place only when everything else has arrived, so the folder
+  becomes a game exactly when it is complete. Needs the 7.0.26 helper.
+- **A stalled or stopped upload can be continued.** A row that has moved no data for 90 seconds
+  says so and offers **Restart transfer**; a row that was stopped, or interrupted by closing the
+  app, says so and offers **Resume**. Both pick up from what the PS5 already has. **Retry
+  failed uploads** now runs them (it only put them back in the list), and its label no longer
+  reads "the retry failed" in most languages.
+- **Large solid .rar uploads no longer fail over and over on a retry.** Resuming one reads
+  through everything the PS5 already has before sending anything new; the console took that
+  silence for a stalled sender and ended the job after 15 minutes, every time. The app now
+  tells the console it is still working. Needs the 7.0.26 helper.
+- **A .rar's unpacked size is right** when it holds entries of unknown size (RAR5), which made
+  the free-space check before an upload add up to nonsense.
+- **Payload Manager: update what you stored.** Payloads stored from the Catalog are remembered,
+  and the Payload Manager tab offers **Update** when the catalogue has a newer release: it
+  stores the new one in its place and keeps its spot in the boot list. Payloads Payload Manager
+  installed from its own repository are left to it. (Desktop and Android, where the catalogue
+  is.)
+- **Files: drag to move.** Drag a folder onto another folder, or onto the path above the list,
+  to move it there (across drives it copies, then removes). Files move the same way in the web
+  UI and on Android; on the desktop a dragged file still goes out to your computer. Not in the
+  Windows app, where the window takes every drag for its own file drop; use Move to… there.
+- **A deleted Collection folder no longer breaks the Collection (#461).** Saving the folder
+  list checked that every folder still existed, so once one was gone nothing could be saved,
+  removing that folder included. Only a folder being added is checked now. A scan skips a
+  folder it can't open instead of failing, and Collection names it, marked "Not found" in
+  Folders, so you can remove it or plug the drive back in.
+
+## 7.0.25
+
+- **Profile no longer offers "Create User" (#460).** The PS5 has no create-user call a payload
+  can use, and the old button only ever tried to rename the console's first user, which fails
+  on a jailbroken console with "sceUserServiceGetInitialUser failed". Profile now says to add
+  users on the PS5 (Switch User, then Add User). Renaming and deleting users are unchanged.
+
+## 7.0.24
+
+- **Payloads → Ports: see what is listening on the PS5.** Every port in use, TCP and UDP, with
+  what usually listens there (elfldr, ftpsrv, Payload Manager, nanodns, the ps5upload helper,
+  Remote Play) and whether a PC can reach it or only the console itself. Ports with a web page
+  open in your browser from there. The helper finds them by binding each port and letting go
+  at once, so no payload ever sees a connection; a full pass takes about a second. Needs the
+  7.0.24 helper.
+- **Folder games on a USB drive are no longer described as /data/homebrew folders (#452).**
+
+## 7.0.23
+
+- **Payload Manager 0.6 works again (#458).** 0.6 refuses changes without its request marker
+  and wants POST for launch and delete, and keeps payloads in slots. The fallback launch,
+  storing, deleting and "Load at boot" now work with 0.6.1 as well as 0.5.2.
+- **Games is smooth with a big library (#450).** Covers come as small cached thumbnails
+  (about 20 KB instead of 300-700 KB), and screenshot thumbnails load two at a time and stop
+  when you leave the screen instead of filling every connection to the console.
+- **Hidden home-screen icons stay hidden (#450).** The console shows an app's icon again every
+  time it starts; the helper now hides it again a couple of seconds later. Icons hidden with
+  earlier versions are picked up.
+- **The game page shows where the game runs from (#452):** the image on your external drive,
+  not a leftover folder in /data/homebrew.
+- **Sending the helper no longer hangs for 15 s** when an old copy is stuck and serving nothing.
+- **Android save backups are no longer 0 bytes (#451).** They go to Downloads as
+  `<title>-<date>.zip`, and the message says where.
+- **Tasks shows speed and ETA (#444)** for transfers, like the Files queue.
+- **Convert:** "backported" only for real backports (an older SDK than declared is no longer
+  called one), the game's ampr_emu 0.3.x version is read (#449), and when LZ4 needs the newer
+  runtime it points at the checkbox that adds it.
+- **Fast verification by default (#459, thanks quer3q).** Convert checks structure, sizes and
+  small files in full and a seeded sample of the rest; "Full verification" re-reads every byte.
+- **"Last seen" is translated (#454, thanks EnriqueWood).**
+- **Payloads: export and import playlists**, with the auto-loader choice and your custom repos,
+  to share a working setup.
+- **Linux packages: the update command to copy (#456).** On Bazzite and other rpm-ostree
+  systems, Settings → Updates shows `rpm-ostree uninstall ps5-upload --install <rpm>`; dnf and
+  apt installs get theirs.
+- **Helper crash reports say where.** A fault now logs the address and instruction.
+
 ## 7.0.22
 
 - **HDR PNG carries the capture's ICC profile (#448).** 7.0.15 wrote the cICP tag only;

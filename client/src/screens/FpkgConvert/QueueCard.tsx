@@ -79,7 +79,7 @@ export function QueueCard(p: QueueCardProps) {
             {tr("cq_pick_folders", undefined, "Pick game folders…")}
           </Button>
           <Button size="sm" variant="ghost" leftIcon={<ListPlus size={14} />} onClick={p.onPickFiles}>
-            {tr("cq_pick_files", undefined, "Pick images or archives…")}
+            {tr("cq_pick_files", undefined, "Pick packages, images or archives…")}
           </Button>
         </div>
 
@@ -96,7 +96,7 @@ export function QueueCard(p: QueueCardProps) {
                       className="shrink-0 rounded bg-[var(--color-surface-3)] px-1.5 py-px font-mono text-[10px] text-[var(--color-muted)]"
                       data-testid="cq-ext"
                     >
-                      {buildExtension(i.build)}
+                      {i.build?.kind === "folder" ? tr("cq_ext_folder", undefined, "folder") : buildExtension(i.build)}
                     </span>
                   </div>
                   <div

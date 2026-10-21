@@ -289,8 +289,27 @@ fn is_newer(current: &str, latest: &str) -> bool {
 #[cfg(test)]
 mod is_newer_tests {
     use super::{
-        is_newer, is_safe_update_url, UpdateChannel, DEFAULT_MANIFEST_URL, PRERELEASE_LIST_URL,
+        install_command_for, is_newer, is_safe_update_url, UpdateChannel, DEFAULT_MANIFEST_URL,
+        PRERELEASE_LIST_URL,
     };
+
+    #[test]
+    fn a_packaged_linux_install_gets_its_own_command() {
+        let p = "/home/me/Downloads/PS5Upload-7.0.23-linux-x64.rpm";
+        assert_eq!(
+            install_command_for(p, Some("rpm"), true, Some("ps5-upload")).as_deref(),
+            Some("rpm-ostree uninstall ps5-upload --install '/home/me/Downloads/PS5Upload-7.0.23-linux-x64.rpm' && systemctl reboot")
+        );
+        assert_eq!(
+            install_command_for(p, Some("rpm"), false, None).as_deref(),
+            Some("sudo dnf install '/home/me/Downloads/PS5Upload-7.0.23-linux-x64.rpm'")
+        );
+        assert_eq!(
+            install_command_for("/tmp/it's.deb", Some("deb"), false, None).as_deref(),
+            Some("sudo apt install '/tmp/it'\\''s.deb'")
+        );
+        assert_eq!(install_command_for(p, None, true, None), None);
+    }
 
     #[test]
     fn higher_numeric_is_newer() {
@@ -537,6 +556,65 @@ pub struct UpdateDownload {
     pub path: String,
     /// Total bytes written to disk.
     pub bytes: u64,
+    /// For a packaged Linux install: the one command that installs the download, to copy into
+    /// a terminal (#456: on Bazzite, `rpm-ostree uninstall ps5-upload --install <rpm>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+}
+
+/// `path` quoted for a POSIX shell.
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// The command that installs `path` over this packaged Linux copy, or None (portable copy,
+/// another OS). An rpm-ostree system (Bazzite, Silverblue, Kinoite) cannot `dnf install`; its
+/// layered package is swapped in one transaction that applies on the next boot.
+fn install_command_for(
+    path: &str,
+    kind: Option<&str>,
+    ostree: bool,
+    package: Option<&str>,
+) -> Option<String> {
+    let q = shell_quote(path);
+    match kind? {
+        "rpm" if ostree => Some(format!(
+            "rpm-ostree uninstall {} --install {q} && systemctl reboot",
+            package.unwrap_or("ps5-upload")
+        )),
+        "rpm" => Some(format!("sudo dnf install {q}")),
+        "deb" => Some(format!("sudo apt install {q}")),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_command(path: &str) -> Option<String> {
+    let kind = linux_package_kind();
+    let ostree = std::path::Path::new("/run/ostree-booted").exists();
+    let package = (kind == Some("rpm"))
+        .then(|| {
+            let exe = std::env::current_exe().ok()?;
+            let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+            let out = std::process::Command::new("rpm")
+                .args(["-qf", "--qf", "%{NAME}"])
+                .arg(&exe)
+                .output()
+                .ok()?;
+            let name = String::from_utf8(out.stdout).ok()?;
+            let name = name.trim();
+            (out.status.success() && !name.is_empty() && !name.contains(char::is_whitespace))
+                .then(|| name.to_string())
+        })
+        .flatten();
+    install_command_for(path, kind, ostree, package.as_deref())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_command(path: &str) -> Option<String> {
+    let _ = install_command_for;
+    let _ = path;
+    None
 }
 
 /// Download the platform-specific asset from the URL returned by
@@ -649,8 +727,10 @@ pub async fn update_download(
             if let Err(e) = reveal(&app, &target).await {
                 eprintln!("[updates] cached bundle at {target:?} but reveal failed: {e}");
             }
+            let path = target.to_string_lossy().into_owned();
             return Ok(UpdateDownload {
-                path: target.to_string_lossy().into_owned(),
+                install_command: install_command(&path),
+                path,
                 bytes: meta.len(),
             });
         }
@@ -712,8 +792,10 @@ pub async fn update_download(
         eprintln!("[updates] download saved to {target:?} but reveal failed: {e}");
     }
 
+    let path = target.to_string_lossy().into_owned();
     Ok(UpdateDownload {
-        path: target.to_string_lossy().into_owned(),
+        install_command: install_command(&path),
+        path,
         bytes: total,
     })
 }

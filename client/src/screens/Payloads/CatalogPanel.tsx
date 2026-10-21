@@ -1,3 +1,4 @@
+import { Link } from "react-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Send,
@@ -37,8 +38,11 @@ import {
 import { Button, ErrorCard, Spinner, Badge, Input } from "../../components";
 import { useConfirm } from "../../components/ConfirmDialog";
 import { pmOverview, pmStore } from "../../api/payloadManager";
-import { useTr } from "../../state/lang";
+import { recordPmStore } from "../../lib/pmUpdates";
+import { hostOf } from "../../lib/addr";
+import { useLangStore, useTr } from "../../state/lang";
 import UsbAutoloaderModal from "./UsbAutoloaderModal";
+import { payloadCardLink } from "./payloadTabs";
 
 /**
  * Catalog tab of the Payloads screen — curated catalogue of
@@ -330,16 +334,18 @@ export default function CatalogPanel() {
         r = await pmStore(h, filename, local.path, true);
         if (!r.stored) return;
       }
+      // So the Payload Manager tab can offer this one's updates later.
+      recordPmStore(hostOf(h), filename, id, local.version);
       pushNotification(
         "success",
         withConsolePrefix(h, tr("payloads_pm_stored_title", { name: filename }, `Stored ${filename} in Payload Manager`)),
         {
           body: tr(
-            "payloads_pm_stored_body",
+            "payloads_pm_stored_body_v2",
             { folder: r.folder },
-            `It is in Payload Manager's "${r.folder}" folder. The Payload Manager tab launches it or loads it at boot.`,
+            `It is in Payload Manager's "${r.folder}" folder. Payload Manager on the On your PS5 tab launches it or loads it at boot.`,
           ),
-          link: "/payloads?tab=manager",
+          link: payloadCardLink("payload-manager"),
         },
       );
     } catch (e) {
@@ -453,6 +459,12 @@ export default function CatalogPanel() {
             )}
           </p>
         </div>
+        <p className="text-xs text-[var(--color-muted)]">
+          <Link to="/connection" className="underline">
+            {tr("connection_elfldr_first_title", undefined, "Load elfldr first.")}
+          </Link>{" "}
+          {tr("connection_elfldr_first_short", undefined, "With an autoloader or PLDMGR, put elfldr before ps5upload.elf, or the helper drops after a few seconds.")}
+        </p>
         <div className="flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-card)] border border-[var(--color-border)] bg-[var(--color-surface)] p-3">
           <div className="text-xs text-[var(--color-muted)]">
             {tr(
@@ -679,6 +691,7 @@ function PayloadCard({
   onRemove?: () => void;
 }) {
   const tr = useTr();
+  const lang = useLangStore((s) => s.lang);
   // Versions the picker offers (only those with a downloadable asset).
   const pickable = releaseList ? downloadableReleases(releaseList) : [];
   const selectedIsPrerelease = !!release?.prerelease;
@@ -900,9 +913,9 @@ function PayloadCard({
             {release.cached_age_secs > 0 && (
               <span>
                 {tr(
-                  "payloads_cached_ago",
-                  { age: release.cached_age_secs },
-                  `cached ${release.cached_age_secs}s ago`,
+                  "payloads_saved_when",
+                  { when: relativeAge(release.cached_age_secs, lang) },
+                  "saved {when}",
                 )}
               </span>
             )}
@@ -917,11 +930,17 @@ function PayloadCard({
             <div className="mt-2 flex items-start gap-1.5 rounded-[var(--radius-card)] border border-[var(--color-warn)] bg-[var(--color-surface)] p-3 text-xs text-[var(--color-warn)]">
               <AlertTriangle size={11} className="mt-0.5 shrink-0" />
               <span>
-                {tr(
-                  "payloads_refresh_error_banner",
-                  undefined,
-                  "Couldn't refresh from GitHub — showing cached snapshot. The latest tag on GitHub may be newer than what's shown here.",
-                )}{" "}
+                {/HTTP 404/.test(release.refresh_error)
+                  ? tr(
+                      "payloads_repo_gone",
+                      undefined,
+                      "This project's GitHub page can't be found any more (it may have been taken down). The last version saved here still works.",
+                    )
+                  : tr(
+                      "payloads_refresh_error_banner",
+                      undefined,
+                      "Couldn't refresh from GitHub — showing cached snapshot. The latest tag on GitHub may be newer than what's shown here.",
+                    )}{" "}
                 <span className="text-[var(--color-muted)]">
                   ({release.refresh_error})
                 </span>
@@ -955,4 +974,23 @@ function PayloadCard({
       )}
     </section>
   );
+}
+
+/** "57 days ago", "3 hours ago" … in the app's language (Intl, no strings of our own). */
+export function relativeAge(secs: number, lang: string): string {
+  const steps: Array<[Intl.RelativeTimeFormatUnit, number]> = [
+    ["day", 86400],
+    ["hour", 3600],
+    ["minute", 60],
+  ];
+  let rtf: Intl.RelativeTimeFormat;
+  try {
+    rtf = new Intl.RelativeTimeFormat(lang, { numeric: "auto" });
+  } catch {
+    rtf = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+  }
+  for (const [unit, size] of steps) {
+    if (secs >= size) return rtf.format(-Math.floor(secs / size), unit);
+  }
+  return rtf.format(-Math.max(1, Math.floor(secs)), "second");
 }

@@ -16,6 +16,7 @@ import {
   Ban,
   Info,
   UploadCloud,
+  Moon,
 } from "lucide-react";
 
 import {
@@ -26,7 +27,7 @@ import {
   Toggle,
 } from "../../components";
 import { queueItemViewPath } from "../../lib/queueView";
-import { queueRemainingBytes } from "../../lib/queueSize";
+import { queueItemBytes, queueRemainingBytes } from "../../lib/queueSize";
 import { usePackageViewer } from "../../state/packageViewer";
 import { GameIcon } from "../../components/GameIcon";
 import { PlatformBadge } from "../../components/PlatformBadge";
@@ -287,7 +288,7 @@ export const QueuePanel = memo(function QueuePanel({ host }: { host?: string } =
               leftIcon={<RotateCcw size={12} />}
               onClick={retryFailed}
             >
-              {tr("queue_retry_failed", undefined, "Retry failed")}
+              {tr("queue_retry_failed_v2", undefined, "Retry failed uploads")}
             </Button>
           )}
 
@@ -824,6 +825,9 @@ export function QueueRow({
                 <span className="truncate font-mono">→ {item.resolvedDest}</span>
               </>
             )}
+            {isPending && <span>· {queueItemBytes(item) > 0
+              ? formatBytes(queueItemBytes(item))
+              : tr("queue_size_unknown", "Size not known yet")}</span>}
             {!isInstall && !finished && (
               <span>
                 ·{" "}
@@ -1011,6 +1015,68 @@ export function QueueRow({
               }/${MAX_AUTO_RECOVER_ATTEMPTS})…`,
             )}
           </span>
+        </div>
+      )}
+
+      {isActive && !isRecovering && !isInstall && item.stalledForMs != null && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 rounded-[var(--radius-field)] bg-[var(--color-warn)]/10 px-2 py-1.5 text-xs text-[var(--color-warn)]">
+          <span className="min-w-0 flex-1">
+            {tr(
+              "queue_stalled",
+              { time: formatDuration(item.stalledForMs / 1000) },
+              "Nothing has moved for {time}. Restarting the transfer picks up from what the PS5 already has.",
+            )}
+          </span>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => useUploadQueueStore.getState().restartItem(item.id)}
+          >
+            {tr("queue_restart_transfer", undefined, "Restart transfer")}
+          </Button>
+        </div>
+      )}
+
+      {isPending && item.waitingForWake && (
+        <div
+          data-testid="queue-waiting-for-wake"
+          className="mt-2 flex items-center gap-2 rounded-[var(--radius-field)] bg-[var(--color-accent-soft)] px-2 py-1.5 text-xs text-[var(--color-text)]"
+        >
+          <Moon size={12} className="shrink-0 text-[var(--color-accent-bright)]" aria-hidden />
+          <span className="min-w-0 flex-1">
+            <span className="font-medium">
+              {tr("queue_waiting_for_wake", undefined, "Waiting for the PS5 to wake")}
+            </span>
+            {" · "}
+            {tr(
+              "queue_waiting_for_wake_body",
+              undefined,
+              "The PS5 is in rest mode. This upload carries on by itself once the helper is back.",
+            )}
+          </span>
+        </div>
+      )}
+
+      {isPending && item.interrupted && !item.waitingForWake && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[var(--color-muted)]">
+          <span className="min-w-0 flex-1">
+            {tr(
+              "queue_interrupted",
+              undefined,
+              "Stopped part-way. Resuming continues from what the PS5 already has.",
+            )}
+          </span>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() =>
+              void useUploadQueueStore
+                .getState()
+                .startHost(hostOf(item.addr), { onlyIds: [item.id] })
+            }
+          >
+            {tr("queue_resume", undefined, "Resume")}
+          </Button>
         </div>
       )}
 

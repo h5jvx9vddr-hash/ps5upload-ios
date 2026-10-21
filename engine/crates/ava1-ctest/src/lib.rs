@@ -460,6 +460,7 @@ pub mod ffi {
         pub fn ava1_test_data_delays(open_ms: u32, map_ms: u32);
         pub fn ava1_test_job_attached(id: *const u8) -> c_int;
         pub fn ava1_test_reap_rules(jobs_dir: *const c_char) -> c_int;
+        pub fn ava1_test_ended_transfers(jobs_dir: *const c_char) -> c_int;
         pub fn ava1_test_retire_unlisted() -> c_int;
         pub fn ava1_test_job_counts(id: *const u8, out: *mut u64) -> c_int;
         pub fn ava1_test_data_knob(name: *const c_char, v: u32) -> c_int;
@@ -1069,6 +1070,14 @@ pub fn c_reap_rules(jobs: &Path) -> i32 {
     let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
     let j = CString::new(jobs.to_str().unwrap()).unwrap();
     unsafe { ffi::ava1_test_reap_rules(j.as_ptr()) }
+}
+
+/// Ended uploads on a live session leave the job table (#475), checked in C on a private data
+/// layer (0 = all hold, else the step that failed). Holds the C server lock.
+pub fn c_ended_transfers(jobs: &Path) -> i32 {
+    let _lock = C_SERVER.lock().unwrap_or_else(|e| e.into_inner());
+    let j = CString::new(jobs.to_str().unwrap()).unwrap();
+    unsafe { ffi::ava1_test_ended_transfers(j.as_ptr()) }
 }
 
 extern "C" {
@@ -1713,6 +1722,25 @@ impl CApplyJob {
         unsafe { ffi::ava1_test_apply_fail_dir_sync(id) }
     }
 
+    /// try_chunk the way a sender does it: out of credit (-2), wait for the workers to give
+    /// some back, until `over()` says the job will take no more (then the refusal is
+    /// returned) or 10 s pass.
+    pub fn chunk_when_credit(&self, id: u32, off: u64, d: &[u8], over: &dyn Fn() -> bool) -> i32 {
+        let t = std::time::Instant::now();
+        loop {
+            let rc = self.try_chunk(id, off, d);
+            if rc != -2 || over() || t.elapsed().as_secs() >= 10 {
+                return rc;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// The job stopped itself at an injected crash point.
+    pub fn job_stopped(&self) -> bool {
+        unsafe { ffi::ava1_test_job_stopped() != 0 }
+    }
+
     /// ava1_apply_chunk's answer (0, or a negative AVA1_E_*).
     pub fn try_chunk(&self, id: u32, off: u64, d: &[u8]) -> i32 {
         unsafe { ffi::ava1_test_apply_chunk(id, off, d.as_ptr(), d.len()) }
@@ -1847,6 +1875,11 @@ impl CApplyJob {
 
     pub fn root(&self, id: u32, root: [u8; 32]) {
         assert_eq!(unsafe { ffi::ava1_test_apply_root(id, root.as_ptr()) }, 0);
+    }
+
+    /// ava1_apply_root's answer (0, or negative once the job has stopped).
+    pub fn try_root(&self, id: u32, root: [u8; 32]) -> i32 {
+        unsafe { ffi::ava1_test_apply_root(id, root.as_ptr()) }
     }
 
     pub fn wait(&self, ms: u32) -> i32 {
@@ -2477,4 +2510,70 @@ impl Drop for TempDir {
         }
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+extern "C" {
+    fn ava1_jobs_list_all(me: *const u8, out: *mut u8, cap: usize, out_len: *mut usize) -> c_int;
+    fn ava1_jobs_owner_is(id: *const u8, me: *const u8) -> c_int;
+    fn ava1_job_cancel_any(id: *const u8) -> c_int;
+    fn ava1_jobs_release_seen(me: *const u8);
+    fn ava1_server_set_rpc_peer(peer: *const u8);
+    fn ava1_data_rpc(
+        method: u16,
+        body: *const u8,
+        len: u32,
+        out: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> c_int;
+}
+
+/// `ava1_jobs_release_seen` (the console page read /api/jobs): `me`'s finished operations and
+/// copies keep only the grace.
+pub fn c_jobs_release_seen(me: &[u8; 32]) {
+    unsafe { ava1_jobs_release_seen(me.as_ptr()) }
+}
+
+/// A data-layer RPC (`job.copy`, `job.run`, ...) as `me`, the way the console page's routes call
+/// it (`ava1_server_set_rpc_peer` on the calling thread, then the data plane): (status, reply).
+pub fn c_data_rpc_as(me: &[u8; 32], method: u16, body: &[u8]) -> (i32, Vec<u8>) {
+    let mut out = vec![0u8; 64 * 1024];
+    let mut n = 0usize;
+    let rc = unsafe {
+        ava1_server_set_rpc_peer(me.as_ptr());
+        ava1_data_rpc(
+            method,
+            body.as_ptr(),
+            body.len() as u32,
+            out.as_mut_ptr(),
+            out.len(),
+            &mut n,
+        )
+    };
+    out.truncate(n);
+    (rc, out)
+}
+
+/// `ava1_jobs_list_all` (the console page's job list): every job the data layer holds, of
+/// any owner, as an encoded `JobListResult`; `Err(status)` on failure. Call it while a
+/// `CServer::start_data` server runs (it holds the C server lock, so this takes none).
+pub fn c_jobs_list_all(me: &[u8; 32]) -> Result<Vec<u8>, i32> {
+    let mut out = vec![0u8; 64 * 1024];
+    let mut n = 0usize;
+    let rc = unsafe { ava1_jobs_list_all(me.as_ptr(), out.as_mut_ptr(), out.len(), &mut n) };
+    if rc != 0 {
+        return Err(rc);
+    }
+    out.truncate(n);
+    Ok(out)
+}
+
+/// `ava1_jobs_owner_is`: 1 when job `id` is listed and owned by `me`, else 0.
+pub fn c_jobs_owner_is(id: &[u8; 16], me: &[u8; 32]) -> i32 {
+    unsafe { ava1_jobs_owner_is(id.as_ptr(), me.as_ptr()) }
+}
+
+/// `ava1_job_cancel_any`: `JOB_CANCEL` without the owner check (0, or `ERR_UNKNOWN_JOB`).
+pub fn c_job_cancel_any(id: &[u8; 16]) -> i32 {
+    unsafe { ava1_job_cancel_any(id.as_ptr()) }
 }

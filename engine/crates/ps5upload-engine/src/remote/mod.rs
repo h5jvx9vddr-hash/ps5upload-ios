@@ -22,7 +22,7 @@ pub mod store;
 pub mod webdav_fs;
 
 #[cfg(test)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -62,6 +62,12 @@ pub enum RemoteError {
     NotFound(String),
     #[error("{0}")]
     Io(String),
+    /// A write would replace something already there (a rename's target, say).
+    #[error("{0}")]
+    Exists(String),
+    /// The server (or this protocol) cannot do what was asked.
+    #[error("{0}")]
+    Unsupported(String),
     /// The server's identity (SFTP host key, FTPS certificate) is not the one the user accepted.
     #[error("Sign-in failed: {}", if *changed { "the server's key has changed since you last connected" } else { "unknown server key — accept it to connect" })]
     HostKey { fingerprint: String, changed: bool },
@@ -82,6 +88,31 @@ pub trait RemoteFs: Send + Sync {
     async fn open(&self, path: &str) -> Result<Arc<dyn RemoteFile>, RemoteError>;
     /// Every regular file under `path`, as (path relative to `path`, entry), capped at `limit`.
     async fn walk(&self, path: &str, limit: usize) -> Result<Vec<(String, Entry)>, RemoteError>;
+
+    // ── Writes: only what the Collection's organizer needs, all of it non-destructive ──
+
+    /// Creates one folder (its parent must exist). A folder already there is success; a
+    /// file by that name is [`RemoteError::Exists`].
+    async fn create_dir(&self, path: &str) -> Result<(), RemoteError> {
+        Err(RemoteError::Unsupported(format!(
+            "this server cannot create {path}"
+        )))
+    }
+
+    /// Renames a file or folder within the server. Never replaces anything: when `to` is
+    /// already there it fails with [`RemoteError::Exists`] and both stay as they were.
+    async fn rename(&self, from: &str, _to: &str) -> Result<(), RemoteError> {
+        Err(RemoteError::Unsupported(format!(
+            "this server cannot rename {from}"
+        )))
+    }
+
+    /// Removes an empty folder. A folder with anything in it is refused and left as it is.
+    async fn remove_dir(&self, path: &str) -> Result<(), RemoteError> {
+        Err(RemoteError::Unsupported(format!(
+            "this server cannot remove {path}"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +123,23 @@ pub(crate) struct MemFs {
     mtimes: Arc<Mutex<BTreeMap<String, i64>>>,
     fail_reads: Arc<AtomicUsize>,
     fail_lists: AtomicUsize,
+    /// Folders made explicitly (an empty one has no file to imply it).
+    dirs: Arc<Mutex<BTreeSet<String>>>,
+    /// The next writes happen but their reply is lost: the caller sees a dropped connection.
+    lose_replies: Arc<AtomicUsize>,
+    /// Writes until the server goes away (0: never): that write happens, its reply is lost,
+    /// and every call after it fails until [`MemFs::set_down`] brings the server back.
+    down_after: Arc<AtomicUsize>,
+    down: Arc<std::sync::atomic::AtomicBool>,
+    /// Removes no folder, as WebDAV (whose DELETE is recursive) never does.
+    keep_dirs: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+#[allow(deprecated)] // fetch_update is the pre-1.99 spelling of try_update
+fn take_one(n: &AtomicUsize) -> bool {
+    n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -103,6 +151,11 @@ impl MemFs {
             mtimes: Arc::default(),
             fail_reads: Arc::new(AtomicUsize::new(0)),
             fail_lists: AtomicUsize::new(0),
+            dirs: Arc::default(),
+            lose_replies: Arc::default(),
+            down_after: Arc::default(),
+            down: Arc::default(),
+            keep_dirs: Arc::default(),
         }
     }
 
@@ -133,7 +186,61 @@ impl MemFs {
             mtimes: Arc::clone(&self.mtimes),
             fail_reads: Arc::new(AtomicUsize::new(0)),
             fail_lists: AtomicUsize::new(0),
+            dirs: Arc::clone(&self.dirs),
+            lose_replies: Arc::clone(&self.lose_replies),
+            down_after: Arc::clone(&self.down_after),
+            down: Arc::clone(&self.down),
+            keep_dirs: Arc::clone(&self.keep_dirs),
         }
+    }
+
+    /// From now on folders are never removed (`remove_dir` is unsupported), as on WebDAV.
+    pub fn never_remove_dirs(&self) {
+        self.keep_dirs.store(true, Ordering::SeqCst);
+    }
+
+    /// The `n`-th write from now takes effect, loses its reply, and takes the server down.
+    pub fn go_down_after_writes(&self, n: usize) {
+        self.down_after.store(n, Ordering::SeqCst);
+    }
+
+    /// Takes the server away (every call fails as a dropped connection) or brings it back.
+    pub fn set_down(&self, down: bool) {
+        self.down.store(down, Ordering::SeqCst);
+    }
+
+    fn check_up(&self) -> Result<(), RemoteError> {
+        if self.down.load(Ordering::SeqCst) {
+            Err(RemoteError::Io("connection reset".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The next `n` writes take effect, but report a dropped connection.
+    pub fn lose_next_replies(&self, n: usize) {
+        self.lose_replies.store(n, Ordering::SeqCst);
+    }
+
+    /// A file's bytes, for tests to check nothing was overwritten.
+    pub fn bytes(&self, path: &str) -> Option<Vec<u8>> {
+        self.files.lock().unwrap().get(&normal(path)).cloned()
+    }
+
+    /// Runs a write: refused outright, or done with its reply lost, as the test asked.
+    fn write<T>(&self, op: impl FnOnce() -> Result<T, RemoteError>) -> Result<T, RemoteError> {
+        self.check_up()?;
+        let r = op()?;
+        if self.down_after.load(Ordering::SeqCst) > 0
+            && self.down_after.fetch_sub(1, Ordering::SeqCst) == 1
+        {
+            self.set_down(true);
+        }
+        self.check_up()?;
+        if take_one(&self.lose_replies) {
+            return Err(RemoteError::Io("connection reset".into()));
+        }
+        Ok(r)
     }
 
     /// The next `n` listings fail, as a dropped session would.
@@ -188,11 +295,38 @@ impl MemFs {
                 }
             }
         }
+        drop(files);
+        for d in self.dirs.lock().unwrap().range(prefix.clone()..) {
+            let Some(rest) = d.strip_prefix(&prefix) else {
+                break;
+            };
+            let name = rest.split('/').next().unwrap_or(rest);
+            if !name.is_empty() {
+                out.entry(name.to_string()).or_insert(Entry {
+                    name: name.to_string(),
+                    is_dir: true,
+                    size: 0,
+                    mtime: None,
+                });
+            }
+        }
         out.into_values().collect()
     }
 
     fn is_dir(&self, dir: &str) -> bool {
-        dir == "/" || !self.children(dir).is_empty()
+        let explicit = self.dirs.lock().unwrap().contains(dir);
+        dir == "/" || explicit || !self.children(dir).is_empty()
+    }
+
+    fn is_file(&self, p: &str) -> bool {
+        self.files.lock().unwrap().contains_key(p)
+    }
+
+    fn parent_of(p: &str) -> String {
+        match p.rsplit_once('/') {
+            Some(("", _)) | None => "/".into(),
+            Some((d, _)) => d.into(),
+        }
     }
 }
 
@@ -236,6 +370,7 @@ impl RemoteFile for MemFile {
 #[async_trait::async_trait]
 impl RemoteFs for MemFs {
     async fn list(&self, path: &str, cursor: Option<String>) -> Result<Page, RemoteError> {
+        self.check_up()?;
         if self.list_fails() {
             return Err(RemoteError::Io("connection reset".into()));
         }
@@ -253,6 +388,7 @@ impl RemoteFs for MemFs {
     }
 
     async fn stat(&self, path: &str) -> Result<Entry, RemoteError> {
+        self.check_up()?;
         let p = normal(path);
         if let Some(b) = self.files.lock().unwrap().get(&p) {
             let name = p.rsplit('/').next().unwrap_or("").to_string();
@@ -317,6 +453,98 @@ impl RemoteFs for MemFs {
             })
             .collect())
     }
+
+    async fn create_dir(&self, path: &str) -> Result<(), RemoteError> {
+        let p = normal(path);
+        self.write(|| {
+            if self.is_file(&p) {
+                return Err(RemoteError::Exists(format!("{p} is a file")));
+            }
+            if self.is_dir(&p) {
+                return Ok(());
+            }
+            if !self.is_dir(&Self::parent_of(&p)) {
+                return Err(RemoteError::NotFound(format!("no folder for {p}")));
+            }
+            self.dirs.lock().unwrap().insert(p.clone());
+            Ok(())
+        })
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), RemoteError> {
+        let (from, to) = (normal(from), normal(to));
+        self.write(|| {
+            if self.is_file(&to) || self.is_dir(&to) {
+                return Err(RemoteError::Exists(format!("{to} already exists")));
+            }
+            if !self.is_dir(&Self::parent_of(&to)) {
+                return Err(RemoteError::NotFound(format!("no folder for {to}")));
+            }
+            let mut files = self.files.lock().unwrap();
+            if let Some(b) = files.remove(&from) {
+                files.insert(to.clone(), b);
+                drop(files);
+                let mut m = self.mtimes.lock().unwrap();
+                if let Some(t) = m.remove(&from) {
+                    m.insert(to.clone(), t);
+                }
+                // The folder it left stays, as on a real server.
+                self.dirs.lock().unwrap().insert(Self::parent_of(&from));
+                return Ok(());
+            }
+            drop(files);
+            if from == "/" || !self.is_dir(&from) {
+                return Err(RemoteError::NotFound(format!("{from} not found")));
+            }
+            if to.starts_with(&format!("{from}/")) {
+                return Err(RemoteError::Io(format!("{to} is inside {from}")));
+            }
+            let moved = |k: &String| -> Option<String> {
+                if *k == from {
+                    Some(to.clone())
+                } else {
+                    k.strip_prefix(&format!("{from}/"))
+                        .map(|rest| format!("{to}/{rest}"))
+                }
+            };
+            let mut files = self.files.lock().unwrap();
+            let keys: Vec<String> = files.keys().cloned().collect();
+            for k in keys {
+                if let Some(n) = moved(&k) {
+                    let b = files.remove(&k).unwrap();
+                    files.insert(n, b);
+                }
+            }
+            let mut dirs = self.dirs.lock().unwrap();
+            let keys: Vec<String> = dirs.iter().cloned().collect();
+            for k in keys {
+                if let Some(n) = moved(&k) {
+                    dirs.remove(&k);
+                    dirs.insert(n);
+                }
+            }
+            dirs.insert(to.clone());
+            dirs.insert(Self::parent_of(&from));
+            Ok(())
+        })
+    }
+
+    async fn remove_dir(&self, path: &str) -> Result<(), RemoteError> {
+        let p = normal(path);
+        if self.keep_dirs.load(Ordering::SeqCst) {
+            return Err(RemoteError::Unsupported(format!("{p} left in place")));
+        }
+        self.write(|| {
+            if p == "/" || !self.is_dir(&p) {
+                return Err(RemoteError::NotFound(format!("{p} is not a folder")));
+            }
+            if !self.children(&p).is_empty() {
+                return Err(RemoteError::Io(format!("{p} is not empty")));
+            }
+            self.dirs.lock().unwrap().remove(&p);
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -372,8 +600,14 @@ mod tests {
 
     #[tokio::test]
     async fn memfs_meets_the_contract() {
-        let fs = MemFs::new(&[("/g/a.bin", b"0123456789abcdefXYZ"), ("/g/sub/b", b"x")]);
+        let fs = MemFs::new(&[
+            ("/g/a.bin", b"0123456789abcdefXYZ"),
+            ("/g/sub/b", b"x"),
+            ("/w/a", b"aaa"),
+            ("/w/b", b"bbbbb"),
+        ]);
         crate::remote::contract::check(&fs, "/g").await;
+        crate::remote::contract::check_writes(&fs, "/w").await;
     }
 
     #[tokio::test]

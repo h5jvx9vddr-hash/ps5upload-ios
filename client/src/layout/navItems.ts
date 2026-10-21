@@ -205,8 +205,8 @@ export const NAV_ITEMS: NavItem[] = [
   },
   {
     to: "/processes",
-    key: "processes",
-    fallback: "Processes",
+    key: "processes_and_ports",
+    fallback: "Processes & ports",
     icon: Layers,
   },
   {

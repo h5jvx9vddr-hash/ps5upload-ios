@@ -1107,6 +1107,12 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
     let end = at + len;
     let mut p = 0usize;
     let mut dst = at;
+    // The reference decoder wants 13 bytes for the whole chunk, the eight seed bytes of the
+    // block's first half included. Asking for 13 more AFTER the seed refused valid small first
+    // halves that level 7 writes (#477: "chunk too short" on a good package).
+    if src.len() < 13 {
+        return format_err("kraken: chunk too short");
+    }
     if at == 0 {
         // The seed is the half's first eight bytes: a half shorter than that cannot be LZ, and
         // a damaged descriptor saying it is must not make the copy below overrun the block.
@@ -1117,7 +1123,8 @@ fn decode_half(src: &[u8], out: &mut [u8], at: usize, len: usize, delta: bool) -
         p = SEED;
         dst = SEED;
     }
-    if src.len() < p + 13 {
+    // The excess flag (and its second byte, when present) must be inside the chunk.
+    if p + 2 > src.len() {
         return format_err("kraken: chunk too short");
     }
     let flag = src[p];

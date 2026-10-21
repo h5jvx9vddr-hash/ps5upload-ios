@@ -107,8 +107,14 @@ pub fn open_remote(files: Arc<dyn RemoteFiles>, path: &str) -> Result<Box<dyn So
         )?)),
         "ffpfsc" => crate::source::ffpfsc_tree(&reader, &label),
         "ffpfs" => crate::pfs_source::open(reader()?, label),
+        "pkg" => Ok(Box::new(crate::pkg_source::PkgSource::from_reader(
+            reader()?,
+            size,
+            crate::crypto::DEFAULT_PASSCODE,
+            label,
+        )?)),
         _ => format_err(format!(
-            "{path} is neither a folder nor a supported image (.exfat, .ffpkg, .ffpfs, .ffpfsc)"
+            "{path} is neither a folder nor a supported image (.exfat, .ffpkg, .ffpfs, .ffpfsc) or debug package (.pkg)"
         )),
     }
 }

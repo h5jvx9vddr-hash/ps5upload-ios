@@ -18,7 +18,12 @@ import { useUploadSettingsStore } from "../state/uploadSettings";
 import { getEngineUrl } from "../state/engine";
 import { Spinner } from "../components/Spinner";
 import { hostOf } from "../lib/addr";
-import { sessionNeedsAttention } from "../lib/consoleSession";
+import {
+  consoleLight,
+  consoleLightColor,
+  type ConsoleLight,
+} from "../lib/consolePower";
+import { consoleLightLabel } from "../lib/consoleLightLabel";
 
 /**
  * App-footer status strip: engine + payload liveness, plus the versions
@@ -37,6 +42,7 @@ export default function StatusBar() {
   const engineError = useConnectionStore((s) => s.engineError);
   const payloadStatus = useConnectionStore((s) => s.payloadStatus);
   const session = useConnectionStore((s) => s.session);
+  const power = useConnectionStore((s) => s.power);
   const payloadVersion = useConnectionStore((s) => s.payloadVersion);
   const ps5Kernel = useConnectionStore((s) => s.ps5Kernel);
   const ps5Firmware = parsePS5Firmware(ps5Kernel);
@@ -53,22 +59,16 @@ export default function StatusBar() {
     ? profiles.filter((p) => p.id !== activeProfile?.id)
     : [];
 
-  const dot = (status: "up" | "down" | "unknown", warn = false) => {
-    const color =
-      warn
-        ? "bg-[var(--color-warn)]"
-        : status === "up"
-        ? "bg-[var(--color-good)]"
-        : status === "down"
-          ? "bg-[var(--color-bad)]"
-          : "bg-[var(--color-muted)]";
-    return (
-      <span
-        className={`inline-block h-2 w-2 rounded-full ${color}`}
-        aria-hidden
-      />
-    );
-  };
+  const dot = (light: ConsoleLight) => (
+    <span
+      data-light={light}
+      className="inline-block h-2 w-2 rounded-full"
+      style={{ background: consoleLightColor(light) }}
+      aria-hidden
+    />
+  );
+  const engineLight: ConsoleLight =
+    engineStatus === "up" ? "up" : engineStatus === "down" ? "down" : "unknown";
 
   // The footer says two things, so it shows two groups: the Engine (the
   // app's own local backend) and the PS5 (the console we're talking to).
@@ -87,13 +87,12 @@ export default function StatusBar() {
   // what helper build.
   // The one probe's verdict: a console that answers but needs pairing is not
   // "connected" and not "down" either.
-  const sessionWarn = sessionNeedsAttention(session);
+  // Rest mode reads as its own calm state, not as a dropped connection.
+  const ps5Light = consoleLight({ payloadStatus, power, session });
   const ps5Tooltip = [
-    sessionWarn
-      ? tr("status_ps5_needs_pairing", undefined, "Needs pairing")
-      : ps5Connected
-        ? tr("status_ps5_connected", undefined, "Connected")
-        : tr("status_ps5_disconnected", undefined, "Not connected"),
+    ps5Light === "unknown"
+      ? tr("status_ps5_disconnected", undefined, "Not connected")
+      : consoleLightLabel(ps5Light, tr),
     ps5Kernel || null,
     payloadVersion
       ? tr(
@@ -122,7 +121,7 @@ export default function StatusBar() {
           )
         }
       >
-        {dot(engineStatus)}
+        {dot(engineLight)}
         <span>{tr("status_engine", undefined, "Engine")}</span>
       </div>
 
@@ -130,10 +129,13 @@ export default function StatusBar() {
 
       {/* Group 2 — the PS5 console (helper + firmware). */}
       <div className="flex items-center gap-2" title={ps5Tooltip}>
-        {dot(payloadStatus, sessionWarn)}
+        {dot(ps5Light)}
         <span className={ps5Connected ? undefined : "opacity-70"}>
           {ps5Name}
         </span>
+        {(ps5Light === "rest" || ps5Light === "unreachable") && (
+          <span data-testid="status-ps5-power">{consoleLightLabel(ps5Light, tr)}</span>
+        )}
         {ps5Connected && ps5Firmware && (
           <span className="rounded-full border border-[var(--color-border-strong)] px-2 font-mono text-[0.625rem]">
             {tr("status_fw", { ver: ps5Firmware }, `FW ${ps5Firmware}`)}
@@ -146,12 +148,13 @@ export default function StatusBar() {
           {otherConsoles.map((p) => {
             const rt =
               runtimeByHost[hostOf(p.host) || "_"] ?? EMPTY_HOST_RUNTIME;
+            const light = consoleLight(rt);
             const statusLabel =
-              rt.payloadStatus === "up"
+              light === "up"
                 ? tr("status_console_up", undefined, "connected")
-                : rt.payloadStatus === "down"
+                : light === "down"
                   ? tr("status_console_down", undefined, "not connected")
-                  : tr("status_console_unknown", undefined, "not probed yet");
+                  : consoleLightLabel(light, tr);
             return (
               <span
                 key={p.id}
@@ -164,7 +167,7 @@ export default function StatusBar() {
                     profileAccentForHost(p.host, profiles) ?? "transparent",
                 }}
               >
-                {dot(rt.payloadStatus, sessionNeedsAttention(rt.session))}
+                {dot(light)}
               </span>
             );
           })}

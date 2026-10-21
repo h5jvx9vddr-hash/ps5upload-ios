@@ -89,10 +89,18 @@ uint32_t ava1_server_pair_guesses(void);
 int ava1_server_conns(void);
 /* RPC workers running right now, all sessions (they are detached: this is the only count of them). */
 int ava1_server_rpc_inflight(void);
+/* An in-process caller of the RPC entry points (the console web UI): ava1_server_local_rpc_enter
+ * counts the call in the in-flight RPCs ava1_payload_stop waits on (0), or refuses it once the
+ * exit has begun (-1: do not call). Every 0 is paired with ava1_server_local_rpc_leave. */
+int ava1_server_local_rpc_enter(void);
+void ava1_server_local_rpc_leave(void);
 /* Stops accepting; open connections notice within one ping interval. */
 void ava1_server_stop(void);
 /* Identity of the paired caller while an RPC callback runs on its worker thread. */
 const uint8_t *ava1_server_rpc_peer(void);
+/* Sets the calling thread's RPC identity, for a caller that runs RPC callbacks on its own thread
+ * (the console web UI's workers act as their own fixed identity, not as a paired device). */
+void ava1_server_set_rpc_peer(const uint8_t peer[32]);
 
 /* The waiting send, for job threads, workers and lane writers: returns when the frame
  * is written. AVA1_E_CLOSED when the session (or lane) is not live. */
